@@ -1,6 +1,6 @@
 # `seacast-rs`
 
-A Rust implementation of **SEACAST v2**: chunked, erasure-coded diffusion of large objects (the execution payload, data columns, rows) between peers. It follows `protocol-v2.md` and the rules that document carries over from `protocol.md`, both in the `informed-diffusion-spec` repository.
+A Rust implementation of **SEACAST v2**: chunked, erasure-coded diffusion of large objects (the execution payload, data columns, rows) between peers. It follows `protocol-v2.md` and the rules that document carries over from `protocol.md`, from [Csaba Kiraly](https://www.github.com/cskiraly)'s `informed-diffusion-spec`  [repository](https://github.com/cskiraly/informed-diffusion-spec).
 
 The protocol logic is a single-threaded state machine with no I/O. A host supplies the transport, the clock, the buffers and the domain's checks.
 
