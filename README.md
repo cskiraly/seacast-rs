@@ -2,16 +2,23 @@
 
 A Rust implementation of **SEACAST v2**: chunked, erasure-coded diffusion of large objects (the execution payload, data columns, rows) between peers. It follows `protocol-v2.md` and the rules that document carries over from `protocol.md`, both in the `informed-diffusion-spec` repository.
 
-The protocol logic is a single-threaded state machine with no I/O. A host supplies the transport, the clock, the buffers and the consensus-side checks.
+The protocol logic is a single-threaded state machine with no I/O. A host supplies the transport, the clock, the buffers and the domain's checks.
 
-### Divergence from the spec
-1. Chunk container (v0.3 §2): replace slot, beacon_block_root and the optional descriptor with type, then a frame of header | context | proof | data, lengths given by type and header.
-2. group_key (v0.3 §1): sha256(0x03 || type || group_id(d) || context) in place of sha256(0x03 || group_id(d) || slot).
-3. message_id (v0.3 §2): the Altair id over the new encoding; state that the topic is one per type.
-4. validate_chunk (v0.3 §3): split into the codec check, the domain's answer (once per group), and the proof.
-5. on_block_installed (v0.3 §4.2) and on_header_validated (v2 §4.2): one event, "the domain can now tell of these groups".
-6. Live window (v0.3 §8.1): a domain rule (ignore, end group) rather than a node rule; deferred chunks expire by time.
-7. Types without a header (new): a standalone type's group id and its level 1.
+## Where this differs from the specification
+
+- **Bitmaps are 1024 bits** (`BITMAP_WORDS` in `bitmap.rs`). `protocol.md` allows 8192 indices in a plain group and a HAVE bitmap. 1024 chunks carry a 16 MiB body uncoded, which is past what consensus gossip lets one message be; a group or an index beyond it is refused. Every table, message and queue item that holds a bitmap grows with the constant, which is why it is not 8192.
+- **Evidence** (`[D6]`) is carried in the message types and not acted on. The specification carries it and does not define it.
+- **The wire encoding** in `seacast-codec::wire` is this implementation's. `protocol-v2.md` §7 leaves the standalone binding's bytes open, and the gossipsub bindings are not implemented.
+- **The chunk's layout** is `type | group | index | frame`, with the frame `header | context | proof | data`. The specification's `Chunk` has `slot` and `beacon_block_root` as fields of their own and an optional descriptor; here they are the payload's context, and a header is present or absent by type.
+- **The group id** is `sha256(0x03 || type || header id || context)`. The specification's `group_key` is `sha256(0x03 || group id || slot)`: the type and the block root are not bound.
+- **The chunk id** is the specification's formula (group, index, and the Altair message id over a topic) over the chunk as it is sent here, not over the SSZ `Chunk`. The topic is the domain's, one a type.
+- **The gate** is one call, `on_groups_authenticated`, where the specification has `on_block_installed` and `on_header_validated`.
+- **Level 1** is three steps where the specification has one `validate_chunk`: the codec's check of the chunk alone, the domain's answer on the group, then the proof. The domain is asked once a group and its answer is kept, so later chunks of an authentic group run only the codec's steps.
+- **The live window** is a deadline the domain gives a group (`Domain::deadline`), a time on the host's clock, where the specification has the group's slot. A group and its deferred chunks go at the deadline at the latest, and its tombstone is kept until it. A group with no deadline has only the node's lifetimes: a deferred chunk goes `GROUP_TTL` after it arrived and a tombstone after `tombstone_ttl`.
+- **Standalone types** are new: one chunk a group, no header and no proof, with the group id `sha256(0x04 || type || frame)` and a level 1 that is that hash, index 0 and a length limit. The specification defines no type without a header.
+- **The send queue and window** (`protocol-v2.md` §4.11, §4.12) are not in the node. The node hands each item to the host with `send` and filters it in `on_write`; `SendQueues` implements the specification's queue and window beside it, and a host may replace it.
+- **Serving** has two checks the specification's `on_want` does not have: an ask for an index this node neither holds nor has interest in, as the peer sees that interest, is refused and penalised (`AskOutsideOfferOrInterest`), and at most `max_served_per_heartbeat` chunks are served in a heartbeat over all peers, beside `SERVE_LIMIT` per peer and group.
+- **State a peer can create** has limits the specification leaves open or does not name: `max_pairs` and `max_wide_pairs` on (peer, group) records, and `max_relations_per_link`.
 
 ## Crates
 
@@ -32,7 +39,7 @@ flowchart LR
     TW["timer wheel"]
     V["proof checker"]
     D["decoder"]
-    CS["consensus: blocks, headers"]
+    CS["domain: what a group belongs to"]
   end
   N["SeacastNode"]
 
@@ -46,7 +53,7 @@ flowchart LR
   N -. "schedule_after(delay, event)" .-> TW
   N -. "send(peer, item, urgent), cancel_chunk(peer, group, index)" .-> T
   N -. "start_decode(group)" .-> D
-  N -. "deliver(group, payload), penalise(peer)" .-> CS
+  N -. "deliver(group, object), penalise(peer)" .-> CS
   T -- "on_write(peer, item)" --> N
   V == "pop_unverified()" ==> N
 ```
@@ -60,17 +67,17 @@ The traits a host implements, in `seacast_core::traits`:
 | `ChunkBuffer` | A handle to a chunk's bytes. The node stores, clones and compares handles and asks only `len()`. It never reads the bytes, so a handle may be a reference into a ring cache. |
 | `RuntimeEnv` | Clock, timers, the send path's callbacks, decode trigger, delivery, penalties. |
 | `TypeCodec` | The networking mechanics of the object types: how a chunk's frame is laid out, its index count and threshold, the checks that need no outside knowledge, decode, projection onto groups. |
-| `Domain` | What a group belongs to and whether that is authentic. Asked once a group, with the id of the group's header and the chunk's context bytes. |
+| `Domain` | What a group belongs to, whether that is authentic, and when its window closes. Asked once a group, with the id of the group's header and the chunk's context bytes. |
 | `Policy` | What this node takes part in: its types, interest, duty and parameters (`TypeParams`). |
 | `ObjectCatalog` | The three together: what the node is given. |
 | `DeferredStore` | Reservations for chunks that wait for the domain's word on their group. |
 | `RngSource` | Randomness. |
 
-## A payload's life
+## An object's life
 
 ```mermaid
 flowchart TB
-  subgraph builder["Builder"]
+  subgraph publisher["Publisher"]
     B1["body"] --> B2["Snappy compress"]
     B2 --> B3["cut into K data segments"]
     B3 --> B4["Reed-Solomon: K parity segments"]
@@ -80,7 +87,7 @@ flowchart TB
   end
 
   subgraph relay["Every node on the way"]
-    R1["chunk arrives"] --> R2["level 1: static checks, then the proof"]
+    R1["chunk arrives"] --> R2["level 1: codec check, the domain, then the proof"]
     R2 --> R3["store, claim it (HAVE) to pushers and sender"]
     R3 --> R4["forward: push to a few, offer to the rest"]
     R3 --> R5{"K chunks?"}
@@ -89,7 +96,7 @@ flowchart TB
     R5 -- "yes" --> R7["stop pulling, claim all N"]
     R7 --> R8["level 2: fill in missing chunks, check the root"]
     R8 --> R9["push rebuilt chunks to peers still short"]
-    R8 --> R10["decompress, deliver the payload"]
+    R8 --> R10["decompress, deliver the object"]
   end
 
   B7 --> R1
@@ -231,9 +238,9 @@ flowchart TB
   FR -.-> S
 ```
 
-`SendQueues::next_to_send` returns `Send(entry)`, `Wait` or `Empty`. An entry carries at most one chunk, as its buffer handle with its proof and header, plus control messages. The window is in bytes and node-wide; control takes no room in it. Because the chunk is chosen at the moment of sending, a host that polls keeps the late choice: while the window is full, items wait and the rarest goes first when room returns.
+`SendQueues::next_to_send` returns `Send(entry)`, `Wait` or `Empty`. An entry carries at most one chunk, whose frame is one buffer handle, plus control messages. The window is in bytes and node-wide; control takes no room in it. Because the chunk is chosen at the moment of sending, a host that polls keeps the late choice: while the window is full, items wait and the rarest goes first when room returns.
 
-## Completion, decode and the payload
+## Completion, decode and delivery
 
 ```mermaid
 stateDiagram-v2
@@ -264,14 +271,16 @@ flowchart LR
   store -- "sent from its slot" --> TX["pushes and answers"]
   store --> CIP["complete_in_place: missing slots computed, root checked"]
   CIP -. "written into their own slots" .-> store
-  DK -- "payload_into: the data slots end to end are the compressed stream" --> OUT["payload buffer, reserved at the declared length"]
+  DK -- "body_into: the data slots end to end are the compressed stream" --> OUT["body buffer, reserved at the declared length"]
 ```
 
-The code is systematic, so the K data slots are the Snappy stream itself. If every data chunk arrived, no Reed-Solomon runs. Otherwise only the missing slots are computed. A chunk's bytes therefore move twice: from the network into its slot, and from the slots into the decompressed payload.
+The code is systematic, so the K data slots are the Snappy stream itself. If every data chunk arrived, no Reed-Solomon runs. Otherwise only the missing slots are computed. A chunk's bytes therefore move twice: from the network into its slot, and from the slots into the decompressed body.
 
 | function (`seacast-codec`) | what it does |
 | --- | --- |
-| `build_group` | body to descriptor and shards, at the builder |
+| `SegmentedCodec` | the `TypeCodec` of a segmented type, over the functions below |
+| `build_group` | body to descriptor and shards, at the publisher |
+| `group_id`, `group_key` | a descriptor's id, which the domain commits; a group's id from its type, that id and its context |
 | `split_frame`, `build_frame`, `build_chunks` | a segmented chunk's frame taken apart and put together; a group's chunks as a publisher hands them to the node |
 | `check_frame`, `check_frame_proof` | level 1 for one chunk: descriptor, group id, index and length; then the Merkle proof |
 | `chunk_id` | a chunk's id: group, index, and the Altair message id over a topic and the chunk as it is sent |
@@ -285,13 +294,13 @@ The code is systematic, so the K data slots are the Snappy stream itself. If eve
 
 ## A group's lifetime
 
-A group's state lives `GROUP_TTL` after its last chunk or its completion, or until the host ends it with `end_group`, which is how a domain's own window (a slot's, say) is applied. Then one record is removed, with the pull state that named the group, and a tombstone keeps the group from being taken up again for `tombstone_ttl`. A chunk the domain says is too old or too early is ignored (`Ignore`), and a deferred chunk goes `GROUP_TTL` after it arrived.
+A group's state lives `GROUP_TTL` after its last chunk or its completion. The domain may give a group a deadline (`Domain::deadline`, asked with `authenticate` on the group's first chunk): the time its window closes, a slot boundary say. The group then goes at the deadline if that is sooner, and the host may end any group at once with `end_group`. When a group goes, one record is removed, with the pull state that named the group, and a tombstone keeps the group from being taken up again: until its deadline, or for `tombstone_ttl` if it has none. A deferred chunk goes at its group's deadline, or `GROUP_TTL` after it arrived. From the deadline on the domain answers `Ignore` for the group, as it does for one that is too early. A group known only from offers has no deadline until its first chunk.
 
 ## State
 
 | kept per | where | holds |
 | --- | --- | --- |
-| group | `groups: Groups`, one `Group` record | type, header, state, the received, rebuilt and held bitmaps, interest, timestamps, slot, claims, probe and repair sampling |
+| group | `groups: Groups`, one `Group` record | type, header, state, the received, rebuilt and held bitmaps, interest, timestamps, claims, probe and repair sampling |
 | chunk | `chunks`, `known_id`, `holders`, `standing` | the handle and id, who holds it, who asked for it ahead of its arrival |
 | ask | `offers`, `tried`, `promises`, `asked_at` | announcers in order, whom was asked and when, running promises |
 | peer and group | `pairs: Pairs`, one record a pair | what the peer holds, what was pushed and sent to it, its offers, its park; bitmaps of 128 bits in the record, wider ones in a pool |
@@ -304,22 +313,14 @@ A full table refuses a new key instead of failing, and state a peer can make the
 - groups without a header that a peer names: `max_pending_groups` per peer;
 - groups that are only named and groups that are open: `max_groups` each, counted apart, so naming groups cannot stop real ones from opening;
 - push relations on one link: `max_relations_per_link` per direction;
-- ties to uninstalled block roots: `max_pending_groups` per peer.
-
-## Where this differs from the specification
-
-- **Bitmaps are 1024 bits** (`BITMAP_WORDS` in `bitmap.rs`). `protocol.md` allows 8192 indices in a plain group and a HAVE bitmap. 1024 chunks carry a 16 MiB body uncoded, which is past what consensus gossip lets one message be; a group or an index beyond it is refused. Every table, message and queue item that holds a bitmap grows with the constant, which is why it is not 8192.
-- **Evidence** (`[D6]`) is carried in the message types and not acted on. The specification carries it and does not define it.
-- **The wire encoding** in `seacast-codec::wire` is this implementation's. `protocol-v2.md` §7 leaves the standalone binding's bytes open, and the gossipsub bindings are not implemented.
-- **The chunk's layout** is `type | group | index | frame`, with the frame `header | context | proof | data`. The specification's `Chunk` has `slot` and `beacon_block_root` as fields of their own and an optional descriptor; here they are the payload's context, and a header is present or absent by type.
-- **The group id** is `sha256(0x03 || type || header id || context)`. The specification's `group_key` is `sha256(0x03 || group id || slot)`: the type and the block root are not bound.
-- **The chunk id** is the specification's formula (group, index, and the Altair message id over a topic) over the chunk as it is sent here, not over the SSZ `Chunk`. The topic is the domain's, one a type.
-- **The gate** is one call, `on_groups_authenticated`, where the specification has `on_block_installed` and `on_header_validated`; the live window is the domain's, applied with `Ignore` and `end_group`.
+- ties to groups the domain cannot tell of yet: `max_pending_groups` per peer.
 
 ## Building and running
 
 ```bash
 cargo test                                         # unit, limit and simulation tests
+just fmt                                           # rustfmt, on the pinned nightly
+just clippy                                        # clippy, warnings denied
 cargo run --release -p seacast-sim                 # the five settings of protocol-v2.md §6.2
 cargo run --release -p seacast-codec --example bench   # timings of the codec's hot paths
 ```

@@ -43,7 +43,7 @@ pub struct SeacastNode<B> {
     pub groups: Groups,
     pub chunks: PreallocMap<(GroupId, u32), ChunkMsg<B>>,
     pub known_id: PreallocMap<(GroupId, u32), ChunkId>,
-    /// When each expired group expired.
+    /// Until when each expired group is kept out.
     pub tombstones: PreallocMap<GroupId, Timestamp>,
 
     // Per peer and group diffusion state (`protocol-v2.md` §3)
@@ -83,7 +83,7 @@ pub struct SeacastNode<B> {
     // Gate deferral & equivocation ties (`protocol.md` §4.2)
     pub seen_ids: PreallocSet<ChunkId>,
     /// Chunks waiting for the domain's word on their group, with when each
-    /// arrived.
+    /// is dropped.
     pub pending: PreallocVec<(Timestamp, PeerId, ChunkMsg<B>)>,
     pub pending_ids: PreallocSet<ChunkId>,
     /// Chunks that passed the inline checks, for the host to verify, and their

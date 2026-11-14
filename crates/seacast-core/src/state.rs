@@ -93,6 +93,8 @@ pub struct Group {
     /// Whether the domain has authenticated the group: asked once, not once a
     /// chunk.
     pub authentic: bool,
+    /// When the group leaves the domain's window (`Domain::deadline`).
+    pub deadline: Option<Timestamp>,
     pub state: Option<GroupState>,
     pub received: Option<Bitmap>,
     pub rebuilt: Option<Bitmap>,

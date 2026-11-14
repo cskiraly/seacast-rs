@@ -64,6 +64,8 @@ struct Catalog {
     header_validated: bool,
     /// The domain does not take groups yet: their chunks are ignored.
     too_early: bool,
+    /// When the domain's window closes on every group, if it has one.
+    deadline: Option<Timestamp>,
     /// A second index every chunk is said to fill, as a faulty `project` would.
     stray_index: Option<u32>,
 }
@@ -81,6 +83,7 @@ impl Catalog {
             cells: Vec::new(),
             header_validated: false,
             too_early: false,
+            deadline: None,
             stray_index: None,
         }
     }
@@ -150,6 +153,10 @@ impl Domain for Catalog {
             ValidationResult::Defer
         }
     }
+    fn deadline(&self, _t: TypeId, _group: &GroupId, _context: &[u8]) -> Option<Timestamp> {
+        self.deadline
+    }
+
     fn authenticable(&self, _t: TypeId, _group: &GroupId) -> bool {
         true
     }
@@ -431,6 +438,44 @@ fn the_domain_ends_a_group_and_its_deferred_chunks() {
     world.env.now += world.node.config.group_ttl + 1.0;
     world.heartbeat();
     assert!(world.node.pending.is_empty() && world.node.pending_ids.is_empty());
+}
+
+/// A group the domain gave a deadline goes at it, sooner than `GROUP_TTL`, with
+/// its deferred chunks; one ended before the deadline is kept out until it,
+/// longer than `tombstone_ttl`.
+#[test]
+fn a_deadline_ends_a_group_and_bounds_its_tombstone() {
+    let mut catalog = Catalog::new(8, 8);
+    catalog.installed = Some([9; 32]);
+    let mut world = World::new(catalog, 1, InterestKind::All);
+    let ttl = world.node.config.group_ttl;
+    assert!(world.node.config.tombstone_ttl <= ttl);
+    world.catalog.deadline = Some(world.env.now + 4.0 * ttl);
+    let (ended, waiting) = (group(1), group(2));
+    world.rpc(1, chunk_rpc(chunk(ended, 0, [9; 32])));
+    world.node.end_group(ended, &mut world.env, &mut world.store);
+    world.env.now += 2.0 * ttl;
+    world.heartbeat();
+    assert!(world.node.expired(&ended));
+
+    world.catalog.deadline = Some(world.env.now + 2.0);
+    let held = group(3);
+    world.rpc(1, chunk_rpc(chunk(held, 0, [9; 32])));
+    world.rpc(1, chunk_rpc(chunk(waiting, 0, [5; 32])));
+    assert_eq!(world.node.group_state(&held), Some(GroupState::Collecting));
+    assert_eq!(world.node.pending.len(), 1);
+
+    world.env.now += 3.0;
+    world.heartbeat();
+    assert_eq!(world.node.group_state(&held), None);
+    assert!(world.node.chunks.is_empty() && world.node.pending.is_empty());
+    assert!(world.node.pending_ids.is_empty());
+    // Past its deadline a group needs no tombstone: the domain ignores it.
+    assert!(!world.node.expired(&held) && world.node.expired(&ended));
+
+    world.env.now += 2.0 * ttl;
+    world.heartbeat();
+    assert!(world.node.tombstones.is_empty());
 }
 
 /// Every index an offer makes the node ask for leaves in a WANT, however many

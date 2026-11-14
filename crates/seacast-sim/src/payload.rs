@@ -7,7 +7,7 @@
 use seacast_codec::{BufferPool, ChunkBytes, SegmentedCodec, Sha256};
 use seacast_core::{
     Bytes32, ChunkId, ChunkMsg, Domain, GroupId, InlineVec, Join, NodeId, PeerId, Policy,
-    PreallocVec, Shape, TypeCodec, TypeId, TypeParams, ValidationResult,
+    PreallocVec, Shape, Timestamp, TypeCodec, TypeId, TypeParams, ValidationResult,
 };
 
 use crate::PAYLOAD;
@@ -28,6 +28,11 @@ pub trait PayloadHost {
 
     /// Whether the domain commits `group` already (`Domain::authenticable`).
     fn authenticable(&self, group: &GroupId) -> bool;
+
+    /// When `context`'s slot leaves the live window (`Domain::deadline`).
+    fn deadline(&self, _group: &GroupId, _context: &[u8]) -> Option<Timestamp> {
+        None
+    }
 
     fn node_id(&self, peer: PeerId) -> NodeId;
 }
@@ -103,6 +108,10 @@ impl<Host: PayloadHost, Pool, B> Domain for PayloadCatalog<Host, Pool, B> {
 
     fn authenticable(&self, _t: TypeId, group: &GroupId) -> bool {
         self.host.authenticable(group)
+    }
+
+    fn deadline(&self, _t: TypeId, group: &GroupId, context: &[u8]) -> Option<Timestamp> {
+        self.host.deadline(group, context)
     }
 }
 

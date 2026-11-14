@@ -380,6 +380,15 @@ pub trait Domain {
     /// group before.
     fn authenticable(&self, t: TypeId, group: &GroupId) -> bool;
 
+    /// When a group of type `t` with this `context` leaves the domain's
+    /// window, on the host's clock: its state and its deferred chunks go then
+    /// at the latest, and its tombstone is kept until then. The domain
+    /// answers `Ignore` for the group from then on. `None`: the node's
+    /// lifetimes alone apply (`GROUP_TTL`, `tombstone_ttl`).
+    fn deadline(&self, _t: TypeId, _group: &GroupId, _context: &[u8]) -> Option<Timestamp> {
+        None
+    }
+
     /// The shape of a group the domain knows ahead of its chunks.
     fn shape_by_group(&self, _group: &GroupId) -> Option<Shape> {
         None

@@ -71,7 +71,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                     verdict
                 };
             }
-            self.groups.rec(chunk.group).authentic = true;
+            let deadline = catalog.deadline(chunk.type_id, &chunk.group, context);
+            let rec = self.groups.rec(chunk.group);
+            rec.authentic = true;
+            rec.deadline = deadline;
         }
         catalog.check_proof(chunk)
     }
@@ -314,7 +317,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         if deferred_store.reserve(peer, &chunk) {
             self.pending_ids.insert(chunk.cached_id);
-            let _ = self.pending.push((env.now(), peer, chunk));
+            let until = catalog
+                .deadline(chunk.type_id, &chunk.group, catalog.context(&chunk))
+                .unwrap_or(env.now() + self.config.group_ttl);
+            let _ = self.pending.push((until, peer, chunk));
         }
     }
 
@@ -684,7 +690,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     /// Ends the active lifetime of every group past it (`protocol.md` §8.1): a
     /// group `GROUP_TTL` after its last chunk or its completion leaves a
     /// tombstone and nothing else; a deferred chunk goes `GROUP_TTL` after
-    /// it arrived; a tombstone goes after its own time.
+    /// it arrived; a tombstone goes after its own time. A group the domain
+    /// gave a deadline goes at it if that is sooner, as do its deferred
+    /// chunks, and its tombstone is kept until it.
     pub(crate) fn expire_groups<E, D>(&mut self, env: &mut E, deferred_store: &mut D)
     where
         E: RuntimeEnv<B>,
@@ -694,7 +702,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let ttl = self.config.group_ttl;
         let mut at = 0;
         while at < self.pending.len() {
-            if now - self.pending[at].0 > ttl {
+            if now > self.pending[at].0 {
                 let (_, peer, chunk) = self.pending.remove(at);
                 self.pending_ids.remove(&chunk.cached_id);
                 deferred_store.release(peer, &chunk);
@@ -714,7 +722,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         loop {
             for (&group, rec) in self.groups.iter() {
                 let active = rec.last_activity.or(rec.known_at).unwrap_or(now);
-                if now - active > ttl {
+                if now - active > ttl || rec.deadline.is_some_and(|at| now > at) {
                     self.expiring.insert(group);
                 }
             }
@@ -724,8 +732,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             self.expire_due(now, env);
         }
 
-        let tombstone_ttl = self.config.tombstone_ttl;
-        self.tombstones.retain(|_, &mut since| now - since <= tombstone_ttl);
+        self.tombstones.retain(|_, &mut until| now <= until);
     }
 
     /// Removes everything kept of the groups in `expiring` but their
@@ -736,8 +743,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     {
         let dead = core::mem::replace(&mut self.expiring, crate::PreallocSet::with_capacity(0));
         for &group in dead.iter() {
-            self.groups.remove(&group);
-            self.tombstones.insert(group, now);
+            let deadline = self.groups.remove(&group).and_then(|rec| rec.deadline);
+            self.tombstones.insert(group, deadline.unwrap_or(now + self.config.tombstone_ttl));
         }
         let gone = |of: &GroupId| dead.contains(of);
         let gone_id =

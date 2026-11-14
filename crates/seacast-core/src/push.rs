@@ -408,9 +408,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if !self.groups.open(group, t) {
             return;
         }
+        let deadline = shards.first().and_then(|f| catalog.deadline(t, &group, catalog.context(f)));
         let rec = self.groups.rec(group);
         rec.hdr = Some(shape);
         rec.authentic = true;
+        rec.deadline = deadline;
         rec.interest = Some(catalog.own_interest(t, &group));
         rec.known_at.get_or_insert(now);
 
