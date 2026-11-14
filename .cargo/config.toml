@@ -1,0 +1,4 @@
+# The codec picks its SHA-256 and GF(2^8) kernels by `cfg(target_feature)`: without this, every
+# build takes the portable arms.
+[build]
+rustflags = ["-C", "target-cpu=native"]

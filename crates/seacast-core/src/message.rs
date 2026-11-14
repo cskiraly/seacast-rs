@@ -1,0 +1,329 @@
+use crate::{
+    bitmap::Bitmap,
+    collections::{InlineVec, MAX_ENTRY_CONTROL},
+    types::{Ask, ChunkId, Colour, Direction, Duty, FamilyId, GroupId, InterestKind, TypeId},
+};
+
+/// `Join`: per link and object type, sent by both ends (`protocol-v2.md` §2
+/// `[D11]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Join {
+    pub object_type: TypeId,
+    pub interest: InterestKind,
+    pub custody_count: u64,
+    pub duty: Duty,
+    pub colours: u16,
+}
+
+/// `Graft`: relation maintenance per family and colour (`protocol-v2.md` §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Graft {
+    pub object_type: TypeId,
+    pub family: FamilyId,
+    pub colour: Colour,
+    pub direction: Direction,
+}
+
+/// `Prune`: relation teardown per family and colour (`protocol-v2.md` §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Prune {
+    pub object_type: TypeId,
+    pub family: FamilyId,
+    pub colour: Colour,
+    pub direction: Direction,
+}
+
+/// `Have`: holding (`offer = false`) or offer (`offer = true`) bitmap
+/// (`protocol-v2.md` §2 `[c7, D3]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Have {
+    pub group: GroupId,
+    pub bits: Bitmap,
+    /// `true`: `"you may ask me for these"` (an offer);
+    /// `false`: `"I hold these, verified"` (a holding).
+    pub offer: bool,
+    /// `[c10, D3]` The decode claim (`claim_all`): sender holds or can produce
+    /// every index.
+    pub claim_all: bool,
+    /// `[D3]` Sender's interest in this group is satisfied (`complete`).
+    pub complete: bool,
+}
+
+impl Have {
+    #[inline]
+    pub const fn holding(group: GroupId, bits: Bitmap, claim_all: bool, complete: bool) -> Self {
+        Self { group, bits, offer: false, claim_all, complete }
+    }
+
+    #[inline]
+    pub const fn offer(group: GroupId, bits: Bitmap) -> Self {
+        Self { group, bits, offer: true, claim_all: false, complete: false }
+    }
+}
+
+/// `Want`: `"send me these"`, per recipient (`protocol-v2.md` §2 `[D2]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Want {
+    pub group: GroupId,
+    pub bits: Bitmap,
+    /// Distinguishes an offer-driven pull ask (which starts a `PROMISE` timer
+    /// when written, `protocol.md` §7.2) from a standing/probe/custodian
+    /// `Want` (which starts no `PROMISE` timer at write time,
+    /// `protocol-v2.md` §4.5, §4.6, §4.10).
+    pub track_promise: bool,
+}
+
+impl Want {
+    /// Creates an offer-driven pull ask for a single index (starts a promise
+    /// when written).
+    #[inline]
+    pub fn pull_ask(ask: Ask) -> Self {
+        Self { group: ask.group, bits: Bitmap::singleton(ask.index), track_promise: true }
+    }
+
+    /// Creates a standing / direct `Want` (e.g. for samplers, probes, or repair
+    /// custodian asks).
+    #[inline]
+    pub const fn standing(group: GroupId, bits: Bitmap) -> Self {
+        Self { group, bits, track_promise: false }
+    }
+}
+
+/// `ChunkMsg`: a chunk as the node holds it (`protocol-v2.md` §2). The node
+/// reads its type, group, index and id; its header, context, proof and data are
+/// the type's codec's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkMsg<B> {
+    pub type_id: TypeId,
+    pub group: GroupId,
+    pub index: u32,
+    /// The chunk's header, context, proof and data, laid out by its type's
+    /// codec.
+    pub frame: B,
+    /// Cached 56-byte structured chunk ID (`chunk_id(f)` / `message_id(f)`).
+    pub cached_id: ChunkId,
+}
+
+/// `Evidence`: fraud-proof object published when a group fails Level 2
+/// consistency (`protocol-v2.md` §2 `[D6]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Evidence<B> {
+    pub group: GroupId,
+    pub body: B,
+}
+
+/// Standalone RPC message bundle exchanged on a link (`protocol-v2.md` §4, §7).
+///
+/// Uses stack-allocated [`InlineVec`] for control messages and carries at most
+/// one [`ChunkMsg`] per wire frame, performing **zero heap allocation**.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rpc<B> {
+    pub joins: InlineVec<Join, 4>,
+    pub chunk: Option<ChunkMsg<B>>,
+    pub haves: InlineVec<Have, MAX_ENTRY_CONTROL>,
+    pub wants: InlineVec<Want, MAX_ENTRY_CONTROL>,
+    pub grafts: InlineVec<Graft, MAX_ENTRY_CONTROL>,
+    pub prunes: InlineVec<Prune, MAX_ENTRY_CONTROL>,
+    pub evidence: Option<Evidence<B>>,
+}
+
+impl<B> Default for Rpc<B> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            joins: InlineVec::new(),
+            chunk: None,
+            haves: InlineVec::new(),
+            wants: InlineVec::new(),
+            grafts: InlineVec::new(),
+            prunes: InlineVec::new(),
+            evidence: None,
+        }
+    }
+}
+
+impl<B> Rpc<B> {
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.joins.is_empty() &&
+            self.chunk.is_none() &&
+            self.haves.is_empty() &&
+            self.wants.is_empty() &&
+            self.grafts.is_empty() &&
+            self.prunes.is_empty() &&
+            self.evidence.is_none()
+    }
+}
+
+/// One control message waiting in a peer's queue.
+#[derive(Debug, Clone, Copy)]
+pub enum Control {
+    Join(Join),
+    Have(Have),
+    Want(Want),
+    Graft(Graft),
+    Prune(Prune),
+}
+
+/// What waits in a peer's queue (`protocol.md` §7): a chunk, named by the key
+/// it is stored under, or one control message. The entry that leaves is built
+/// from it when it is sent (`SeacastNode::next_to_send`), so a queue holds no
+/// chunk, proof or header, and an item is the same small size whatever it
+/// stands for.
+#[derive(Debug, Clone, Copy)]
+pub enum Queued {
+    Chunk { group: GroupId, index: u32, solicited: bool },
+    Control(Control),
+}
+
+impl Queued {
+    /// `chunk` as it is stored: under its own group and index.
+    #[inline]
+    pub fn from_chunk<B>(chunk: &ChunkMsg<B>, solicited: bool) -> Self {
+        Self::Chunk { group: chunk.group, index: chunk.index, solicited }
+    }
+
+    #[inline]
+    pub fn from_have(have: Have) -> Self {
+        Self::Control(Control::Have(have))
+    }
+
+    #[inline]
+    pub fn from_want(want: Want) -> Self {
+        Self::Control(Control::Want(want))
+    }
+
+    #[inline]
+    pub fn from_join(join: Join) -> Self {
+        Self::Control(Control::Join(join))
+    }
+
+    #[inline]
+    pub fn from_graft(graft: Graft) -> Self {
+        Self::Control(Control::Graft(graft))
+    }
+
+    #[inline]
+    pub fn from_prune(prune: Prune) -> Self {
+        Self::Control(Control::Prune(prune))
+    }
+
+    #[inline]
+    pub fn is_chunk(&self) -> bool {
+        matches!(self, Self::Chunk { .. })
+    }
+}
+
+/// An entry in a peer's two-lane send queue (`protocol.md` §7.2 `Entry`).
+/// Carries at most one chunk, plus optional control messages stored inline with
+/// zero heap allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueEntry<B> {
+    pub chunk: Option<ChunkMsg<B>>,
+    pub solicited: bool,
+    pub joins: InlineVec<Join, 4>,
+    pub haves: InlineVec<Have, MAX_ENTRY_CONTROL>,
+    pub wants: InlineVec<Want, MAX_ENTRY_CONTROL>,
+    pub grafts: InlineVec<Graft, MAX_ENTRY_CONTROL>,
+    pub prunes: InlineVec<Prune, MAX_ENTRY_CONTROL>,
+    pub evidence: Option<Evidence<B>>,
+}
+
+impl<B> Default for QueueEntry<B> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            chunk: None,
+            solicited: false,
+            joins: InlineVec::new(),
+            haves: InlineVec::new(),
+            wants: InlineVec::new(),
+            grafts: InlineVec::new(),
+            prunes: InlineVec::new(),
+            evidence: None,
+        }
+    }
+}
+
+impl<B> QueueEntry<B> {
+    #[inline]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    #[inline]
+    pub fn from_chunk(chunk: ChunkMsg<B>, solicited: bool) -> Self {
+        Self { chunk: Some(chunk), solicited, ..Self::default() }
+    }
+
+    #[inline]
+    pub fn from_have(have: Have) -> Self {
+        Self { haves: InlineVec::singleton(have), ..Self::default() }
+    }
+
+    #[inline]
+    pub fn from_want(want: Want) -> Self {
+        Self { wants: InlineVec::singleton(want), ..Self::default() }
+    }
+
+    #[inline]
+    pub fn from_join(join: Join) -> Self {
+        Self { joins: InlineVec::singleton(join), ..Self::default() }
+    }
+
+    #[inline]
+    pub fn from_graft(graft: Graft) -> Self {
+        Self { grafts: InlineVec::singleton(graft), ..Self::default() }
+    }
+
+    #[inline]
+    pub fn from_prune(prune: Prune) -> Self {
+        Self { prunes: InlineVec::singleton(prune), ..Self::default() }
+    }
+
+    /// Adds `control` if its kind has room in the entry.
+    #[inline]
+    pub fn push_control(&mut self, control: Control) -> bool {
+        match control {
+            Control::Join(join) => self.joins.push(join),
+            Control::Have(have) => self.haves.push(have),
+            Control::Want(want) => self.wants.push(want),
+            Control::Graft(graft) => self.grafts.push(graft),
+            Control::Prune(prune) => self.prunes.push(prune),
+        }
+    }
+
+    #[inline]
+    pub fn add_offer(&mut self, offer: Have) {
+        let _ = self.haves.push(offer);
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.chunk.is_none() &&
+            self.joins.is_empty() &&
+            self.haves.is_empty() &&
+            self.wants.is_empty() &&
+            self.grafts.is_empty() &&
+            self.prunes.is_empty() &&
+            self.evidence.is_none()
+    }
+
+    #[inline]
+    pub fn into_rpc(self) -> Rpc<B> {
+        Rpc {
+            joins: self.joins,
+            chunk: self.chunk,
+            haves: self.haves,
+            wants: self.wants,
+            grafts: self.grafts,
+            prunes: self.prunes,
+            evidence: self.evidence,
+        }
+    }
+}

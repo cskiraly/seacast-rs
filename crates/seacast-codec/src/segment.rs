@@ -1,0 +1,896 @@
+use seacast_core::{
+    Bytes32, ChunkBuffer, ChunkId, ChunkMsg, GroupId, MAX_BITMAP_BITS, PreallocVec, TypeId,
+};
+
+use crate::{
+    buffer::{BufferPool, ChunkBytes},
+    merkle::{
+        MerkleProof, MerkleTree, build_merkle_layers, merkle_proof_from_layers, tree_width,
+        verify_merkle_proof,
+    },
+    reed_solomon::{rs_complete_in_place, rs_parity_rows, rs_reconstruct_into},
+    sha256::Sha256,
+    snappy,
+};
+
+/// Target uncompressed segment size (`UNIT = 16 KiB` in `protocol.md` §1
+/// `[c1]`).
+pub const UNIT: usize = 16 * 1024;
+
+/// Maximum coded chunks (data + parity) (`MAX_CHUNKS = 256` in `protocol.md` §1
+/// `[c6]`).
+pub const MAX_CHUNKS: u32 = 256;
+
+/// Maximum plain (uncoded) chunks supported by a group (`MAX_BITMAP_BITS =
+/// 512`).
+pub const MAX_PLAIN_CHUNKS: usize = MAX_BITMAP_BITS;
+
+/// Maximum segment byte size (`MAX_SEGMENT_SIZE = 2 * UNIT = 32 KiB` in
+/// `protocol.md` §1 `[c1]`).
+pub const MAX_SEGMENT_SIZE: u32 = (2 * UNIT) as u32;
+
+/// Longest body a coded group carries: `MAX_CHUNKS / 2` data segments of
+/// `UNIT`. A coded group's segments decompress to at most this.
+pub const MAX_CODED_BODY: usize = (MAX_CHUNKS as usize / 2) * UNIT;
+
+/// Serialized size of a `SegmentDescriptor` in bytes (`1 + 1 + 1 + 4 + 4 + 8 +
+/// 32 = 51`).
+pub const DESCRIPTOR_BYTES: usize = 51;
+
+/// Pluggable pre-coding body compressor (`encoding = 1` in
+/// `SegmentDescriptor`).
+pub trait Compressor {
+    fn compress(&self, input: &[u8]) -> Vec<u8>;
+    fn decompress(&self, compressed: &[u8]) -> Option<Vec<u8>>;
+}
+
+/// Standard Snappy block format compressor/decompressor ([`snappy`]). It
+/// decompresses at most [`MAX_CODED_BODY`] bytes.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SnappyBlockCompressor;
+
+impl Compressor for SnappyBlockCompressor {
+    fn compress(&self, input: &[u8]) -> Vec<u8> {
+        snappy::compress(input)
+    }
+
+    fn decompress(&self, compressed: &[u8]) -> Option<Vec<u8>> {
+        snappy::decompress(compressed, MAX_CODED_BODY)
+    }
+}
+
+/// `SegmentDescriptor`: the header of a segmented group, which the domain
+/// commits (`protocol.md` §1 `[c1]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct SegmentDescriptor {
+    /// `2` = coded (compress first, then Reed–Solomon); `1` = plain.
+    pub version: u8,
+    /// `0` = SHA-256.
+    pub hash_id: u8,
+    /// `1` = snappy block compression applied before coding (`[c6]`); `0` =
+    /// plain.
+    pub encoding: u8,
+    /// `N`: total chunks in the group (data + parity).
+    pub count: u32,
+    /// Bytes per chunk (the last data chunk may be shorter).
+    pub segment_size: u32,
+    /// Length of the segmented byte string.
+    pub total_length: u64,
+    /// Merkle root over the `N` chunks.
+    pub root: Bytes32,
+}
+
+impl SegmentDescriptor {
+    /// Serializes the descriptor into its 51-byte SSZ layout (`serialize(d)` in
+    /// `protocol.md` §1).
+    pub fn serialize(&self) -> [u8; DESCRIPTOR_BYTES] {
+        let mut out = [0u8; DESCRIPTOR_BYTES];
+        out[0] = self.version;
+        out[1] = self.hash_id;
+        out[2] = self.encoding;
+        out[3..7].copy_from_slice(&self.count.to_le_bytes());
+        out[7..11].copy_from_slice(&self.segment_size.to_le_bytes());
+        out[11..19].copy_from_slice(&self.total_length.to_le_bytes());
+        out[19..51].copy_from_slice(&self.root);
+        out
+    }
+
+    /// Deserializes a `SegmentDescriptor` from 51 bytes.
+    pub fn deserialize(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < DESCRIPTOR_BYTES {
+            return None;
+        }
+        let mut root = [0u8; 32];
+        root.copy_from_slice(&bytes[19..51]);
+        Some(Self {
+            version: bytes[0],
+            hash_id: bytes[1],
+            encoding: bytes[2],
+            count: u32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]),
+            segment_size: u32::from_le_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]),
+            total_length: u64::from_le_bytes(bytes[11..19].try_into().unwrap()),
+            root,
+        })
+    }
+
+    /// Number of data chunks `K(d) = ceil(d.total_length / d.segment_size)`
+    /// (`protocol.md` §1).
+    #[inline]
+    pub fn k(&self) -> u32 {
+        if self.segment_size == 0 {
+            return 0;
+        }
+        // Saturated: a descriptor is a peer's until its group id has been checked by
+        // the domain, and no valid one has more than `MAX_PLAIN_CHUNKS` chunks.
+        u32::try_from(self.total_length.div_ceil(self.segment_size as u64)).unwrap_or(u32::MAX)
+    }
+
+    /// Total number of chunks `N(d) = d.count` (`protocol.md` §1).
+    #[inline]
+    pub fn n(&self) -> u32 {
+        self.count
+    }
+
+    /// Expected byte length of chunk `index` (`segment_length(d, i)` in
+    /// `protocol.md` §1).
+    #[inline]
+    pub fn segment_length(&self, index: u32) -> usize {
+        let k = self.k();
+        if k > 0 && index == k - 1 {
+            let prev = ((k - 1) as u64) * (self.segment_size as u64);
+            (self.total_length.saturating_sub(prev)) as usize
+        } else {
+            self.segment_size as usize
+        }
+    }
+
+    /// Checks whether this descriptor is valid before allocating group state
+    /// (`valid_descriptor(d)` in `protocol.md` §1).
+    pub fn is_valid(&self) -> bool {
+        if self.hash_id != 0 || self.segment_size == 0 || self.segment_size > MAX_SEGMENT_SIZE {
+            return false;
+        }
+        if self.total_length == 0 {
+            return false;
+        }
+        let k = self.k();
+        if k == 0 {
+            return false;
+        }
+        let last_len = self.total_length.checked_sub(((k - 1) as u64) * (self.segment_size as u64));
+        if !matches!(last_len, Some(l) if l > 0 && l <= (self.segment_size as u64)) {
+            return false;
+        }
+        match self.version {
+            2 => {
+                self.encoding == 1 && self.count <= MAX_CHUNKS && self.count as u64 == 2 * k as u64
+            }
+            1 => self.encoding == 0 && self.count == k && (self.count as usize) <= MAX_PLAIN_CHUNKS,
+            _ => false,
+        }
+    }
+}
+
+/// Computes `group_id(d) = sha256(0x02 || serialize(d))` (`protocol.md` §1).
+pub fn group_id(d: &SegmentDescriptor) -> Bytes32 {
+    let mut h = Sha256::new();
+    h.update(&[0x02]);
+    h.update(&d.serialize());
+    h.finalize()
+}
+
+/// The id of a group of a segmented type: `sha256(0x03 || uint16_le(type) ||
+/// header_id || context)`, where `header_id` is [`group_id`] of its descriptor
+/// and `context` is what the domain reads.
+pub fn group_key(type_id: TypeId, header_id: &Bytes32, context: &[u8]) -> GroupId {
+    let mut h = Sha256::new();
+    h.update(&[0x03]);
+    h.update(&type_id.0.to_le_bytes());
+    h.update(header_id);
+    h.update(context);
+    h.finalize()
+}
+
+/// The digests in the proof of any chunk of a group of `count` chunks.
+pub fn proof_len(count: u32) -> usize {
+    tree_width(count as usize).trailing_zeros() as usize
+}
+
+/// A segmented chunk's frame: `descriptor | context | proof | data`. Every
+/// length is given: the descriptor's is fixed, the context's is its type's, the
+/// proof's follows from the descriptor's count, and the data is the rest.
+pub struct Frame<'a> {
+    pub descriptor: SegmentDescriptor,
+    pub context: &'a [u8],
+    pub proof: &'a [u8],
+    pub data: &'a [u8],
+}
+
+impl Frame<'_> {
+    pub fn proof(&self) -> MerkleProof {
+        let mut proof = MerkleProof::new();
+        for digest in self.proof.as_chunks::<32>().0 {
+            let _ = proof.push(*digest);
+        }
+        proof
+    }
+}
+
+/// Splits `frame` into its parts. `None` if it is too short for them, or its
+/// descriptor's count is beyond what a proof covers.
+pub fn split_frame(frame: &[u8], context_len: usize) -> Option<Frame<'_>> {
+    let descriptor = SegmentDescriptor::deserialize(frame.get(..DESCRIPTOR_BYTES)?)?;
+    if descriptor.count as usize > MAX_PLAIN_CHUNKS {
+        return None;
+    }
+    let rest = &frame[DESCRIPTOR_BYTES..];
+    let (context, rest) = rest.split_at_checked(context_len)?;
+    let (proof, data) = rest.split_at_checked(32 * proof_len(descriptor.count))?;
+    Some(Frame { descriptor, context, proof, data })
+}
+
+/// The frame of a chunk: `descriptor | context | proof | data`.
+pub fn build_frame(
+    descriptor: &SegmentDescriptor,
+    context: &[u8],
+    proof: &[Bytes32],
+    data: &[u8],
+) -> Vec<u8> {
+    let mut frame =
+        Vec::with_capacity(DESCRIPTOR_BYTES + context.len() + 32 * proof.len() + data.len());
+    frame.extend_from_slice(&descriptor.serialize());
+    frame.extend_from_slice(context);
+    for digest in proof {
+        frame.extend_from_slice(digest);
+    }
+    frame.extend_from_slice(data);
+    frame
+}
+
+/// `MESSAGE_DOMAIN_VALID_SNAPPY` of the Altair networking rules.
+const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [1, 0, 0, 0];
+
+/// The 56-byte id of a chunk (`message_id(f)` in `protocol.md` §2): its group,
+/// its index, and its 20-byte content id, which is the message id of the Altair
+/// networking rules over `topic` and the chunk as it is sent: `uint16_le(type)
+/// | group | uint32_le(index) | frame`. The topic is the domain's, one a type.
+pub fn chunk_id(
+    topic: &[u8],
+    type_id: TypeId,
+    group: &GroupId,
+    index: u32,
+    frame: &[u8],
+) -> ChunkId {
+    let mut h = Sha256::new();
+    h.update(&MESSAGE_DOMAIN_VALID_SNAPPY);
+    h.update(&(topic.len() as u64).to_le_bytes());
+    h.update(topic);
+    h.update(&type_id.0.to_le_bytes());
+    h.update(group);
+    h.update(&index.to_le_bytes());
+    h.update(frame);
+    let mut out = [0u8; 56];
+    out[0..32].copy_from_slice(group);
+    out[32..36].copy_from_slice(&index.to_le_bytes());
+    out[36..56].copy_from_slice(&h.finalize()[..20]);
+    out
+}
+
+/// `Shard`: a chunk's content and stack-allocated [`MerkleProof`] built by the
+/// publisher (`protocol.md` §1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shard<B> {
+    pub index: u32,
+    pub proof: MerkleProof,
+    pub data: B,
+}
+
+/// Segments, optionally compresses and Reed–Solomon-encodes `body`, and builds
+/// the Merkle tree (`build_group(body)` in `protocol.md` §1 `[c1, c6]`).
+pub fn build_group<B, Pool, Comp>(
+    body: &[u8],
+    pool: &mut Pool,
+    compressor: &Comp,
+) -> (SegmentDescriptor, Vec<Shard<B>>)
+where
+    B: ChunkBuffer,
+    Pool: BufferPool<B>,
+    Comp: Compressor,
+{
+    assert!(!body.is_empty(), "body must not be empty");
+    let k = body.len().div_ceil(UNIT);
+    let coded = 2 * k <= MAX_CHUNKS as usize;
+    // Coded, the compressed bytes are padded in place to `k` whole segments: the
+    // Reed–Solomon input as it stands, with no copy per segment.
+    let mut compressed = if coded { compressor.compress(body) } else { Vec::new() };
+    let total = if coded { compressed.len() } else { body.len() };
+    assert!(total > 0, "the compressor returned nothing");
+    let size = total.div_ceil(k);
+    let mut parity = Vec::new();
+    if coded {
+        compressed.resize(k * size, 0);
+        parity.resize(k * size, 0);
+        let srcs: Vec<&[u8]> = compressed.chunks_exact(size).collect();
+        let rows: Vec<usize> = (k..2 * k).collect();
+        let mut dsts: Vec<&mut [u8]> = parity.chunks_exact_mut(size).collect();
+        rs_parity_rows(&srcs, 2 * k, &rows, &mut dsts);
+    }
+    let data = if coded { &compressed[..total] } else { body };
+
+    let mut leaves: Vec<&[u8]> =
+        (0..k).map(|i| &data[(i * size).min(total)..((i + 1) * size).min(total)]).collect();
+    leaves.extend(parity.chunks_exact(size));
+
+    let tree = build_merkle_layers(&leaves);
+    let root = tree.root();
+
+    let descriptor = SegmentDescriptor {
+        version: if coded { 2 } else { 1 },
+        hash_id: 0,
+        encoding: if coded { 1 } else { 0 },
+        count: leaves.len() as u32,
+        segment_size: size as u32,
+        total_length: total as u64,
+        root,
+    };
+
+    let mut shards = Vec::with_capacity(leaves.len());
+    for (i, leaf) in leaves.into_iter().enumerate() {
+        let proof = merkle_proof_from_layers(&tree, i);
+        shards.push(Shard { index: i as u32, proof, data: pool.alloc_from_slice(leaf) });
+    }
+    (descriptor, shards)
+}
+
+/// The part of level 1 that reads no data (`validate_chunk` in `protocol.md`
+/// §3): the frame splits, its descriptor is valid, `group` is the id of
+/// `type_id`, the descriptor and the context, `index` is one the descriptor
+/// has, and the data has the length it gives.
+pub fn check_frame(
+    type_id: TypeId,
+    group: &GroupId,
+    index: u32,
+    frame: &[u8],
+    context_len: usize,
+) -> bool {
+    let Some(f) = split_frame(frame, context_len) else {
+        return false;
+    };
+    f.descriptor.is_valid() &&
+        group_key(type_id, &group_id(&f.descriptor), f.context) == *group &&
+        index < f.descriptor.count &&
+        f.data.len() == f.descriptor.segment_length(index)
+}
+
+/// The rest of level 1: the data is leaf `index` of the tree with the
+/// descriptor's root.
+pub fn check_frame_proof(index: u32, frame: &[u8], context_len: usize) -> bool {
+    split_frame(frame, context_len).is_some_and(|f| {
+        verify_merkle_proof(&f.descriptor.root, f.data, index, f.descriptor.count, &f.proof())
+    })
+}
+
+/// The chunks of a group built by [`build_group`], as a publisher hands them to
+/// the node.
+pub fn build_chunks<B, Pool>(
+    type_id: TypeId,
+    topic: &[u8],
+    context: &[u8],
+    descriptor: &SegmentDescriptor,
+    shards: &[Shard<B>],
+    pool: &mut Pool,
+) -> Vec<ChunkMsg<B>>
+where
+    B: ChunkBytes,
+    Pool: BufferPool<B>,
+{
+    let group = group_key(type_id, &group_id(descriptor), context);
+    shards
+        .iter()
+        .map(|shard| {
+            let frame = build_frame(descriptor, context, &shard.proof, shard.data.as_bytes());
+            ChunkMsg {
+                type_id,
+                group,
+                index: shard.index,
+                cached_id: chunk_id(topic, type_id, &group, shard.index, &frame),
+                frame: pool.alloc_from_slice(&frame),
+            }
+        })
+        .collect()
+}
+
+/// Level 2 on a group whose chunks are kept where they were written
+/// (`protocol.md` §3, §4.6): `data` is the `K` data segments end to end, every
+/// one `segment_size` bytes, the last padded with zeros; `parity` is the other
+/// `N - K` chunks, laid out the same way; `have(i)` says chunk `i` is there.
+/// Every missing chunk is computed into its place, nothing present is moved,
+/// and the tree over all `N` must have the committed root.
+///
+/// The tree gives the proofs of the chunks filled in. `None` if `K` chunks are
+/// not there, or if the root differs: the group is inconsistent, and what was
+/// filled in is not to be used.
+pub fn complete_in_place(
+    descriptor: &SegmentDescriptor,
+    data: &mut [u8],
+    parity: &mut [u8],
+    have: impl Fn(usize) -> bool,
+) -> Option<MerkleTree> {
+    if !descriptor.is_valid() {
+        return None;
+    }
+    let (k, n) = (descriptor.k() as usize, descriptor.n() as usize);
+    let size = descriptor.segment_size as usize;
+    if data.len() != k * size || parity.len() != (n - k) * size {
+        return None;
+    }
+    rs_complete_in_place(k, n, data, parity, have)?;
+    let leaves: Vec<&[u8]> = (0..k)
+        .map(|i| &data[i * size..][..descriptor.segment_length(i as u32)])
+        .chain(parity.chunks_exact(size))
+        .collect();
+    let tree = build_merkle_layers(&leaves);
+    (tree.root() == descriptor.root).then_some(tree)
+}
+
+/// The length of the body a complete group's data segments hold: what
+/// [`body_into`] writes. A caller reserves that much; a coded group's is at
+/// most [`MAX_CODED_BODY`].
+pub fn body_len(descriptor: &SegmentDescriptor, data: &[u8]) -> Option<usize> {
+    let segmented = data.get(..usize::try_from(descriptor.total_length).ok()?)?;
+    match descriptor.encoding {
+        1 => snappy::decompressed_len(segmented).filter(|&len| len <= MAX_CODED_BODY),
+        _ => Some(segmented.len()),
+    }
+}
+
+/// Writes the body of a complete group at the start of `out`, from its data
+/// segments where they lie, and returns its length: the one move of the body's
+/// bytes after their arrival. The data segments end to end are the segmented
+/// byte string itself, so nothing is gathered.
+pub fn body_into(descriptor: &SegmentDescriptor, data: &[u8], out: &mut [u8]) -> Option<usize> {
+    let segmented = data.get(..usize::try_from(descriptor.total_length).ok()?)?;
+    match descriptor.encoding {
+        1 => {
+            snappy::decompressed_len(segmented).filter(|&len| len <= MAX_CODED_BODY)?;
+            snappy::decompress_into(segmented, out)
+        }
+        _ => {
+            out.get_mut(..segmented.len())?.copy_from_slice(segmented);
+            Some(segmented.len())
+        }
+    }
+}
+
+/// The data of a chunk whose frame has `skip` bytes before it.
+fn data_at<B: ChunkBytes>(chunk: &ChunkMsg<B>, skip: usize) -> &[u8] {
+    chunk.frame.as_bytes().get(skip..).unwrap_or(&[])
+}
+
+/// Level 2 decoding: reconstructs all `N` chunks from any `K` verified chunks
+/// in `available`, re-encodes parity, verifies the Merkle root, populates
+/// `out_rebuilt` with all `N` chunks, and returns the decompressed body
+/// allocated via `pool` (`decode_and_reencode` in `protocol.md` §1, §4.6).
+pub fn decode_and_reencode<B, Pool, Comp>(
+    available_chunks: &[ChunkMsg<B>],
+    context_len: usize,
+    pool: &mut Pool,
+    compressor: &Comp,
+    out_rebuilt: &mut PreallocVec<ChunkMsg<B>>,
+    topic: &[u8],
+) -> Option<B>
+where
+    B: ChunkBytes,
+    Pool: BufferPool<B>,
+    Comp: Compressor,
+{
+    let first_chunk = available_chunks.first()?;
+    let head = split_frame(first_chunk.frame.as_bytes(), context_len)?;
+    let (descriptor, context) = (&head.descriptor, head.context);
+    if !descriptor.is_valid() {
+        return None;
+    }
+    let k = descriptor.k() as usize;
+    let n = descriptor.n() as usize;
+    let seg_size = descriptor.segment_size as usize;
+    if available_chunks.len() < k {
+        return None;
+    }
+    let (type_id, group) = (first_chunk.type_id, first_chunk.group);
+    // Every chunk of the group has the same header, context and proof length before
+    // its data.
+    let skip = DESCRIPTOR_BYTES + context_len + 32 * proof_len(descriptor.count);
+
+    // The first chunk given of each index.
+    let mut given: [Option<&ChunkMsg<B>>; MAX_PLAIN_CHUNKS] = [None; MAX_PLAIN_CHUNKS];
+    for ch in available_chunks {
+        if let Some(entry @ None) = given.get_mut(ch.index as usize) {
+            *entry = Some(ch);
+        }
+    }
+
+    // The data segments end to end, every one `seg_size` bytes; coded, the parity
+    // chunks that were not among the `k` decoded from.
+    let mut data = Vec::new();
+    let mut parity = Vec::new();
+    let mut leaves: Vec<&[u8]> = Vec::with_capacity(n);
+    if descriptor.version == 2 {
+        let used = &available_chunks[..k];
+        if used.iter().any(|ch| {
+            ch.index as usize >= n || data_at(ch, skip).len() != descriptor.segment_length(ch.index)
+        }) {
+            return None;
+        }
+        // The last data chunk alone may be shorter than a segment: padded, as it was
+        // coded.
+        let last = (k - 1) as u32;
+        let short = descriptor.segment_length(last) < seg_size;
+        let mut padded_last = Vec::new();
+        if let Some(ch) = used.iter().find(|ch| short && ch.index == last) {
+            padded_last.extend_from_slice(data_at(ch, skip));
+            padded_last.resize(seg_size, 0);
+        }
+        let indices: Vec<u32> = used.iter().map(|ch| ch.index).collect();
+        let chunks: Vec<&[u8]> = used
+            .iter()
+            .map(|ch| if short && ch.index == last { &padded_last[..] } else { data_at(ch, skip) })
+            .collect();
+        data.resize(k * seg_size, 0);
+        rs_reconstruct_into(k, n, &indices, &chunks, &mut data)?;
+
+        // Decoding from `k` chunks and coding again gives those `k` back whatever they
+        // hold, so only the other parity chunks are computed; the root check
+        // below covers them all.
+        let other_parity: Vec<usize> = (k..n).filter(|r| !indices.contains(&(*r as u32))).collect();
+        parity.resize(other_parity.len() * seg_size, 0);
+        let srcs: Vec<&[u8]> = data.chunks_exact(seg_size).collect();
+        let mut dsts: Vec<&mut [u8]> = parity.chunks_exact_mut(seg_size).collect();
+        rs_parity_rows(&srcs, n, &other_parity, &mut dsts);
+
+        leaves.extend((0..k).map(|i| &data[i * seg_size..][..descriptor.segment_length(i as u32)]));
+        let mut computed = parity.chunks_exact(seg_size);
+        for r in k..n {
+            leaves.push(match used.iter().find(|ch| ch.index as usize == r) {
+                Some(ch) => data_at(ch, skip),
+                None => computed.next()?,
+            });
+        }
+    } else {
+        for chunk in &given[..k] {
+            let bytes = data_at((*chunk)?, skip);
+            leaves.push(bytes);
+            data.extend_from_slice(bytes);
+        }
+    }
+
+    let tree = build_merkle_layers(&leaves);
+    if tree.root() != descriptor.root {
+        return None;
+    }
+
+    let segmented_bytes = data.get(..descriptor.total_length as usize)?;
+    let body_buf = if descriptor.encoding == 1 {
+        pool.alloc_from_slice(&compressor.decompress(segmented_bytes)?)
+    } else {
+        pool.alloc_from_slice(segmented_bytes)
+    };
+
+    out_rebuilt.clear();
+    for (i, leaf) in leaves.into_iter().enumerate() {
+        let idx = i as u32;
+        if let Some(existing) = given[i] {
+            let _ = out_rebuilt.push(existing.clone());
+        } else {
+            let proof = merkle_proof_from_layers(&tree, i);
+            let frame = build_frame(descriptor, context, &proof, leaf);
+            let msg = ChunkMsg {
+                type_id,
+                group,
+                index: idx,
+                cached_id: chunk_id(topic, type_id, &group, idx, &frame),
+                frame: pool.alloc_from_slice(&frame),
+            };
+            let _ = out_rebuilt.push(msg);
+        }
+    }
+    Some(body_buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::buffer::VecBufferPool;
+
+    const TOPIC: &[u8] = b"topic";
+    /// What a domain would put there: these tests only carry it.
+    const CONTEXT: [u8; 40] = [3; 40];
+
+    fn valid(chunk: &ChunkMsg<Vec<u8>>) -> bool {
+        let (index, frame) = (chunk.index, &chunk.frame[..]);
+        check_frame(chunk.type_id, &chunk.group, index, frame, CONTEXT.len()) &&
+            check_frame_proof(index, frame, CONTEXT.len())
+    }
+
+    #[test]
+    fn test_build_and_decode_group() {
+        let mut pool = VecBufferPool;
+        let comp = SnappyBlockCompressor;
+        let body: Vec<u8> = (0..(UNIT * 4 + 1234)).map(|i| (i % 251) as u8).collect();
+        let (desc, shards) = build_group(&body, &mut pool, &comp);
+        assert!(desc.is_valid());
+        assert_eq!(desc.version, 2);
+        assert_eq!(desc.k(), 5);
+        assert_eq!(desc.n(), 10);
+        assert_eq!(shards.len(), 10);
+
+        // Indices 1, 3, 5, 7, 9: data and parity, without index 4, the short last data
+        // chunk.
+        let subset = chunks_of(&desc, &shards, [1, 3, 5, 7, 9].into_iter());
+        assert!(subset.iter().all(valid));
+
+        let mut rebuilt = PreallocVec::with_capacity(16);
+        let recovered =
+            decode_and_reencode(&subset, CONTEXT.len(), &mut pool, &comp, &mut rebuilt, TOPIC)
+                .expect("level 2 decode");
+        assert_eq!(rebuilt.len(), 10);
+        assert_eq!(recovered, body);
+        for ch in rebuilt.iter() {
+            assert!(valid(ch));
+        }
+    }
+
+    fn chunks_of(
+        desc: &SegmentDescriptor,
+        shards: &[Shard<Vec<u8>>],
+        indices: impl Iterator<Item = usize>,
+    ) -> Vec<ChunkMsg<Vec<u8>>> {
+        let all = build_chunks(TypeId(0), TOPIC, &CONTEXT, desc, shards, &mut VecBufferPool);
+        indices.map(|i| all[i].clone()).collect()
+    }
+
+    /// Bodies that compress and bodies that do not, decoded from the data
+    /// alone, the parity alone and a mix, with the rebuilt chunks the ones
+    /// the publisher made.
+    #[test]
+    fn test_decode_from_any_half() {
+        let mut pool = VecBufferPool;
+        let comp = SnappyBlockCompressor;
+        let mut state = 5u64;
+        let mut noise = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 56) as u8
+        };
+        for len in [1, 1000, UNIT, UNIT + 1, 7 * UNIT + 99, 128 * UNIT] {
+            for compressible in [false, true] {
+                let body: Vec<u8> = (0..len)
+                    .map(|i| if compressible { (i / 7 % 13) as u8 } else { noise() })
+                    .collect();
+                let (desc, shards) = build_group::<Vec<u8>, _, _>(&body, &mut pool, &comp);
+                assert!(desc.is_valid() && desc.version == 2, "{len} bytes");
+                let (k, n) = (desc.k() as usize, desc.n() as usize);
+                assert_eq!((shards.len(), n), (n, 2 * k));
+                let subsets: [Vec<usize>; 4] = [
+                    (0..k).collect(),
+                    (k..n).collect(),
+                    (0..n).filter(|i| i % 2 == 1).collect(),
+                    (0..n).rev().filter(|i| i % 3 != 0).take(k).collect(),
+                ];
+                for subset in subsets {
+                    let available = chunks_of(&desc, &shards, subset.iter().copied());
+                    let mut rebuilt = PreallocVec::with_capacity(n);
+                    let decoded = decode_and_reencode(
+                        &available,
+                        CONTEXT.len(),
+                        &mut pool,
+                        &comp,
+                        &mut rebuilt,
+                        TOPIC,
+                    );
+                    assert_eq!(decoded.as_ref(), Some(&body), "{len} bytes from {subset:?}");
+                    assert_eq!(rebuilt.len(), n);
+                    for (i, ch) in rebuilt.iter().enumerate() {
+                        let frame = split_frame(&ch.frame, CONTEXT.len()).expect("a frame");
+                        assert_eq!(
+                            (ch.index as usize, frame.data, frame.proof()),
+                            (i, &shards[i].data[..], shards[i].proof)
+                        );
+                        assert!(valid(ch));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_decode_refuses_bad_chunks() {
+        let mut pool = VecBufferPool;
+        let comp = SnappyBlockCompressor;
+        let body: Vec<u8> = (0..5 * UNIT).map(|i| (i * i % 251) as u8).collect();
+        let (desc, shards) = build_group::<Vec<u8>, _, _>(&body, &mut pool, &comp);
+        let k = desc.k() as usize;
+        let mut rebuilt = PreallocVec::with_capacity(2 * k);
+        let mut decode = |available: &[ChunkMsg<Vec<u8>>]| {
+            decode_and_reencode(
+                available,
+                CONTEXT.len(),
+                &mut VecBufferPool,
+                &comp,
+                &mut rebuilt,
+                TOPIC,
+            )
+        };
+        let good = chunks_of(&desc, &shards, 1..k + 1);
+        assert_eq!(decode(&good), Some(body.clone()));
+        // A byte changed in a data chunk and in a parity chunk, a chunk given twice,
+        // one of the wrong length, an index outside the group, and too few
+        // chunks.
+        for at in [0, k - 1] {
+            let mut bad = good.clone();
+            // Past the descriptor, the context and the proof: in the data.
+            let last = bad[at].frame.len() - 5;
+            bad[at].frame[last] ^= 1;
+            assert_eq!(decode(&bad), None);
+        }
+        let mut bad = good.clone();
+        bad[1] = bad[0].clone();
+        assert_eq!(decode(&bad), None);
+        let mut bad = good.clone();
+        bad[2].frame.pop();
+        assert_eq!(decode(&bad), None);
+        let mut bad = good.clone();
+        bad[3].index = 2 * k as u32;
+        assert_eq!(decode(&bad), None);
+        assert_eq!(decode(&good[1..]), None);
+    }
+
+    /// A descriptor is checked before its group id is: no field of it may
+    /// overflow the checks.
+    #[test]
+    fn test_descriptor_limits_do_not_overflow() {
+        let base = SegmentDescriptor {
+            version: 1,
+            hash_id: 0,
+            encoding: 0,
+            count: 1,
+            segment_size: 1,
+            total_length: u64::MAX,
+            root: [0; 32],
+        };
+        assert!(!base.is_valid());
+        for (segment_size, total_length, count, version, encoding) in [
+            (1, (1u64 << 32) + 1, 1, 1, 0),
+            (MAX_SEGMENT_SIZE, u64::MAX, u32::MAX, 1, 0),
+            (3, 3 * (1u64 << 31), 0, 2, 1),
+            (MAX_SEGMENT_SIZE, u64::MAX - 1, 2, 2, 1),
+        ] {
+            let d =
+                SegmentDescriptor { version, encoding, count, segment_size, total_length, ..base };
+            assert!(!d.is_valid(), "{d:?}");
+            let _ = (d.k(), d.segment_length(0), d.segment_length(d.k().saturating_sub(1)));
+        }
+    }
+
+    /// A group kept in place: chunks written once into their slots, whatever is
+    /// missing computed there, and the body decompressed straight out of
+    /// the data slots.
+    #[test]
+    fn test_decode_in_place() {
+        let mut pool = VecBufferPool;
+        let comp = SnappyBlockCompressor;
+        for len in [1, UNIT + 1, 7 * UNIT + 99, 128 * UNIT] {
+            let body: Vec<u8> = (0..len).map(|i| (i / 5 % 17) as u8 ^ (i >> 9) as u8).collect();
+            let (desc, shards) = build_group::<Vec<u8>, _, _>(&body, &mut pool, &comp);
+            let (k, n, size) = (desc.k() as usize, desc.n() as usize, desc.segment_size as usize);
+            for kept in [0, 1, 2] {
+                // Every chunk, the parity alone, and every other one.
+                let have = |i: usize| match kept {
+                    0 => true,
+                    1 => i >= k,
+                    _ => i % 2 == 1,
+                };
+                let (mut data, mut parity) = (vec![0u8; k * size], vec![0u8; (n - k) * size]);
+                for shard in shards.iter().filter(|shard| have(shard.index as usize)) {
+                    let i = shard.index as usize;
+                    let slot =
+                        if i < k { &mut data[i * size..] } else { &mut parity[(i - k) * size..] };
+                    slot[..shard.data.len()].copy_from_slice(&shard.data);
+                }
+                let tree =
+                    complete_in_place(&desc, &mut data, &mut parity, have).expect("consistent");
+                for shard in &shards {
+                    let i = shard.index as usize;
+                    let slot = if i < k { &data[i * size..] } else { &parity[(i - k) * size..] };
+                    assert_eq!(
+                        &slot[..shard.data.len()],
+                        &shard.data[..],
+                        "{len} bytes, chunk {i}"
+                    );
+                    assert_eq!(merkle_proof_from_layers(&tree, i), shard.proof);
+                }
+                let mut out = vec![0u8; body_len(&desc, &data).expect("well formed")];
+                assert_eq!(body_into(&desc, &data, &mut out), Some(body.len()));
+                assert!(out == body, "{len} bytes");
+            }
+            // A chunk that is not the committed one fails the root, and too few chunks
+            // decode nothing.
+            let (mut data, mut parity) = (vec![0u8; k * size], vec![0u8; (n - k) * size]);
+            for shard in &shards {
+                let i = shard.index as usize;
+                let slot =
+                    if i < k { &mut data[i * size..] } else { &mut parity[(i - k) * size..] };
+                slot[..shard.data.len()].copy_from_slice(&shard.data);
+            }
+            parity[0] ^= 1;
+            assert!(complete_in_place(&desc, &mut data, &mut parity, |i| i >= k).is_none());
+            assert!(complete_in_place(&desc, &mut data, &mut parity, |i| i > k).is_none());
+        }
+    }
+
+    /// The content id is the Altair message id over the topic and the chunk as
+    /// it is sent: its type, group and index, then its frame.
+    #[test]
+    fn test_chunk_id_is_the_altair_message_id() {
+        let (group, frame) = ([2u8; 32], [5u8, 6, 7, 8, 9]);
+        let mut message = vec![1, 0, 0, 0];
+        message.extend_from_slice(&(TOPIC.len() as u64).to_le_bytes());
+        message.extend_from_slice(TOPIC);
+        message.extend_from_slice(&TypeId(1).0.to_le_bytes());
+        message.extend_from_slice(&group);
+        message.extend_from_slice(&1u32.to_le_bytes());
+        message.extend_from_slice(&frame);
+        let id = chunk_id(TOPIC, TypeId(1), &group, 1, &frame);
+        assert_eq!(id[..32], group);
+        assert_eq!(id[32..36], 1u32.to_le_bytes());
+        assert_eq!(id[36..], crate::sha256::sha256(&message)[..20]);
+        // Another frame for the same index is another chunk, as is another topic's or
+        // type's.
+        assert_ne!(id, chunk_id(TOPIC, TypeId(1), &group, 1, &frame[..4]));
+        assert_ne!(id, chunk_id(b"other", TypeId(1), &group, 1, &frame));
+        assert_ne!(id, chunk_id(TOPIC, TypeId(0), &group, 1, &frame));
+    }
+
+    /// A body of 10 MiB is a plain group of 640 chunks: more
+    /// than half the indices a bitmap names, and within them.
+    #[test]
+    fn test_largest_gossip_body_fits_a_group() {
+        let mut pool = VecBufferPool;
+        let comp = SnappyBlockCompressor;
+        let body: Vec<u8> = (0..10 << 20).map(|i| (i % 241) as u8).collect();
+        let (desc, shards) = build_group::<Vec<u8>, _, _>(&body, &mut pool, &comp);
+        assert!(desc.is_valid() && desc.version == 1 && desc.count == 640);
+        let available = chunks_of(&desc, &shards, 0..640);
+        assert!(available.iter().all(valid));
+        let mut rebuilt = PreallocVec::with_capacity(640);
+        let decoded =
+            decode_and_reencode(&available, CONTEXT.len(), &mut pool, &comp, &mut rebuilt, TOPIC);
+        assert!(decoded.as_ref() == Some(&body));
+    }
+
+    /// A body past the coded limit goes uncoded and uncompressed.
+    #[test]
+    fn test_plain_group_round_trip() {
+        let mut pool = VecBufferPool;
+        let comp = SnappyBlockCompressor;
+        let body: Vec<u8> = (0..129 * UNIT + 5).map(|i| (i % 253) as u8).collect();
+        let (desc, shards) = build_group::<Vec<u8>, _, _>(&body, &mut pool, &comp);
+        assert!(desc.is_valid() && desc.version == 1 && desc.count == 130);
+        let available = chunks_of(&desc, &shards, (0..130).rev());
+        let mut rebuilt = PreallocVec::with_capacity(130);
+        assert_eq!(
+            decode_and_reencode(&available, CONTEXT.len(), &mut pool, &comp, &mut rebuilt, TOPIC),
+            Some(body)
+        );
+        assert_eq!(rebuilt.len(), 130);
+        assert_eq!(
+            decode_and_reencode(
+                &available[1..],
+                CONTEXT.len(),
+                &mut pool,
+                &comp,
+                &mut rebuilt,
+                TOPIC
+            ),
+            None
+        );
+    }
+}

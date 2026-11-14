@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/seacast-core",
+    "crates/seacast-codec",
+    "crates/seacast-sim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "CC0-1.0"
+repository = "https://github.com/cskiraly/informed-diffusion-spec"
