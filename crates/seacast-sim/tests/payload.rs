@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use seacast_codec::{
     MerkleProof, SegmentDescriptor, SegmentedCodec, SnappyBlockCompressor, UNIT, VecBufferPool,
-    build_frame, build_group, build_merkle_layers, chunk_id, group_id, group_key,
+    build_frame, build_group, build_merkle_layers, chunk_id, group_id, group_key, leaf_hash,
     merkle_proof_from_layers, split_frame,
 };
 use seacast_core::{
@@ -19,7 +19,6 @@ use seacast_sim::{
     payload::{PayloadCatalog, PayloadHost},
 };
 
-const TOPIC: &[u8] = b"/eth2/00000000/execution_payload_chunk/ssz_snappy";
 const SLOT: u64 = 7;
 const ROOT: Bytes32 = [0xb1; 32];
 /// A payload chunk's context in this domain: its slot, then its block root.
@@ -125,7 +124,7 @@ impl World {
     fn new() -> Self {
         let catalog = PayloadCatalog::new(
             Blocks::default(),
-            SegmentedCodec::new(VecBufferPool, CONTEXT_LEN, TOPIC),
+            SegmentedCodec::new(VecBufferPool, CONTEXT_LEN),
             TypeParams::default(),
             join(),
         );
@@ -211,7 +210,7 @@ fn chunks(
                 type_id: PAYLOAD,
                 group,
                 index: i as u32,
-                cached_id: chunk_id(TOPIC, PAYLOAD, &group, i as u32, &frame),
+                cached_id: chunk_id(&group, i as u32, &leaf_hash(&leaves[i])),
                 frame,
                 memo: [0; 32],
             }

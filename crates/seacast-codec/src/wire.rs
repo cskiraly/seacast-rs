@@ -1,40 +1,68 @@
 use std::ops::Range;
 
 use seacast_core::{
-    Bitmap, Bytes32, ChunkBuffer, ChunkId, ChunkMsg, Direction, Duty, Evidence, Graft, Have,
-    InlineVec, InterestKind, Join, MAX_ENTRY_CONTROL, MAX_HAVE_BYTES, Prune, Rpc, TypeId, Want,
+    Bitmap, Bytes32, ChunkBuffer, Direction, Duty, Evidence, Graft, GroupId, Have, InlineVec,
+    InterestKind, Join, MAX_ENTRY_CONTROL, MAX_HAVE_BYTES, Prune, Rpc, TypeId, Want,
 };
 
-use crate::{
-    buffer::{BufferPool, ChunkBytes},
-    segment::chunk_id,
-};
+use crate::buffer::{BufferPool, ChunkBytes};
 
-/// Magic prefix for standalone SEACAST v2 RPC frames (`"SEAC\x02"`).
-pub const SEACAST_V2_MAGIC: [u8; 5] = *b"SEAC\x02";
+/// The type a control message is sent with, where a chunk has its object
+/// type: no object type has this id.
+pub const CONTROL_TYPE: TypeId = TypeId(0xffff);
 
-/// The most bytes of an encoded `Rpc` before its evidence body and its chunk's
-/// frame, which have no bound here. Nothing in the encoding delimits a message
-/// or limits those two: the transport does, with this plus the longest body and
-/// frame its types allow.
-pub const MAX_RPC_CONTROL_BYTES: usize = SEACAST_V2_MAGIC.len() +
+/// The most bytes of an encoded control message before its evidence body,
+/// which has no bound here. Nothing in the encoding delimits a message: the
+/// transport does.
+pub const MAX_CONTROL_BYTES: usize = 2 +
     (2 + MAX_ENTRY_CONTROL * (2 + 1 + 8 + 1 + 2)) +
     2 * (2 + MAX_ENTRY_CONTROL * (1 + 2 + 32 + 2 + MAX_HAVE_BYTES)) +
     2 * (2 + MAX_ENTRY_CONTROL * (2 + 4 + 2 + 1)) +
-    (2 + 32 + 4) +
-    (2 + 2 + 32 + 4);
+    (2 + 32 + 4);
 
-/// Encodes a standalone SEACAST v2 `Rpc` but for the bytes of its evidence body
-/// and of its chunk, which close the frame in that order (`protocol-v2.md` §2,
-/// §7): the frame is what this appends to `out`, then the body, then the data.
-/// A writer that gathers sends the three as they lie, with no copy of a chunk.
-/// Returns the two handles.
-pub fn encode_rpc_framing<'a, B>(rpc: &'a Rpc<B>, out: &mut Vec<u8>) -> [Option<&'a B>; 2]
+/// What a chunk is sent with before its frame: `type | group | index`. A
+/// message is either this and a frame, or a control message; both start with
+/// a type, so a reader knows from the first two bytes which it has, and for a
+/// chunk how its frame is laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkHead {
+    pub type_id: TypeId,
+    pub group: GroupId,
+    pub index: u32,
+}
+
+impl ChunkHead {
+    pub const BYTES: usize = 2 + 32 + 4;
+
+    pub fn encode(&self) -> [u8; Self::BYTES] {
+        let mut out = [0u8; Self::BYTES];
+        out[..2].copy_from_slice(&self.type_id.0.to_le_bytes());
+        out[2..34].copy_from_slice(&self.group);
+        out[34..].copy_from_slice(&self.index.to_le_bytes());
+        out
+    }
+
+    pub fn parse(bytes: &[u8; Self::BYTES]) -> Self {
+        let mut group = [0u8; 32];
+        group.copy_from_slice(&bytes[2..34]);
+        Self {
+            type_id: TypeId(u16::from_le_bytes([bytes[0], bytes[1]])),
+            group,
+            index: u32::from_le_bytes([bytes[34], bytes[35], bytes[36], bytes[37]]),
+        }
+    }
+}
+
+/// Encodes the control messages of `rpc` but for the bytes of its evidence
+/// body, which close the message: the message is what this writes to `out`,
+/// then the body. A chunk of `rpc` is not written: it is a message of its own
+/// ([`ChunkHead`], then its frame). Returns the body's handle.
+pub fn encode_control_framing<'a, B>(rpc: &'a Rpc<B>, out: &mut Vec<u8>) -> Option<&'a B>
 where
     B: ChunkBuffer,
 {
     out.clear();
-    out.extend_from_slice(&SEACAST_V2_MAGIC);
+    put_u16(out, CONTROL_TYPE.0);
 
     // 1. Joins
     put_u16(out, rpc.joins.len() as u16);
@@ -114,88 +142,53 @@ where
         put_u16(out, 0);
     }
 
-    // 8. Chunk (at most 1 per RPC frame): its type, group and index. Its frame is
-    //    the last
-    // thing sent and has no length: its type and its header give every length in
-    // it.
-    if let Some(ref ch) = rpc.chunk {
-        put_u16(out, 1);
-        put_u16(out, ch.type_id.0);
-        out.extend_from_slice(&ch.group);
-        put_u32(out, ch.index);
-    } else {
-        put_u16(out, 0);
-    }
-    [rpc.evidence.as_ref().map(|ev| &ev.body), rpc.chunk.as_ref().map(|ch| &ch.frame)]
+    rpc.evidence.as_ref().map(|ev| &ev.body)
 }
 
-/// Encodes a standalone SEACAST v2 `Rpc` into a caller-supplied byte buffer
-/// (`protocol-v2.md` §2, §7). If `out` is preallocated with sufficient
-/// capacity, performs zero heap allocations.
-pub fn encode_rpc_into<B>(rpc: &Rpc<B>, out: &mut Vec<u8>)
+/// [`encode_control_framing`] and the evidence body, appended.
+pub fn encode_control_into<B>(rpc: &Rpc<B>, out: &mut Vec<u8>)
 where
     B: ChunkBytes,
 {
-    for trailing in encode_rpc_framing(rpc, out).into_iter().flatten() {
-        out.extend_from_slice(trailing.as_bytes());
+    if let Some(body) = encode_control_framing(rpc, out) {
+        out.extend_from_slice(body.as_bytes());
     }
 }
 
-/// Encodes a standalone SEACAST v2 `Rpc` into bytes (`protocol-v2.md` §2, §7).
-pub fn encode_rpc<B>(rpc: &Rpc<B>) -> Vec<u8>
+pub fn encode_control<B>(rpc: &Rpc<B>) -> Vec<u8>
 where
     B: ChunkBytes,
 {
     let mut out = Vec::new();
-    encode_rpc_into(rpc, &mut out);
+    encode_control_into(rpc, &mut out);
     out
 }
 
-/// A decoded chunk's fields, for the function that gives it its id.
-pub struct ChunkParts<'a> {
-    pub type_id: TypeId,
-    pub group: &'a Bytes32,
-    pub index: u32,
-    pub frame: &'a [u8],
-}
-
-/// The id function of chunks that are all on `topic`, for [`decode_rpc`] and
-/// [`decode_rpc_with`]. A host with several types gives a function that picks
-/// the topic of `type_id`.
-pub fn chunk_id_on(topic: &[u8]) -> impl Fn(ChunkParts<'_>) -> ChunkId + '_ {
-    move |c| chunk_id(topic, c.type_id, c.group, c.index, c.frame)
-}
-
-/// Decodes a standalone SEACAST v2 `Rpc`, copying its chunk's data and its
-/// evidence body into buffers of `pool`.
-pub fn decode_rpc<B, Pool>(
-    input: &[u8],
-    pool: &mut Pool,
-    chunk_id: impl FnMut(ChunkParts<'_>) -> ChunkId,
-) -> Option<Rpc<B>>
+/// Decodes a control message, copying its evidence body into a buffer of
+/// `pool`.
+pub fn decode_control<B, Pool>(input: &[u8], pool: &mut Pool) -> Option<Rpc<B>>
 where
     B: ChunkBuffer,
     Pool: BufferPool<B>,
 {
-    decode_rpc_with(input, |range| pool.alloc_from_slice(&input[range]), chunk_id)
+    decode_control_with(input, |range| pool.alloc_from_slice(&input[range]))
 }
 
-/// Decodes a standalone SEACAST v2 `Rpc`. `buffer` makes the handle for a range
-/// of `input`, the chunk's data or the evidence body: a host that keeps `input`
-/// where it arrived hands back a reference to that range, and nothing is
-/// copied.
-pub fn decode_rpc_with<B>(
+/// Decodes a control message: an `Rpc` with no chunk. `buffer` makes the
+/// handle for the range of `input` that is the evidence body: a host that
+/// keeps `input` where it arrived hands back a reference to that range, and
+/// nothing is copied.
+pub fn decode_control_with<B>(
     input: &[u8],
     mut buffer: impl FnMut(Range<usize>) -> B,
-    mut chunk_id: impl FnMut(ChunkParts<'_>) -> ChunkId,
 ) -> Option<Rpc<B>>
 where
     B: ChunkBuffer,
 {
-    if input.len() < SEACAST_V2_MAGIC.len() || input[0..5] != SEACAST_V2_MAGIC {
+    let mut pos = 0;
+    if TypeId(get_u16(input, &mut pos)?) != CONTROL_TYPE {
         return None;
     }
-    let mut pos = 5;
 
     // 1. Joins
     let joins_len = get_u16(input, &mut pos)? as usize;
@@ -305,21 +298,7 @@ where
         None
     };
 
-    // 8. Chunk: everything but its data
-    let chunks_len = get_u16(input, &mut pos)? as usize;
-    if chunks_len > 1 {
-        return None;
-    }
-    let chunk_head = if chunks_len == 1 {
-        let type_id = TypeId(get_u16(input, &mut pos)?);
-        let group = get_bytes32(input, &mut pos)?;
-        let index = get_u32(input, &mut pos)?;
-        Some((type_id, group, index))
-    } else {
-        None
-    };
-
-    // The evidence body, then the chunk's frame: all that is left.
+    // The evidence body: all that is left.
     let mut take = |len: usize| {
         let range = pos..pos.checked_add(len)?;
         input.get(range.clone())?;
@@ -333,25 +312,11 @@ where
         }
         None => None,
     };
-    let chunk = match chunk_head {
-        Some((type_id, group, index)) => {
-            let range = pos..input.len();
-            pos = input.len();
-            let cached_id = chunk_id(ChunkParts {
-                type_id,
-                group: &group,
-                index,
-                frame: &input[range.clone()],
-            });
-            Some(ChunkMsg { type_id, group, index, frame: buffer(range), cached_id, memo: [0; 32] })
-        }
-        None => None,
-    };
     if pos != input.len() {
         return None;
     }
 
-    Some(Rpc { joins, chunk, haves, wants, grafts, prunes, evidence })
+    Some(Rpc { joins, chunk: None, haves, wants, grafts, prunes, evidence })
 }
 
 fn encode_dir(d: Direction) -> u8 {
@@ -437,18 +402,14 @@ fn get_bytes32(input: &[u8], pos: &mut usize) -> Option<Bytes32> {
 
 #[cfg(test)]
 mod tests {
-    use seacast_core::Ask;
+    use seacast_core::{Ask, MAX_BITMAP_BITS};
 
     use super::*;
     use crate::buffer::VecBufferPool;
 
     #[test]
-    fn test_wire_rpc_roundtrip() {
-        let mut pool = VecBufferPool;
+    fn test_control_roundtrip() {
         let group = [0x11; 32];
-        let frame = vec![1u8, 2, 3, 4, 5];
-        let cid = chunk_id(b"topic", TypeId(0), &group, 2, &frame);
-
         let rpc: Rpc<Vec<u8>> = Rpc {
             joins: InlineVec::singleton(Join {
                 object_type: TypeId(0),
@@ -457,14 +418,7 @@ mod tests {
                 duty: Duty::Forward,
                 colours: 1,
             }),
-            chunk: Some(ChunkMsg {
-                type_id: TypeId(0),
-                group,
-                index: 2,
-                frame,
-                cached_id: cid,
-                memo: [0; 32],
-            }),
+            chunk: None,
             haves: InlineVec::from_slice(&[
                 Have::holding(TypeId(0), group, Bitmap::all_bits(8), true, true),
                 Have::offer(TypeId(3), group, Bitmap::singleton(3)),
@@ -485,34 +439,39 @@ mod tests {
             evidence: Some(Evidence { group, body: vec![9, 8, 7] }),
         };
 
-        let bytes = encode_rpc(&rpc);
-        let decoded = decode_rpc(&bytes, &mut pool, chunk_id_on(b"topic")).expect("decode rpc");
-        assert_eq!(decoded, rpc);
+        let bytes = encode_control(&rpc);
+        assert_eq!(bytes[..2], CONTROL_TYPE.0.to_le_bytes());
+        assert_eq!(decode_control(&bytes, &mut VecBufferPool), Some(rpc));
+
+        // A chunk's head is not a control message, and a message is decoded whole.
+        let head = ChunkHead { type_id: TypeId(7), group, index: 2 }.encode();
+        assert_eq!(decode_control::<Vec<u8>, _>(&head, &mut VecBufferPool), None);
+        assert_eq!(
+            decode_control::<Vec<u8>, _>(&bytes[..bytes.len() - 1], &mut VecBufferPool),
+            None
+        );
+    }
+
+    #[test]
+    fn test_chunk_head_roundtrip() {
+        let head = ChunkHead { type_id: TypeId(0x0301), group: [0xab; 32], index: 0x0102_0304 };
+        assert_eq!(ChunkHead::parse(&head.encode()), head);
+        assert_eq!(head.encode()[..2], [0x01, 0x03]);
     }
 
     #[test]
     fn test_control_bound() {
-        let every = Bitmap::all_bits(seacast_core::MAX_BITMAP_BITS as u32);
+        let every = Bitmap::all_bits(MAX_BITMAP_BITS as u32);
         let group = [0xff; 32];
         let mut rpc: Rpc<Vec<u8>> = Rpc::default();
         for t in 0..MAX_ENTRY_CONTROL as u16 {
             let _ = rpc.joins.push(Join { object_type: TypeId(t), ..Join::default() });
-        }
-        for _ in 0..MAX_ENTRY_CONTROL {
             let _ = rpc.haves.push(Have::offer(TypeId(1), group, every));
             let _ = rpc.wants.push(Want::standing(TypeId(1), group, every));
             let _ = rpc.grafts.push(Graft::default());
             let _ = rpc.prunes.push(Prune::default());
         }
         rpc.evidence = Some(Evidence { group, body: Vec::new() });
-        rpc.chunk = Some(ChunkMsg {
-            type_id: TypeId(1),
-            group,
-            index: 0,
-            frame: Vec::new(),
-            cached_id: [0; 56],
-            memo: [0; 32],
-        });
-        assert_eq!(encode_rpc(&rpc).len(), MAX_RPC_CONTROL_BYTES);
+        assert_eq!(encode_control(&rpc).len(), MAX_CONTROL_BYTES);
     }
 }

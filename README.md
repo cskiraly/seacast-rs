@@ -9,9 +9,11 @@ The protocol logic is a single-threaded state machine with no I/O. A host suppli
 - **Bitmaps are 1024 bits** (`BITMAP_WORDS` in `bitmap.rs`). `protocol.md` allows 8192 indices in a plain group and a HAVE bitmap. 1024 chunks carry a 16 MiB body uncoded, which is past what consensus gossip lets one message be; a group or an index beyond it is refused. Every table, message and queue item that holds a bitmap grows with the constant, which is why it is not 8192.
 - **Evidence** (`[D6]`) is carried in the message types and not acted on. The specification carries it and does not define it.
 - **The wire encoding** in `seacast-codec::wire` is this implementation's. `protocol-v2.md` §7 leaves the standalone binding's bytes open, and the gossipsub bindings are not implemented.
+- **A chunk and control messages are separate messages on the wire**, each starting with a type: a chunk's object type, or `CONTROL_TYPE` for joins, holdings, offers, asks, grafts, prunes and evidence. The specification's RPC carries a chunk and control together. A reader knows from the type how the chunk's frame is laid out, so it runs level 1 on the frame's head before the data has arrived. A host hands the node a chunk and the control sent with it as two `on_rpc` calls, chunk first: the node then responds twice where the specification's `respond` runs once an RPC.
+- **Up to 16 joins a message** (`MAX_ENTRY_CONTROL`): a limit of this encoding.
 - **The chunk's layout** is `type | group | index | frame`, with the frame `header | context | proof | data`. The specification's `Chunk` has `slot` and `beacon_block_root` as fields of their own and an optional descriptor; here they are the payload's context, and a header is present or absent by type.
 - **The group id** is `sha256(0x03 || type || header id || context)`. The specification's `group_key` is `sha256(0x03 || group id || slot)`: the type and the block root are not bound.
-- **The chunk id** is the specification's formula (group, index, and the Altair message id over a topic) over the chunk as it is sent here, not over the SSZ `Chunk`. The topic is the domain's, one a type.
+- **The chunk id** is `group | index | content`, with `content` the first 20 bytes of the digest of the chunk's Merkle leaf, or of the group id for a standalone chunk. The specification's content id is the Altair message id over a topic and the chunk. Level 1 binds a chunk's data to its group and index, so the leaf's digest names the same bytes, and it is the hash level 1 computes anyway: the chunk is not hashed a second time, and no topic is needed.
 - **The gate** is one call, `on_groups_authenticated`, where the specification has `on_block_installed` and `on_header_validated`.
 - **Level 1** is three steps where the specification has one `validate_chunk`: the codec's check of the chunk alone, the domain's answer on the group, then the proof. The domain is asked once a group and its answer is kept, so later chunks of an authentic group run only the codec's steps.
 - **The live window** is a deadline the domain gives a group (`Domain::deadline`), a time on the host's clock, where the specification has the group's slot. A group and its deferred chunks go at the deadline at the latest, and its tombstone is kept until it. A group with no deadline has only the node's lifetimes: a deferred chunk goes `GROUP_TTL` after it arrived and a tombstone after `tombstone_ttl`.
@@ -288,14 +290,16 @@ The code is systematic, so the K data slots are the Snappy stream itself. If eve
 | `group_id`, `group_key` | a descriptor's id, which the domain commits; a group's id from its type, that id and its context |
 | `split_frame`, `build_frame`, `build_chunks` | a segmented chunk's frame taken apart and put together; a group's chunks as a publisher hands them to the node |
 | `check_frame`, `check_frame_proof`, `frame_leaf_hash` | level 1 for one chunk: descriptor, group id, index and length; then the Merkle proof. `frame_leaf_hash` is the proof check that returns the leaf digest it proved |
-| `chunk_id` | a chunk's id: group, index, and the Altair message id over a topic and the chunk as it is sent |
+| `chunk_id` | a chunk's id: group, index, and 20 bytes of its leaf's digest or its group id |
+| `ChunkLayout` | a type's frame layout, and level 1 in the two steps a stream reader takes: `check_head` on the bytes before the proof, `check_body` on the whole frame |
 | `standalone_group`, `check_standalone` | a type with one chunk a group and no header or proof: its group id is the hash of its frame |
 | `complete_in_place` | level 2 on a slot store: fill in what is missing, hash it, check the root with the digests level 1 proved for the rest, return the tree for proofs. With `data_only_root`: the missing data only, and the data tree |
 | `body_len`, `body_into` | the object's length, and its bytes written into a caller's buffer |
-| `encode_rpc_framing` | a message's bytes except the chunk's data, which is the frame's last field, for a gathered send |
-| `decode_rpc_with` | decode with a closure that turns a range of the input into a buffer handle, so nothing is copied |
+| `ChunkHead` | what a chunk is sent with before its frame: `type | group | index` |
+| `encode_control_framing` | a control message's bytes except its evidence body, for a gathered send |
+| `decode_control_with` | decode a control message with a closure that turns a range of the input into a buffer handle, so nothing is copied |
 
-`build_group`, `decode_and_reencode`, `encode_rpc` and `decode_rpc` are the versions for hosts that keep each chunk in memory of its own (`Vec<u8>`, `Arc<[u8]>`).
+`build_group`, `decode_and_reencode`, `encode_control` and `decode_control` are the versions for hosts that keep each chunk in memory of its own (`Vec<u8>`, `Arc<[u8]>`).
 
 ## A group's lifetime
 

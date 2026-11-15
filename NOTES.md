@@ -65,13 +65,9 @@ An experiment behind a cargo feature of `seacast-codec` (README, "Where this dif
 
 - **Four leaves at a time on SHA-NI matched the 16-lane AVX-512 kernel on full batches** on the one machine tried (Zen 5), so `sha256/x16.rs` could go there. Not measured on an Intel core, where the SHA-NI rounds may not overlap as well; the 16-lane kernel stays until it is.
 - **`ChunkMsg::memo` is 32 bytes a chunk the node holds**, in every table of chunks. Memory has not been measured with it.
-- **A chunk whose `memo` is zero is hashed at level 2**: one from the wire that the host's proof check did not go through `SegmentedCodec::check_proof`, and a publisher's own (`build_chunks` leaves it zero, since it would have to hash each leaf again).
+- **A chunk whose `memo` is zero is hashed at level 2**: one from the wire that the host's proof check did not go through `SegmentedCodec::check_proof` or `ChunkLayout::check_body`. A publisher's own carry their leaf's digest from `build_chunks`, which hashes each leaf a second time after `build_group` built the tree.
 - **`decode_and_reencode` takes the digest of the K chunks it decodes from only.** A parity chunk given beyond those is computed again and hashed, as the specification's re-encode does, so that every node gives the same verdict. `complete_in_place` does not: it leaves a chunk that is there as it is, so a group whose committed parity is not the code's passes at a node that holds all the data. That was so before the digests were reused.
 - **A slot that changes after its level 1 is not detected by level 2**, since its digest is not recomputed. Before, the full rehash caught it.
-
-## The chunk id
-
-The codec computes the chunk id with the Altair message-id formula (`MESSAGE_DOMAIN_VALID_SNAPPY`, topic as an input). That formula is the last consensus-specific thing in `seacast-codec`. It was kept on purpose, to follow the specification with the topic supplied by the domain. Moving it out means `build_chunks` and `decode_and_reencode` take an id function instead of a topic.
 
 ## Small cleanups
 
@@ -88,6 +84,7 @@ The codec computes the chunk id with the Altair message-id formula (`MESSAGE_DOM
 
 ## Specification
 
+- Every departure is listed in the README, "Where this differs from the specification", in the change that makes it. A host's own departures (its object types, what its contexts hold) are the host's to list.
 - The departures listed in the README have not been written into `informed-diffusion-spec`. The spec repository is unchanged.
 - That list was built from the changes made here, each checked by searching the spec for the rule in question. A full audit of the core against both protocol files has not been done, so older departures may be missing.
 - "Serving" in that list: the ask-legitimacy check was compared with the `on_want` pseudocode only. The spec's prose may already state the condition, in which case it is an enforcement and not a departure.

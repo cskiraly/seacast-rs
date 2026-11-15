@@ -26,14 +26,12 @@ pub struct SegmentedCodec<Pool, B> {
     pub pool: Pool,
     /// The bytes of a chunk's context, which the domain defines.
     pub context_len: usize,
-    /// The topic of the chunk id (`protocol.md` §2): the domain's.
-    topic: Vec<u8>,
     _buffer: PhantomData<B>,
 }
 
 impl<Pool, B> SegmentedCodec<Pool, B> {
-    pub fn new(pool: Pool, context_len: usize, topic: &[u8]) -> Self {
-        Self { pool, context_len, topic: topic.to_vec(), _buffer: PhantomData }
+    pub fn new(pool: Pool, context_len: usize) -> Self {
+        Self { pool, context_len, _buffer: PhantomData }
     }
 
     /// The rest of level 1 for a chunk [`TypeCodec::check_proof`] answered
@@ -106,7 +104,6 @@ where
             &mut self.pool,
             &SnappyBlockCompressor,
             out_rebuilt,
-            &self.topic,
         )
     }
 
