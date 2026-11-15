@@ -23,7 +23,7 @@ pub const MAX_ENTRY_CONTROL: usize = 16;
 
 /// Maximum projected `(GroupId, u32)` pairs per chunk (`R4`: column + row = 2).
 /// Object types a node may join.
-pub const MAX_JOINED_TYPES: usize = 32;
+pub const MAX_JOINED_TYPES: usize = 256;
 
 pub const MAX_PROJECTED: usize = 4;
 

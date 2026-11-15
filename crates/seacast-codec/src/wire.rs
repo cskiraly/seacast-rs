@@ -18,13 +18,11 @@ pub const SEACAST_V2_MAGIC: [u8; 5] = *b"SEAC\x02";
 /// or limits those two: the transport does, with this plus the longest body and
 /// frame its types allow.
 pub const MAX_RPC_CONTROL_BYTES: usize = SEACAST_V2_MAGIC.len() +
-    (2 + MAX_RPC_JOINS * (2 + 1 + 8 + 1 + 2)) +
+    (2 + MAX_ENTRY_CONTROL * (2 + 1 + 8 + 1 + 2)) +
     2 * (2 + MAX_ENTRY_CONTROL * (1 + 2 + 32 + 2 + MAX_HAVE_BYTES)) +
     2 * (2 + MAX_ENTRY_CONTROL * (2 + 4 + 2 + 1)) +
     (2 + 32 + 4) +
     (2 + 2 + 32 + 4);
-
-const MAX_RPC_JOINS: usize = 4;
 
 /// Encodes a standalone SEACAST v2 `Rpc` but for the bytes of its evidence body
 /// and of its chunk, which close the frame in that order (`protocol-v2.md` §2,
@@ -201,10 +199,10 @@ where
 
     // 1. Joins
     let joins_len = get_u16(input, &mut pos)? as usize;
-    if joins_len > MAX_RPC_JOINS {
+    if joins_len > MAX_ENTRY_CONTROL {
         return None;
     }
-    let mut joins: InlineVec<Join, MAX_RPC_JOINS> = InlineVec::new();
+    let mut joins: InlineVec<Join, MAX_ENTRY_CONTROL> = InlineVec::new();
     for _ in 0..joins_len {
         let object_type = TypeId(get_u16(input, &mut pos)?);
         let interest = match get_u8(input, &mut pos)? {
@@ -497,7 +495,7 @@ mod tests {
         let every = Bitmap::all_bits(seacast_core::MAX_BITMAP_BITS as u32);
         let group = [0xff; 32];
         let mut rpc: Rpc<Vec<u8>> = Rpc::default();
-        for t in 0..MAX_RPC_JOINS as u16 {
+        for t in 0..MAX_ENTRY_CONTROL as u16 {
             let _ = rpc.joins.push(Join { object_type: TypeId(t), ..Join::default() });
         }
         for _ in 0..MAX_ENTRY_CONTROL {

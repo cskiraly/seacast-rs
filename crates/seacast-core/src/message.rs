@@ -136,7 +136,7 @@ pub struct Evidence<B> {
 /// one [`ChunkMsg`] per wire frame, performing **zero heap allocation**.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rpc<B> {
-    pub joins: InlineVec<Join, 4>,
+    pub joins: InlineVec<Join, MAX_ENTRY_CONTROL>,
     pub chunk: Option<ChunkMsg<B>>,
     pub haves: InlineVec<Have, MAX_ENTRY_CONTROL>,
     pub wants: InlineVec<Want, MAX_ENTRY_CONTROL>,
@@ -244,7 +244,7 @@ impl Queued {
 pub struct QueueEntry<B> {
     pub chunk: Option<ChunkMsg<B>>,
     pub solicited: bool,
-    pub joins: InlineVec<Join, 4>,
+    pub joins: InlineVec<Join, MAX_ENTRY_CONTROL>,
     pub haves: InlineVec<Have, MAX_ENTRY_CONTROL>,
     pub wants: InlineVec<Want, MAX_ENTRY_CONTROL>,
     pub grafts: InlineVec<Graft, MAX_ENTRY_CONTROL>,
