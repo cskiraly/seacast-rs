@@ -273,7 +273,12 @@ fn grouped_rows(
 /// pass.
 #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"))]
 const FFT_FROM_HALF_ROWS: usize = 8;
-#[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f")))]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+const FFT_FROM_HALF_ROWS: usize = 4;
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"),
+    all(target_arch = "aarch64", target_feature = "neon")
+)))]
 const FFT_FROM_HALF_ROWS: usize = 3;
 
 /// Whether [`combine`] copies a strip of the sources side by side before it

@@ -48,13 +48,12 @@ An experiment behind a cargo feature of `seacast-codec` (README, "Where this dif
 ## Reed-Solomon
 
 - **The FFT parity path covers K a power of two only.** For another K the points `0..2K` are not closed under XOR and the matrix is used. Whether such a K can use a transform without changing the code is open; padding K up changes the parity, so it is a specification change.
-- **The NEON and ARMv8 SHA2 arms are compiled for `aarch64-apple-darwin` and linted, not run, on the machine they are written on.** The butterflies and `row` ran on an Apple core through the benchmark, which asserts every root. The grouped `rows` and the interleaved `compress_many` there have not run yet.
-- **`STREAMS` is four on aarch64 by analogy with x86**, not measured.
+- **The NEON and ARMv8 SHA2 arms are compiled and linted for `aarch64-apple-darwin` where they are written, and run on one Apple core**: its tests and benchmark, which asserts every root.
+- **`STREAMS` is four on aarch64 by analogy with x86.** On one Apple core two, three and four streams hash at the same rate: its SHA2 rounds overlap less than SHA-NI's do on the x86 core tried, and two streams already reach the limit. Four is kept for a core that overlaps more; none has been tried.
 - **The NEON three-input XOR needs the `sha3` target feature**; without it two XORs are used. Only the `sha3` path is compiled here.
 - **The row count from which `rs_parity_rows` takes the transform** is one constant for the GFNI kernel, measured, and one for the others, placed from the benchmark's sweep on AVX2 and on one NEON machine: two shapes each, not a sweep of both paths.
 - **`combine` copies each strip of the sources side by side on the kernels that make a pass per row**, since segments of one buffer evict each other from the cache. Measured on AVX2; on NEON it is inferred from one machine's benchmark, where the in-place lines were several times slower than the same work on separately allocated chunks, and not yet rerun there. The destinations are still written where they lie.
 - **The GFNI and NEON arms compute several rows a pass; AVX2 does not.** It has sixteen registers and needs two for a coefficient's tables, so at most four rows of one vector; not tried.
-- **The row count from which the transform is taken on NEON predates its grouped kernel.** It is the constant of the kernels with a pass per row, and should rise once the grouped kernel is measured.
 - **Running the transform in the parity chunks themselves, with no work buffer, was tried and was slower.** Chunks a multiple of the page size apart land in the same cache sets.
 - **`fft::parity` allocates its work buffer on every call**, K strips.
 - **Recovery is still by matrix.** Its cost grows with the chunks lost; a transform-based erasure decode would bound it. Not tried.
