@@ -303,6 +303,19 @@ pub fn chunk_id(
     index: u32,
     frame: &[u8],
 ) -> ChunkId {
+    chunk_id_of_parts(topic, type_id, group, index, &[frame])
+}
+
+/// [`chunk_id`] of a frame whose parts lie apart, in order: a slot store keeps
+/// a group's header and context once and each chunk's proof and data in
+/// places of their own.
+pub fn chunk_id_of_parts(
+    topic: &[u8],
+    type_id: TypeId,
+    group: &GroupId,
+    index: u32,
+    frame: &[&[u8]],
+) -> ChunkId {
     let mut h = Sha256::new();
     h.update(&MESSAGE_DOMAIN_VALID_SNAPPY);
     h.update(&(topic.len() as u64).to_le_bytes());
@@ -310,7 +323,9 @@ pub fn chunk_id(
     h.update(&type_id.0.to_le_bytes());
     h.update(group);
     h.update(&index.to_le_bytes());
-    h.update(frame);
+    for part in frame {
+        h.update(part);
+    }
     let mut out = [0u8; 56];
     out[0..32].copy_from_slice(group);
     out[32..36].copy_from_slice(&index.to_le_bytes());

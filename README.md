@@ -16,6 +16,7 @@ The protocol logic is a single-threaded state machine with no I/O. A host suppli
 - **Level 1** is three steps where the specification has one `validate_chunk`: the codec's check of the chunk alone, the domain's answer on the group, then the proof. The domain is asked once a group and its answer is kept, so later chunks of an authentic group run only the codec's steps.
 - **The live window** is a deadline the domain gives a group (`Domain::deadline`), a time on the host's clock, where the specification has the group's slot. A group and its deferred chunks go at the deadline at the latest, and its tombstone is kept until it. A group with no deadline has only the node's lifetimes: a deferred chunk goes `GROUP_TTL` after it arrived and a tombstone after `tombstone_ttl`.
 - **Standalone types** are new: one chunk a group, no header and no proof, with the group id `sha256(0x04 || type || frame)` and a level 1 that is that hash, index 0 and a length limit. The specification defines no type without a header.
+- **HAVE and WANT carry their group's object type**, which the specification's do not. With more than one type a node cannot tell the type of a group it knows only from an offer otherwise.
 - **The send queue and window** (`protocol-v2.md` §4.11, §4.12) are not in the node. The node hands each item to the host with `send` and filters it in `on_write`; `SendQueues` implements the specification's queue and window beside it, and a host may replace it.
 - **Serving** has two checks the specification's `on_want` does not have: an ask for an index this node neither holds nor has interest in, as the peer sees that interest, is refused and penalised (`AskOutsideOfferOrInterest`), and at most `max_served_per_heartbeat` chunks are served in a heartbeat over all peers, beside `SERVE_LIMIT` per peer and group.
 - **The claim at K** is what the type's codec says a node can produce from the chunks it holds (`TypeCodec::producible`), where the specification's `claim_group` sets all `N` bits. The default is all `N`, and a holding carries `claim_all` only when its bitmap is whole.
@@ -194,7 +195,7 @@ Asks for one offer leave as the bits of one WANT, so none is left behind however
 
 ## Sending
 
-The node does not queue. It hands the host each item to send with `RuntimeEnv::send(peer, item, urgent)`; an item is small: a chunk's key `(group, index)` or one control message. Order, batching and flow control are the host's. When the host writes an item it calls `SeacastNode::on_write(peer, item)`, which returns the frame, or `None` if the item is no longer to be sent, and starts the promise of an ask.
+The node does not queue. It hands the host each item to send with `RuntimeEnv::send(peer, item, urgent)`; an item is small: a chunk's key `(group, index)` or one control message. Order, batching and flow control are the host's. When the host writes an item it calls `SeacastNode::on_write(peer, item)`, which returns the frame, or `None` if the item is no longer to be sent, and starts the promise of an ask. A host that writes somewhere it cannot call the node from reports each write afterwards with `SeacastNode::on_written(peer, item, written_at)` instead, and drops what is no longer to be sent on the cancel callbacks below.
 
 The other send callbacks have defaults that do nothing, so a host implements the ones its send path can use:
 

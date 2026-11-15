@@ -1,9 +1,9 @@
 use crate::{
     bitmap::Bitmap,
-    message::{QueueEntry, Queued},
+    message::{Control, QueueEntry, Queued, Want},
     node::SeacastNode,
     traits::{ChunkBuffer, ObjectCatalog, RuntimeEnv, TimerEvent},
-    types::{Ask, PeerId},
+    types::{Ask, PeerId, Timestamp},
 };
 
 impl<B: ChunkBuffer> SeacastNode<B> {
@@ -110,42 +110,86 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
 
         let now = env.now();
-        let now_bits = now.to_bits();
-
         for w_idx in 0..entry.wants.len() {
-            let g = entry.wants[w_idx].group;
-            let t = self
-                .groups
-                .get(&g)
-                .and_then(|r| r.t_of.as_ref())
-                .copied()
-                .unwrap_or_else(|| catalog.type_of_group(&g));
-            let promise_timeout = catalog.params(t).promise;
-            let track_promise = entry.wants[w_idx].track_promise;
-            let orig_bits = entry.wants[w_idx].bits;
-            if self.expired(&g) {
-                entry.wants[w_idx].bits = Bitmap::EMPTY;
-                continue;
-            }
-            let mut filtered = Bitmap::new();
-            for idx in orig_bits.iter() {
-                let a = Ask::new(g, idx);
-                if !self.held(a) && !self.gated(a) && !self.tied_to_root(peer, a) {
-                    filtered.set(idx);
-                    if track_promise && !self.promises.contains(a, peer) {
-                        self.promises.insert(a, peer, now_bits);
-                        env.schedule_after(promise_timeout, TimerEvent::PromiseDue {
-                            ask: a,
-                            peer,
-                            at_bits: now_bits,
-                        });
-                    }
-                }
-            }
-            entry.wants[w_idx].bits = filtered;
+            let want = entry.wants[w_idx];
+            entry.wants[w_idx].bits = self.promise_asks(peer, &want, now, env, catalog);
         }
         entry.wants.retain(|w| !w.bits.is_empty());
 
         if entry.is_empty() { None } else { Some(entry) }
+    }
+
+    /// The bits of `want` still to be asked of `peer`: not held, gated or tied,
+    /// in a group that has not expired. Each starts its promise at
+    /// `written_at` if the ask tracks one.
+    fn promise_asks<E, C>(
+        &mut self,
+        peer: PeerId,
+        want: &Want,
+        written_at: Timestamp,
+        env: &mut E,
+        catalog: &C,
+    ) -> Bitmap
+    where
+        E: RuntimeEnv<B>,
+        C: ObjectCatalog<B>,
+    {
+        let g = want.group;
+        if self.expired(&g) {
+            return Bitmap::EMPTY;
+        }
+        let t = self.type_of(&g, catalog);
+        let left = (catalog.params(t).promise - (env.now() - written_at)).max(0.0);
+        let at_bits = written_at.to_bits();
+        let mut asked = Bitmap::new();
+        for idx in want.bits.iter() {
+            let a = Ask::new(g, idx);
+            if self.held(a) || self.gated(a) || self.tied_to_root(peer, a) {
+                continue;
+            }
+            asked.set(idx);
+            if want.track_promise && !self.promises.contains(a, peer) {
+                self.promises.insert(a, peer, at_bits);
+                env.schedule_after(left, TimerEvent::PromiseDue { ask: a, peer, at_bits });
+            }
+        }
+        asked
+    }
+
+    /// What a write changes, for a host whose send path cannot call
+    /// [`Self::on_write`] as it writes: one that queues and writes elsewhere
+    /// and reports each item it wrote, with the time of the write. A chunk is
+    /// recorded as sent and an ask starts its promise from `written_at`.
+    ///
+    /// Nothing is filtered here. Such a host drops what is no longer to be sent
+    /// on `cancel_chunk`, `cancel_asks` and `cancel_group`; a write that a
+    /// cancel did not reach in time costs one redundant chunk or ask. A push is
+    /// not withheld from a peer projected to complete without it
+    /// (`protocol.md` §7.2 `[c12]`).
+    pub fn on_written<E, C>(
+        &mut self,
+        peer: PeerId,
+        item: &Queued,
+        written_at: Timestamp,
+        env: &mut E,
+        catalog: &C,
+    ) where
+        E: RuntimeEnv<B>,
+        C: ObjectCatalog<B>,
+    {
+        match item {
+            &Queued::Chunk { group, index, .. } => {
+                let mut sent = self.pairs.sent_to(&(peer, group)).unwrap_or_default();
+                sent.set(index);
+                self.pairs.set_sent_to((peer, group), sent);
+                if self.groups.get(&group).is_some_and(|r| r.origin.is_some()) {
+                    self.origin_sent(group, index, env, catalog);
+                }
+            }
+            Queued::Control(Control::Want(want)) => {
+                self.promise_asks(peer, want, written_at, env, catalog);
+            }
+            Queued::Control(_) => {}
+        }
     }
 }

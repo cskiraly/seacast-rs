@@ -4,9 +4,9 @@
 
 use seacast_core::{
     Ask, Bitmap, BoundedDeferredStore, ChunkId, ChunkMsg, Direction, DispatchOutcome, Domain, Duty,
-    Graft, GroupId, GroupState, Have, InlineVec, InterestKind, Join, NodeConfig, NodeId, PeerId,
-    PenaltyReason, Policy, PreallocVec, Rpc, RuntimeEnv, SeacastNode, Shape, SplitMix64,
-    TimerEvent, Timestamp, TypeCodec, TypeId, TypeParams, ValidationResult, Want,
+    Graft, GroupId, GroupState, Have, InlineVec, InterestKind, Join, MAX_JOINED_TYPES, NodeConfig,
+    NodeId, PeerId, PenaltyReason, Policy, PreallocVec, Rpc, RuntimeEnv, SeacastNode, Shape,
+    SplitMix64, TimerEvent, Timestamp, TypeCodec, TypeId, TypeParams, ValidationResult, Want,
 };
 
 type Chunk = ChunkMsg<Vec<u8>>;
@@ -187,7 +187,7 @@ impl Policy for Catalog {
             colours: 1,
         }
     }
-    fn joined_types(&self) -> InlineVec<TypeId, 8> {
+    fn joined_types(&self) -> InlineVec<TypeId, MAX_JOINED_TYPES> {
         InlineVec::singleton(TYPE)
     }
     fn tiebreak(&self, chunk_id: &ChunkId, peer: PeerId) -> u64 {
@@ -332,12 +332,12 @@ fn a_peer_cannot_overflow_the_tables() {
     let every = Bitmap::all_bits(400);
     for tag in 0..3000 {
         let mut rpc = Rpc::default();
-        let _ = rpc.haves.push(Have::offer(group(tag), every));
-        let _ = rpc.haves.push(Have::holding(group(tag + 10_000), every, true, true));
-        let _ = rpc.wants.push(Want::standing(group(tag + 20_000), every));
+        let _ = rpc.haves.push(Have::offer(TYPE, group(tag), every));
+        let _ = rpc.haves.push(Have::holding(TYPE, group(tag + 10_000), every, true, true));
+        let _ = rpc.wants.push(Want::standing(TYPE, group(tag + 20_000), every));
         // An offer of nothing, and one of indices this node does not want, keep
         // nothing.
-        let _ = rpc.haves.push(Have::offer(group(tag + 30_000), Bitmap::new()));
+        let _ = rpc.haves.push(Have::offer(TYPE, group(tag + 30_000), Bitmap::new()));
         world.rpc(1, rpc);
         world.drain(1);
     }
@@ -376,8 +376,8 @@ fn a_group_expires_and_leaves_a_tombstone() {
     let g = group(1);
     world.rpc(1, chunk_rpc(chunk(g, 0, [0; 32])));
     let mut rpc = Rpc::default();
-    let _ = rpc.haves.push(Have::offer(g, Bitmap::all_bits(8)));
-    let _ = rpc.haves.push(Have::holding(g, Bitmap::singleton(3), false, false));
+    let _ = rpc.haves.push(Have::offer(TYPE, g, Bitmap::all_bits(8)));
+    let _ = rpc.haves.push(Have::holding(TYPE, g, Bitmap::singleton(3), false, false));
     world.rpc(2, rpc);
     assert_eq!(world.node.group_state(&g), Some(GroupState::Collecting));
     assert!(!world.node.offers.is_empty() && !world.node.seen_ids.is_empty());
@@ -401,7 +401,7 @@ fn a_group_expires_and_leaves_a_tombstone() {
     // Expired for good: a chunk, an offer and a holding of it are ignored.
     world.rpc(1, chunk_rpc(chunk(g, 1, [0; 32])));
     let mut rpc = Rpc::default();
-    let _ = rpc.haves.push(Have::offer(g, Bitmap::all_bits(8)));
+    let _ = rpc.haves.push(Have::offer(TYPE, g, Bitmap::all_bits(8)));
     world.rpc(2, rpc);
     assert!(
         world.node.chunks.is_empty() &&
@@ -485,7 +485,7 @@ fn every_ask_of_an_offer_is_sent() {
     let mut world = World::new(Catalog::new(300, 300), 1, InterestKind::All);
     let mut rpc = Rpc::default();
     for tag in 0..3 {
-        let _ = rpc.haves.push(Have::offer(group(tag), Bitmap::all_bits(300)));
+        let _ = rpc.haves.push(Have::offer(TYPE, group(tag), Bitmap::all_bits(300)));
     }
     world.rpc(1, rpc);
     let asked: usize = world.node.asked_at.len();
@@ -572,9 +572,9 @@ fn messages_of_an_unjoined_type_are_ignored() {
     world.drain(1);
 
     let mut rpc = chunk_rpc(chunk(g, 1, [0; 32]));
-    let _ = rpc.haves.push(Have::offer(g, Bitmap::all_bits(8)));
-    let _ = rpc.haves.push(Have::holding(g, Bitmap::singleton(4), false, false));
-    let _ = rpc.wants.push(Want::pull_ask(Ask { group: g, index: 0 }));
+    let _ = rpc.haves.push(Have::offer(TYPE, g, Bitmap::all_bits(8)));
+    let _ = rpc.haves.push(Have::holding(TYPE, g, Bitmap::singleton(4), false, false));
+    let _ = rpc.wants.push(Want::pull_ask(TYPE, Ask { group: g, index: 0 }));
     world.rpc(2, rpc);
     assert!(!world.node.chunks.contains_key(&(g, 1)));
     assert!(world.node.pairs.is_empty());
@@ -630,8 +630,11 @@ fn named_groups_do_not_crowd_out_open_ones() {
     for peer in 1..=6u64 {
         for tag in 0..64 {
             let mut rpc = Rpc::default();
-            let _ =
-                rpc.haves.push(Have::offer(group(peer as u32 * 1000 + tag), Bitmap::all_bits(8)));
+            let _ = rpc.haves.push(Have::offer(
+                TYPE,
+                group(peer as u32 * 1000 + tag),
+                Bitmap::all_bits(8),
+            ));
             world.rpc(peer, rpc);
         }
     }
@@ -704,7 +707,7 @@ fn offers_over_the_limits_arm_no_timer() {
     let mut world = World::new(Catalog::new(1024, 1024), 1, InterestKind::All);
     let offer = |world: &mut World, tag: u32| {
         let mut rpc = Rpc::default();
-        let _ = rpc.haves.push(Have::offer(group(tag), Bitmap::all_bits(1024)));
+        let _ = rpc.haves.push(Have::offer(TYPE, group(tag), Bitmap::all_bits(1024)));
         world.rpc(1, rpc);
     };
     let mut tag = 0;
@@ -740,7 +743,7 @@ fn an_unrecorded_ask_is_not_made() {
     let mut world = World::with_config(config, Catalog::new(300, 300), 1, InterestKind::All);
     for round in 0..8 {
         let mut rpc = Rpc::default();
-        let _ = rpc.haves.push(Have::offer(group(1), Bitmap::all_bits(300)));
+        let _ = rpc.haves.push(Have::offer(TYPE, group(1), Bitmap::all_bits(300)));
         world.rpc(1, rpc);
         assert_eq!(world.node.asked_at.len(), 16);
         assert!(world.env.retries <= 16 * (round + 1));
@@ -757,7 +760,7 @@ fn an_offer_past_the_index_count_is_refused() {
     world.rpc(1, chunk_rpc(chunk(g, 0, [0; 32])));
     let penalties = world.env.penalties;
     let mut rpc = Rpc::default();
-    let _ = rpc.haves.push(Have::offer(g, Bitmap::all_bits(300)));
+    let _ = rpc.haves.push(Have::offer(TYPE, g, Bitmap::all_bits(300)));
     world.rpc(1, rpc);
     assert_eq!(world.env.penalties, penalties + 1);
     assert!(world.node.asked_at.is_empty() && world.node.pairs.is_empty());
@@ -791,7 +794,7 @@ fn an_ask_outside_offer_and_interest_is_refused() {
     let g = group(1);
     let ask = |world: &mut World, index: u32| {
         let mut rpc = Rpc::default();
-        let _ = rpc.wants.push(Want::pull_ask(Ask { group: g, index }));
+        let _ = rpc.wants.push(Want::pull_ask(TYPE, Ask { group: g, index }));
         world.rpc(1, rpc);
     };
     ask(&mut world, 2);
@@ -815,7 +818,7 @@ fn asks_are_served_within_the_heartbeat_budget() {
     world.drain(2);
     let served = |world: &mut World| {
         let mut rpc = Rpc::default();
-        let _ = rpc.wants.push(Want::standing(g, Bitmap::all_bits(8)));
+        let _ = rpc.wants.push(Want::standing(TYPE, g, Bitmap::all_bits(8)));
         world.rpc(2, rpc);
         let sent = world.drain(2);
         sent.iter().filter(|entry| entry.chunk.is_some()).count()
@@ -896,7 +899,7 @@ fn a_host_without_the_reference_queue_is_handed_its_sends() {
 
     // Peer 2 asks for the chunk: the host is handed the answer, by reference.
     let mut rpc = Rpc::default();
-    let _ = rpc.wants.push(Want::pull_ask(Ask { group: g, index: 0 }));
+    let _ = rpc.wants.push(Want::pull_ask(TYPE, Ask { group: g, index: 0 }));
     node.on_rpc(2, rpc, &mut host, &mut catalog, &mut rng, &mut store);
     let answer = host
         .outbox
@@ -908,7 +911,7 @@ fn a_host_without_the_reference_queue_is_handed_its_sends() {
     // It then says it holds the chunk: the host is told, and the item is no longer
     // written.
     let mut rpc = Rpc::default();
-    let _ = rpc.haves.push(Have::holding(g, Bitmap::singleton(0), false, false));
+    let _ = rpc.haves.push(Have::holding(TYPE, g, Bitmap::singleton(0), false, false));
     node.on_rpc(2, rpc, &mut host, &mut catalog, &mut rng, &mut store);
     assert_eq!(host.cancelled, vec![(2, g, 0)]);
     assert!(node.on_write(2, answer, &mut host, &catalog).is_none());
@@ -916,4 +919,55 @@ fn a_host_without_the_reference_queue_is_handed_its_sends() {
     // To a peer that does not hold it, the same item is the chunk's frame.
     let frame = node.on_write(1, answer, &mut host, &catalog);
     assert!(frame.is_some_and(|entry| entry.chunk.is_some()));
+}
+
+/// A holding, offer or ask names its group's type: one of a type not joined on
+/// the link is ignored, and the type is kept for a group that is not open.
+#[test]
+fn a_group_is_of_the_type_it_is_named_with() {
+    let mut world = World::new(Catalog::new(8, 8), 1, InterestKind::All);
+    let (named, other) = (group(1), group(2));
+
+    let mut rpc = Rpc::default();
+    let _ = rpc.haves.push(Have::offer(TypeId(9), other, Bitmap::all_bits(8)));
+    world.rpc(1, rpc);
+    assert!(world.node.groups.get(&other).is_none() && world.node.asked_at.is_empty());
+
+    let mut rpc = Rpc::default();
+    let _ = rpc.haves.push(Have::offer(TYPE, named, Bitmap::all_bits(8)));
+    world.rpc(1, rpc);
+    assert_eq!(world.node.groups.get(&named).and_then(|r| r.named_t), Some(TYPE));
+    assert_eq!(world.node.type_of(&named, &world.catalog), TYPE);
+    assert_eq!(world.node.asked_at.len(), 8);
+
+    // Named again as another type, the group keeps the first.
+    let mut rpc = Rpc::default();
+    let _ = rpc.haves.push(Have::offer(TypeId(9), named, Bitmap::all_bits(8)));
+    world.rpc(1, rpc);
+    assert_eq!(world.node.type_of(&named, &world.catalog), TYPE);
+}
+
+/// A host that writes elsewhere reports each write: a chunk is recorded as
+/// sent, and an ask's promise runs from the time of the write, unless the
+/// chunk arrived before the report.
+#[test]
+fn a_reported_write_has_the_effects_of_a_write() {
+    let mut world = World::new(Catalog::new(8, 8), 2, InterestKind::All);
+    let g = group(1);
+    world.rpc(1, chunk_rpc(chunk(g, 0, [0; 32])));
+
+    let pushed = seacast_core::Queued::Chunk { group: g, index: 0, solicited: false };
+    world.node.on_written(2, &pushed, world.env.now(), &mut world.env, &world.catalog);
+    assert!(world.node.pairs.sent_to(&(2, g)).is_some_and(|sent| sent.has(0)));
+
+    let written_at = world.env.now() - 0.1;
+    let ask =
+        |index| seacast_core::Queued::from_want(Want::pull_ask(TYPE, Ask { group: g, index }));
+    world.node.on_written(2, &ask(3), written_at, &mut world.env, &world.catalog);
+    assert_eq!(world.node.promises.len(), 1);
+    assert!(world.node.promises.contains(Ask { group: g, index: 3 }, 2));
+
+    // Index 0 is held: its ask starts no promise.
+    world.node.on_written(2, &ask(0), written_at, &mut world.env, &world.catalog);
+    assert_eq!(world.node.promises.len(), 1);
 }

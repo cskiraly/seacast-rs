@@ -33,8 +33,8 @@ pub mod window;
 
 pub use bitmap::{BITMAP_WORDS, Bitmap, MAX_BITMAP_BITS, MAX_HAVE_BYTES};
 pub use collections::{
-    InlineVec, MAX_CHUNKS, MAX_ENTRY_CONTROL, MAX_INLINE_OFFERS, MAX_INLINE_PEERS, MAX_PROJECTED,
-    PreallocDeque, PreallocMap, PreallocSet, PreallocVec,
+    InlineVec, MAX_CHUNKS, MAX_ENTRY_CONTROL, MAX_INLINE_OFFERS, MAX_INLINE_PEERS,
+    MAX_JOINED_TYPES, MAX_PROJECTED, PreallocDeque, PreallocMap, PreallocSet, PreallocVec,
 };
 pub use message::{
     ChunkMsg, Control, Evidence, Graft, Have, Join, Prune, QueueEntry, Queued, Rpc, Want,
@@ -227,7 +227,7 @@ mod tests {
                 colours: 0,
             }
         }
-        fn joined_types(&self) -> InlineVec<TypeId, 8> {
+        fn joined_types(&self) -> InlineVec<TypeId, MAX_JOINED_TYPES> {
             InlineVec::singleton(TYPE)
         }
         fn tiebreak(&self, chunk_id: &ChunkId, peer: PeerId) -> u64 {
@@ -313,8 +313,8 @@ mod tests {
         // 4. Receive Have and Want messages and drain writer queue
         let mut rpc_have = Rpc::default();
         let _ = rpc_have.joins.push(peer_join);
-        let _ = rpc_have.haves.push(Have::holding(group, Bitmap::singleton(0), false, false));
-        let _ = rpc_have.wants.push(Want::pull_ask(Ask { group, index: 2 }));
+        let _ = rpc_have.haves.push(Have::holding(TYPE, group, Bitmap::singleton(0), false, false));
+        let _ = rpc_have.wants.push(Want::pull_ask(TYPE, Ask { group, index: 2 }));
         node.on_rpc(2, rpc_have, &mut env, &mut catalog, &mut rng, &mut defer_store);
 
         while let DispatchOutcome::Send(_) = env.next_to_send(&mut node, 2, &catalog) {}

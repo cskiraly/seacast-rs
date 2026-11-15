@@ -86,12 +86,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let Some(h) = self.groups.get(group).and_then(|r| r.hdr.as_ref()) else {
             return known;
         };
-        let t = self
-            .groups
-            .get(group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(group));
+        let t = self.type_of(group, catalog);
         let n = h.n;
         for i in 0..n {
             if known.has(i) {
@@ -121,12 +116,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let Some(h) = self.groups.get(group).and_then(|r| r.hdr.as_ref()) else {
             return false;
         };
-        let t = self
-            .groups
-            .get(group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(group));
+        let t = self.type_of(group, catalog);
         let n = h.n;
         let recv =
             self.groups.get(group).and_then(|r| r.received.as_ref()).unwrap_or(Bitmap::empty_ref());
@@ -137,12 +127,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 continue;
             }
             for (g2, i2) in catalog.cross(t, group, i) {
-                let t2 = self
-                    .groups
-                    .get(&g2)
-                    .and_then(|r| r.t_of.as_ref())
-                    .copied()
-                    .unwrap_or_else(|| catalog.type_of_group(&g2));
+                let t2 = self.type_of(&g2, catalog);
                 let interest2 = self
                     .groups
                     .get(&g2)
@@ -171,12 +156,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
         R: RngSource,
     {
-        let t = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&group));
+        let t = self.type_of(&group, catalog);
         let Some(ref steps_ref) = catalog.params(t).repair_sample else {
             return RepairVerdict::Repaired;
         };
@@ -300,12 +280,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
         R: RngSource,
     {
-        let t = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&group));
+        let t = self.type_of(&group, catalog);
         let cross = catalog.cross(t, &group, index);
         let Some(&(g2, i2)) = cross.first() else {
             return false;
@@ -313,12 +288,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if self.expired(&g2) {
             return false;
         }
-        let t2 = self
-            .groups
-            .get(&g2)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&g2));
+        let t2 = self.type_of(&g2, catalog);
         let claimants = self.groups.get(&group).and_then(|r| r.claims.as_ref());
         let mut qs: InlineVec<PeerId, MAX_INLINE_PEERS> = InlineVec::new();
         for q in self.links(t2) {
@@ -332,7 +302,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return false;
         };
         self.rsample_asked.insert((group, index, q));
-        let want = Want::standing(g2, Bitmap::singleton(i2));
+        let want = Want::standing(self.type_of(&g2, catalog), g2, Bitmap::singleton(i2));
         self.enqueue(q, Queued::from_want(want), false, env);
         true
     }
@@ -360,12 +330,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let Some(h) = self.groups.get(&group).and_then(|r| r.hdr.as_ref()).cloned() else {
             return;
         };
-        let t = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&group));
+        let t = self.type_of(&group, catalog);
         let n = h.n;
         if self.known_in_scope(&group, catalog).popcount() >= n {
             return;
@@ -492,12 +457,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let Some(h) = self.groups.get(&group).and_then(|r| r.hdr.as_ref()) else {
             return;
         };
-        let t = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&group));
+        let t = self.type_of(&group, catalog);
         let n = h.n;
         let mine =
             self.groups.get(&group).and_then(|r| r.mine.as_ref()).unwrap_or(Bitmap::empty_ref());
@@ -527,7 +487,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             peer: q,
             at_bits: now_bits,
         });
-        let want = Want::standing(group, Bitmap::singleton(probe_idx));
+        let want = Want::standing(t, group, Bitmap::singleton(probe_idx));
         self.enqueue(q, Queued::from_want(want), false, env);
 
         let current_reconsider = self
@@ -554,12 +514,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
         R: RngSource,
     {
-        let t = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&group));
+        let t = self.type_of(&group, catalog);
 
         // Collect unique target groups g2 and their (i2, source_index) pairs on the
         // stack
@@ -590,12 +545,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 continue;
             }
 
-            let t2 = self
-                .groups
-                .get(&g2)
-                .and_then(|r| r.t_of.as_ref())
-                .copied()
-                .unwrap_or_else(|| catalog.type_of_group(&g2));
+            let t2 = self.type_of(&g2, catalog);
             let Some(h2) = self
                 .groups
                 .get(&g2)
@@ -751,12 +701,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if self.expired(&group) || bits.is_empty() {
             return;
         }
-        let t = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&group));
+        let t = self.type_of(&group, catalog);
         let now = env.now();
         let mut cands: InlineVec<PeerId, MAX_INLINE_PEERS> = InlineVec::new();
         for q in self.links(t) {
@@ -777,7 +722,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         };
         *self.groups.rec(group).interest.get_or_insert_with(Default::default) |= bits;
         self.groups.rec(group).known_at.get_or_insert(now);
-        let want = Want::standing(group, bits);
+        let want = Want::standing(t, group, bits);
         self.enqueue(q, Queued::from_want(want), false, env);
         let sample_retry = catalog.params(t).sample_retry;
         env.schedule_after(sample_retry, TimerEvent::Resample { group, bits, peer: q });

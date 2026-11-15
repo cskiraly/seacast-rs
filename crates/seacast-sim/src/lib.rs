@@ -8,10 +8,10 @@ use std::{
 use seacast_codec::sha256;
 use seacast_core::{
     AnnounceWidth, Bitmap, BoundedDeferredStore, ChunkBuffer, ChunkId, ChunkMsg, DispatchOutcome,
-    Domain, Duty, FamilyId, GroupId, InlineVec, InterestKind, Join, MAX_CHUNKS, MAX_PROJECTED,
-    NodeConfig, NodeId, PeerId, PenaltyReason, Policy, PreallocVec, QueueEntry, Queued, RngSource,
-    RuntimeEnv, SeacastNode, SendQueues, Shape, SplitMix64, TimerEvent, Timestamp, TypeCodec,
-    TypeId, TypeParams, ValidationResult,
+    Domain, Duty, FamilyId, GroupId, InlineVec, InterestKind, Join, MAX_CHUNKS, MAX_JOINED_TYPES,
+    MAX_PROJECTED, NodeConfig, NodeId, PeerId, PenaltyReason, Policy, PreallocVec, QueueEntry,
+    Queued, RngSource, RuntimeEnv, SeacastNode, SendQueues, Shape, SplitMix64, TimerEvent,
+    Timestamp, TypeCodec, TypeId, TypeParams, ValidationResult,
 };
 
 /// The object types of this domain.
@@ -396,7 +396,7 @@ impl Policy for SimCatalog {
         }
     }
 
-    fn joined_types(&self) -> InlineVec<TypeId, 8> {
+    fn joined_types(&self) -> InlineVec<TypeId, MAX_JOINED_TYPES> {
         match self.setting {
             SimSetting::Tier4 | SimSetting::VariantC => InlineVec::singleton(PAYLOAD),
             SimSetting::Custody | SimSetting::Sampling => {

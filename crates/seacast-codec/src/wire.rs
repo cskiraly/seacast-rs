@@ -13,6 +13,19 @@ use crate::{
 /// Magic prefix for standalone SEACAST v2 RPC frames (`"SEAC\x02"`).
 pub const SEACAST_V2_MAGIC: [u8; 5] = *b"SEAC\x02";
 
+/// The most bytes of an encoded `Rpc` before its evidence body and its chunk's
+/// frame, which have no bound here. Nothing in the encoding delimits a message
+/// or limits those two: the transport does, with this plus the longest body and
+/// frame its types allow.
+pub const MAX_RPC_CONTROL_BYTES: usize = SEACAST_V2_MAGIC.len() +
+    (2 + MAX_RPC_JOINS * (2 + 1 + 8 + 1 + 2)) +
+    2 * (2 + MAX_ENTRY_CONTROL * (1 + 2 + 32 + 2 + MAX_HAVE_BYTES)) +
+    2 * (2 + MAX_ENTRY_CONTROL * (2 + 4 + 2 + 1)) +
+    (2 + 32 + 4) +
+    (2 + 2 + 32 + 4);
+
+const MAX_RPC_JOINS: usize = 4;
+
 /// Encodes a standalone SEACAST v2 `Rpc` but for the bytes of its evidence body
 /// and of its chunk, which close the frame in that order (`protocol-v2.md` §2,
 /// §7): the frame is what this appends to `out`, then the body, then the data.
@@ -58,6 +71,7 @@ where
             flags |= 0x04;
         }
         out.push(flags);
+        put_u16(out, h.object_type.0);
         out.extend_from_slice(&h.group);
         let wire_len = h.bits.encode_to_slice(&mut wire_bits_buf);
         put_u16(out, wire_len as u16);
@@ -68,6 +82,7 @@ where
     put_u16(out, rpc.wants.len() as u16);
     for w in &rpc.wants {
         out.push(u8::from(w.track_promise));
+        put_u16(out, w.object_type.0);
         out.extend_from_slice(&w.group);
         let wire_len = w.bits.encode_to_slice(&mut wire_bits_buf);
         put_u16(out, wire_len as u16);
@@ -186,10 +201,10 @@ where
 
     // 1. Joins
     let joins_len = get_u16(input, &mut pos)? as usize;
-    if joins_len > 4 {
+    if joins_len > MAX_RPC_JOINS {
         return None;
     }
-    let mut joins: InlineVec<Join, 4> = InlineVec::new();
+    let mut joins: InlineVec<Join, MAX_RPC_JOINS> = InlineVec::new();
     for _ in 0..joins_len {
         let object_type = TypeId(get_u16(input, &mut pos)?);
         let interest = match get_u8(input, &mut pos)? {
@@ -216,6 +231,7 @@ where
     let mut haves: InlineVec<Have, MAX_ENTRY_CONTROL> = InlineVec::new();
     for _ in 0..haves_len {
         let flags = get_u8(input, &mut pos)?;
+        let object_type = TypeId(get_u16(input, &mut pos)?);
         let group = get_bytes32(input, &mut pos)?;
         let bits_len = get_u16(input, &mut pos)? as usize;
         if bits_len > MAX_HAVE_BYTES || pos + bits_len > input.len() {
@@ -224,6 +240,7 @@ where
         let bits = Bitmap::from_wire_bytes(&input[pos..pos + bits_len])?;
         pos += bits_len;
         let _ = haves.push(Have {
+            object_type,
             group,
             bits,
             offer: (flags & 0x01) != 0,
@@ -240,6 +257,7 @@ where
     let mut wants: InlineVec<Want, MAX_ENTRY_CONTROL> = InlineVec::new();
     for _ in 0..wants_len {
         let track_promise = get_u8(input, &mut pos)? != 0;
+        let object_type = TypeId(get_u16(input, &mut pos)?);
         let group = get_bytes32(input, &mut pos)?;
         let bits_len = get_u16(input, &mut pos)? as usize;
         if bits_len > MAX_HAVE_BYTES || pos + bits_len > input.len() {
@@ -247,7 +265,7 @@ where
         }
         let bits = Bitmap::from_wire_bytes(&input[pos..pos + bits_len])?;
         pos += bits_len;
-        let _ = wants.push(Want { group, bits, track_promise });
+        let _ = wants.push(Want { object_type, group, bits, track_promise });
     }
 
     // 5. Grafts
@@ -450,10 +468,10 @@ mod tests {
                 memo: [0; 32],
             }),
             haves: InlineVec::from_slice(&[
-                Have::holding(group, Bitmap::all_bits(8), true, true),
-                Have::offer(group, Bitmap::singleton(3)),
+                Have::holding(TypeId(0), group, Bitmap::all_bits(8), true, true),
+                Have::offer(TypeId(3), group, Bitmap::singleton(3)),
             ]),
-            wants: InlineVec::singleton(Want::pull_ask(Ask::new(group, 5))),
+            wants: InlineVec::singleton(Want::pull_ask(TypeId(4), Ask::new(group, 5))),
             grafts: InlineVec::singleton(Graft {
                 object_type: TypeId(0),
                 family: 0,
@@ -472,5 +490,31 @@ mod tests {
         let bytes = encode_rpc(&rpc);
         let decoded = decode_rpc(&bytes, &mut pool, chunk_id_on(b"topic")).expect("decode rpc");
         assert_eq!(decoded, rpc);
+    }
+
+    #[test]
+    fn test_control_bound() {
+        let every = Bitmap::all_bits(seacast_core::MAX_BITMAP_BITS as u32);
+        let group = [0xff; 32];
+        let mut rpc: Rpc<Vec<u8>> = Rpc::default();
+        for t in 0..MAX_RPC_JOINS as u16 {
+            let _ = rpc.joins.push(Join { object_type: TypeId(t), ..Join::default() });
+        }
+        for _ in 0..MAX_ENTRY_CONTROL {
+            let _ = rpc.haves.push(Have::offer(TypeId(1), group, every));
+            let _ = rpc.wants.push(Want::standing(TypeId(1), group, every));
+            let _ = rpc.grafts.push(Graft::default());
+            let _ = rpc.prunes.push(Prune::default());
+        }
+        rpc.evidence = Some(Evidence { group, body: Vec::new() });
+        rpc.chunk = Some(ChunkMsg {
+            type_id: TypeId(1),
+            group,
+            index: 0,
+            frame: Vec::new(),
+            cached_id: [0; 56],
+            memo: [0; 32],
+        });
+        assert_eq!(encode_rpc(&rpc).len(), MAX_RPC_CONTROL_BYTES);
     }
 }

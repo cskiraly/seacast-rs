@@ -304,12 +304,22 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 self.on_chunk(peer, f, env, catalog, rng, deferred_store);
             }
         }
+        for (t, g) in rpc
+            .haves
+            .iter()
+            .map(|h| (h.object_type, h.group))
+            .chain(rpc.wants.iter().map(|w| (w.object_type, w.group)))
+        {
+            if self.is_linked(peer, t) {
+                self.name_group(peer, g, t);
+            }
+        }
         // One WANT per group: an offer's asks are bits of one bitmap, so none is left
         // behind.
         let mut asks: InlineVec<Want, MAX_ENTRY_CONTROL> = InlineVec::new();
         let mut offered = false;
         for h in &rpc.haves {
-            if h.offer && self.linked_for(peer, &h.group, catalog) {
+            if h.offer && self.linked_for(peer, h.object_type, &h.group, catalog) {
                 if !offered && !h.bits.is_empty() {
                     offered = true;
                     *self.ihave_rpcs.entry_or_default(peer) += 1;
@@ -318,7 +328,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                     match asks.iter_mut().find(|w| w.group == a.group) {
                         Some(w) => w.bits.set(a.index),
                         None => {
-                            let _ = asks.push(Want::pull_ask(a));
+                            let _ = asks.push(Want::pull_ask(h.object_type, a));
                         }
                     }
                 }
@@ -326,7 +336,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         let mut wants: InlineVec<Want, MAX_ENTRY_CONTROL> = InlineVec::new();
         for w in &rpc.wants {
-            if self.linked_for(peer, &w.group, catalog) {
+            if self.linked_for(peer, w.object_type, &w.group, catalog) {
                 let _ = wants.push(*w);
             }
         }
@@ -340,26 +350,47 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             self.on_prune(peer, pr);
         }
         for h in rpc.haves {
-            if !h.offer && self.linked_for(peer, &h.group, catalog) {
+            if !h.offer && self.linked_for(peer, h.object_type, &h.group, catalog) {
                 self.on_holding(peer, h, env, catalog, rng);
             }
         }
         self.respond(peer, &asks, &answers, &prunes, env);
     }
 
-    /// Whether `peer` and this node have both joined `group`'s object type on
-    /// their link.
-    fn linked_for<C>(&self, peer: PeerId, group: &GroupId, catalog: &C) -> bool
+    /// Whether a message that names `group` as of type `t` is taken from
+    /// `peer`: both have joined `t` on their link, and the group is of that
+    /// type as far as this node knows.
+    fn linked_for<C>(&self, peer: PeerId, t: TypeId, group: &GroupId, catalog: &C) -> bool
     where
         C: ObjectCatalog<B>,
     {
-        let t = self
-            .groups
+        self.is_linked(peer, t) && self.type_of(group, catalog) == t
+    }
+
+    /// `group`'s object type: the one it was opened with, else the one a peer
+    /// named it with, else the policy's answer for a group this node keeps
+    /// nothing of.
+    pub fn type_of<C>(&self, group: &GroupId, catalog: &C) -> TypeId
+    where
+        C: ObjectCatalog<B>,
+    {
+        self.groups
             .get(group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(group));
-        self.is_linked(peer, t)
+            .and_then(|r| r.t_of.or(r.named_t))
+            .unwrap_or_else(|| catalog.type_of_group(group))
+    }
+
+    /// Keeps the type `peer` named `group` with, while the group is not open
+    /// and the peer may have state kept for it.
+    fn name_group(&mut self, peer: PeerId, group: GroupId, t: TypeId) {
+        if self.expired(&group) ||
+            self.groups.get(&group).is_some_and(|r| r.t_of.is_some() || r.named_t.is_some())
+        {
+            return;
+        }
+        if self.admit_group(peer, &group) {
+            self.groups.rec(group).named_t = Some(t);
+        }
     }
 
     /// Sends one combined response per RPC handled (`protocol.md` §4.1

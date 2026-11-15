@@ -148,12 +148,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             self.fill(g, i, &chunk, Some(peer), env, catalog);
         }
         if projected.iter().any(|&(g, _)| {
-            let tg = self
-                .groups
-                .get(&g)
-                .and_then(|r| r.t_of.as_ref())
-                .copied()
-                .unwrap_or_else(|| catalog.type_of_group(&g));
+            let tg = self.type_of(&g, catalog);
             catalog.duty_for(tg, &g) == Duty::Forward
         }) {
             self.forward(&chunk, peer, env, catalog, rng);
@@ -424,12 +419,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 if self.expired(&g) {
                     continue;
                 }
-                let t = self
-                    .groups
-                    .get(&g)
-                    .and_then(|r| r.t_of.as_ref())
-                    .copied()
-                    .unwrap_or_else(|| catalog.type_of_group(&g));
+                let t = self.type_of(&g, catalog);
                 if !catalog.authenticable(t, &g) {
                     self.drop_tie(p, g, &bits, env, catalog);
                     continue;
@@ -466,12 +456,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         E: RuntimeEnv<B>,
         C: ObjectCatalog<B>,
     {
-        let t = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&group));
+        let t = self.type_of(&group, catalog);
         let auth = catalog.authenticable(t, &group);
         for i in bits.iter() {
             self.drop_offer(group, i, peer, env);
@@ -504,12 +489,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return;
         }
         self.groups.rec(group).stop_pull.replace(true);
-        let t = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&group));
+        let t = self.type_of(&group, catalog);
         if catalog.decode_at_k(t, &group) {
             self.groups.rec(group).state.replace(GroupState::Decoding);
             if let Some(h) = self.groups.get(&group).and_then(|r| r.hdr.as_ref()).copied() {
@@ -603,12 +583,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if self.decode_in_scratch.is_empty() {
             return;
         }
-        let t = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&group));
+        let t = self.type_of(&group, catalog);
         self.decode_out_scratch.clear();
         let decoded =
             catalog.decode(t, &group, &self.decode_in_scratch, &h, &mut self.decode_out_scratch);

@@ -22,12 +22,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     where
         C: ObjectCatalog<B>,
     {
-        let t = self
-            .groups
-            .get(group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(group));
+        let t = self.type_of(group, catalog);
         let fam = catalog.family(t, group);
         let mut out = InlineVec::new();
         for q in self.links(t) {
@@ -92,7 +87,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 .unwrap_or(false);
             (whole, done)
         };
-        Have::holding(group, bits, whole, done)
+        Have::holding(self.type_of(&group, catalog), group, bits, whole, done)
     }
 
     /// Returns what our holding says of `group` (`have_bits(g)` in
@@ -125,12 +120,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             if self.expired(&g) {
                 continue;
             }
-            let t = self
-                .groups
-                .get(&g)
-                .and_then(|r| r.t_of.as_ref())
-                .copied()
-                .unwrap_or_else(|| catalog.type_of_group(&g));
+            let t = self.type_of(&g, catalog);
             if catalog.duty_for(t, &g) != Duty::Forward {
                 continue;
             }
@@ -305,7 +295,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if b.is_empty() {
             return;
         }
-        let offer = Have::offer(group, b);
+        let offer = Have::offer(self.type_of(&group, catalog), group, b);
         if !self.enqueue(peer, Queued::from_have(offer), false, env) {
             self.owe(peer, group, b, env);
         }
@@ -323,12 +313,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
     {
         let mut out = InlineVec::new();
-        let t = self
-            .groups
-            .get(group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(group));
+        let t = self.type_of(group, catalog);
         if catalog.params(t).announce_extra != AnnounceWidth::AllJoined {
             return out;
         }
@@ -360,12 +345,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             e.clear(index);
             self.pairs.set_pushed((peer, group), e);
         }
-        let t = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&group));
+        let t = self.type_of(&group, catalog);
         let fam = catalog.family(t, &group);
         let m = catalog.params(t).m.max(1) as u32;
         let c = (index % m) as u16;
@@ -493,12 +473,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     where
         C: ObjectCatalog<B>,
     {
-        let t = self
-            .groups
-            .get(&chunk.group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&chunk.group));
+        let t = self.type_of(&chunk.group, catalog);
         if catalog.params(t).announce_extra == AnnounceWidth::Sample {
             self.gossip_history.put(chunk);
         }
@@ -535,12 +510,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
     {
         let g = chunk.group;
-        let t = self
-            .groups
-            .get(&g)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&g));
+        let t = self.type_of(&g, catalog);
         let fam = catalog.family(t, &g);
         let m = catalog.params(t).m.max(1) as u32;
         let c = (chunk.index % m) as u16;

@@ -1,6 +1,8 @@
 use crate::{
     bitmap::{Bitmap, MAX_CHUNKS},
-    collections::{InlineVec, MAX_INLINE_PEERS, MAX_PROJECTED, PreallocMap, PreallocVec},
+    collections::{
+        InlineVec, MAX_INLINE_PEERS, MAX_JOINED_TYPES, MAX_PROJECTED, PreallocMap, PreallocVec,
+    },
     message::{ChunkMsg, Have, Join, Queued},
     types::{
         Ask, Bytes32, ChunkId, Duty, FamilyId, GroupId, NodeId, PeerId, Shape, Timestamp, TypeId,
@@ -444,7 +446,7 @@ pub trait Policy {
 
     /// Returns the list of object types this node participates in
     /// (`joined_types()`).
-    fn joined_types(&self) -> InlineVec<TypeId, 8>;
+    fn joined_types(&self) -> InlineVec<TypeId, MAX_JOINED_TYPES>;
 
     /// Returns the families of object type `t` in which this node has
     /// forwarding duty (`families_with_duty(T)`).

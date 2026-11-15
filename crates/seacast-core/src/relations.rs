@@ -40,12 +40,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     where
         C: ObjectCatalog<B>,
     {
-        let t = self
-            .groups
-            .get(group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(group));
+        let t = self.type_of(group, catalog);
         let Some(j) = self.join_recv.get(&(peer, t)) else {
             return Bitmap::EMPTY;
         };
@@ -267,12 +262,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             {
                 continue;
             }
-            let tg = self
-                .groups
-                .get(&g)
-                .and_then(|r| r.t_of.as_ref())
-                .copied()
-                .unwrap_or_else(|| catalog.type_of_group(&g));
+            let tg = self.type_of(&g, catalog);
             if tg != t || catalog.family(tg, &g) != fam {
                 continue;
             }

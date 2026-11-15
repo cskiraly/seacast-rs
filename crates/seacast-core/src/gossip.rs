@@ -133,12 +133,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             if self.expired(g) {
                 continue;
             }
-            let t = self
-                .groups
-                .get(g)
-                .and_then(|r| r.t_of.as_ref())
-                .copied()
-                .unwrap_or_else(|| catalog.type_of_group(g));
+            let t = self.type_of(g, catalog);
             if catalog.params(t).announce_extra == AnnounceWidth::Sample {
                 self.announce(peer, *g, *bits, env, catalog);
             }

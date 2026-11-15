@@ -482,7 +482,7 @@ impl SendQueues {
                 }
             }
             if let Some(urgent_entry) = self.take_head(node, peer, true) {
-                if let Some(out) = self.with_owed(node, peer, urgent_entry) {
+                if let Some(out) = self.with_owed(node, peer, urgent_entry, catalog) {
                     return DispatchOutcome::Send(out);
                 }
                 continue;
@@ -490,7 +490,7 @@ impl SendQueues {
             let normal_empty = self.queue.get(&peer).map(|q| q.normal.is_empty()).unwrap_or(true);
             if normal_empty {
                 if self.has_owed_offers(peer) {
-                    if let Some(out) = self.with_owed(node, peer, QueueEntry::empty()) {
+                    if let Some(out) = self.with_owed(node, peer, QueueEntry::empty(), catalog) {
                         return DispatchOutcome::Send(out);
                     }
                 }
@@ -532,7 +532,7 @@ impl SendQueues {
                         node.origin_sent(ch.group, ch.index, &mut self.env(env), catalog);
                     }
                 }
-                if let Some(final_entry) = self.with_owed(node, peer, out_entry) {
+                if let Some(final_entry) = self.with_owed(node, peer, out_entry, catalog) {
                     return DispatchOutcome::Send(final_entry);
                 }
             }
@@ -617,11 +617,12 @@ impl SendQueues {
 
     /// Attaches owed offers for `peer` to `entry` (`protocol.md` §7.2
     /// `with_owed`).
-    pub fn with_owed<B: ChunkBuffer>(
+    pub fn with_owed<B: ChunkBuffer, C: ObjectCatalog<B>>(
         &mut self,
         node: &SeacastNode<B>,
         peer: PeerId,
         mut entry: QueueEntry<B>,
+        catalog: &C,
     ) -> Option<QueueEntry<B>> {
         // Only as many groups as the entry has room for leave `owed`: the rest stay
         // owed, and the writer, which runs until the queue and `owed` are both
@@ -651,7 +652,7 @@ impl SendQueues {
                 }
             }
             if !b.is_empty() {
-                entry.add_offer(Have::offer(g, b));
+                entry.add_offer(Have::offer(node.type_of(&g, catalog), g, b));
             }
         }
         if entry.is_empty() { None } else { Some(entry) }

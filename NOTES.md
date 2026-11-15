@@ -11,10 +11,10 @@ The intended split, discussed but not designed in detail and not checked against
 
 What this needs from seacast-rs:
 
-- **Split `on_write`.** It does two things in one call, and both read or write node state: it filters the item (drop a chunk the peer now holds, drop asks now held or gated) and it applies the effects of the write (start an ask's promise, record a chunk as sent, update the source's paced holding). Across tiles these become two one-way flows:
+- **`on_write` is split for such a host: `on_written`.** `on_write` filters the item (drop a chunk the peer now holds, drop asks now held or gated) and applies the effects of the write (start an ask's promise, record a chunk as sent, update the source's paced holding). Across tiles these are two one-way flows:
   - control to network: the cancel callbacks that exist (`cancel_chunk`, `cancel_asks`, `cancel_group`), so the network tile needs only an index of its queued items by (peer, group, index), not a copy of the peer's holdings;
-  - network to control: a "written" event per item with the write's timestamp, so a promise starts from the real write time.
-  A cancel that loses the race with a write costs one redundant chunk.
+  - network to control: a "written" event per item with the write's timestamp, which the host passes to `SeacastNode::on_written`, so a promise starts from the real write time.
+  A cancel that loses the race with a write costs one redundant chunk. Not done on this path: projection (`[c12]`), since it reads the peer's holdings at the moment of the write. Whether control should apply it when it hands the item over is open.
 - **Level 1 in the network tile is two of its three steps:** the codec check and the Merkle proof need only the chunk and static per-type configuration; the domain step needs consensus state and stays in control. This runs the proof before the domain step, the reverse of the specification's cost order. Judged acceptable (the proof is cheap and bounded by bytes received; a forged group still fails at the domain step), not measured under attack traffic. The control tile's catalog then answers `true` and `Accept` for the codec steps, and the `Pending` path is unused.
 - **Receive-side deduplication in the network tile: not at first.** It needs the seen-id set, and a duplicate must still reach control because its sender is owed a HAVE. A small seen cache that turns a duplicate into an event without payload is a possible later step.
 - **The byte window is node-wide.** It works as is only if one network tile owns all peers. With peers spread over several tiles it must be split or shared.
@@ -26,9 +26,10 @@ Questions that need Silver's code read (the outbound queue of the network tile, 
 
 ## Open design questions in the core
 
-- **HAVE and WANT carry no type.** The node asks `Policy::type_of_group` for a group it has not opened. Carrying the type on those messages would remove that method.
+- **A group that is not open has the type its first namer gave it.** HAVE and WANT carry their group's type, and the node keeps it (`Group::named_t`) until a chunk opens the group. It is not authenticated: a peer that names a group with a wrong type first makes the node treat the group with that type's parameters, and ignore other peers' messages for it, until a chunk arrives or the record expires. `Policy::type_of_group` remains for a group the node keeps nothing of, and for the groups a chunk projects onto.
 - **One catalog object implements all three traits.** `PayloadCatalog` therefore forwards every `TypeCodec` method to its `SegmentedCodec`. Passing codec, domain and policy to the node as separate arguments would remove the forwarding and change every entry point's signature.
-- **No catalog composes several types.** Serving a standalone type next to the payload type is left to the host; only the helpers (`standalone_group`, `check_standalone`) exist.
+- **No catalog composes several types.** `SegmentedCodec` and `StandaloneCodec` are each one type's `TypeCodec`; a host with several types dispatches on `ChunkMsg::type_id` itself. A node joins at most `MAX_JOINED_TYPES`.
+- **A chunk's context is in every chunk.** A type whose context is long (a column's commitments) pays it N times. `protocol-v2.md` sends a header once a group and link; not done here.
 - **A cancelled push leaves an offer owed** through `owe_offer`. Whether the node should send that offer itself was left open.
 - **A popped chunk must get a verdict.** A host that takes a chunk from `pop_unverified` and never calls `on_validated` leaves its id in `verifying` until the group ends, and other copies are refused meanwhile. There is no timeout.
 - **A deadline is fixed when first asked**, and a group known only from offers has none until its first chunk.

@@ -88,6 +88,9 @@ impl PeerQueue {
 pub struct Group {
     /// The group's object type: set when the group is opened.
     pub t_of: Option<TypeId>,
+    /// The type a peer's holding, offer or ask gave the group before it was
+    /// opened.
+    pub named_t: Option<TypeId>,
     /// The group's index count and threshold, from its header.
     pub hdr: Option<Shape>,
     /// Whether the domain has authenticated the group: asked once, not once a

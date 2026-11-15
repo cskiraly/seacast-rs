@@ -37,12 +37,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return InlineVec::new();
         }
 
-        let t = self
-            .groups
-            .get(&g)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&g));
+        let t = self.type_of(&g, catalog);
         let now = env.now();
         let interest = match self.groups.get(&g).and_then(|r| r.interest.as_ref()) {
             Some(interest) => *interest,
@@ -170,12 +165,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             if self.expired(&g) {
                 continue;
             }
-            let t = self
-                .groups
-                .get(&g)
-                .and_then(|r| r.t_of.as_ref())
-                .copied()
-                .unwrap_or_else(|| catalog.type_of_group(&g));
+            let t = self.type_of(&g, catalog);
             let declared = self
                 .join_recv
                 .get(&(peer, t))
@@ -273,12 +263,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if self.resolve_chunk(&group, index).is_none() {
             return;
         }
-        let t = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&group));
+        let t = self.type_of(&group, catalog);
         let serve_limit = catalog.params(t).serve_limit;
         let now = env.now();
 
@@ -358,12 +343,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         // Nothing is asked for before it can be authenticated (`protocol-v2.md` §4.2):
         // the offers wait in the ledger, and the gate's opening retries them.
-        let t = self
-            .groups
-            .get(&ask.group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&ask.group));
+        let t = self.type_of(&ask.group, catalog);
         if !catalog.authenticable(t, &ask.group) {
             return;
         }
@@ -397,7 +377,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let pick =
             self.untried(&free, ask).unwrap_or_else(|| self.least_recently_tried(&free, ask));
         if self.may_ask(ask, pick, env) {
-            self.enqueue(pick, Queued::from_want(Want::pull_ask(ask)), false, env);
+            let want = Want::pull_ask(self.type_of(&ask.group, catalog), ask);
+            self.enqueue(pick, Queued::from_want(want), false, env);
         }
     }
 
@@ -571,12 +552,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         self.last_resort_armed.insert(k);
         let factor = 1u64.checked_shl(done_len as u32).unwrap_or(u64::MAX);
-        let t = self
-            .groups
-            .get(&ask.group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&ask.group));
+        let t = self.type_of(&ask.group, catalog);
         let delay = catalog.params(t).promise * (factor as f64);
         env.schedule_after(delay, TimerEvent::AskParked(ask));
     }
@@ -644,9 +620,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         let pick =
             self.untried(&free, ask).unwrap_or_else(|| self.least_recently_tried(&free, ask));
-        if self.may_ask(ask, pick, env) &&
-            self.enqueue(pick, Queued::from_want(Want::pull_ask(ask)), false, env)
-        {
+        let want = Want::pull_ask(self.type_of(&ask.group, catalog), ask);
+        if self.may_ask(ask, pick, env) && self.enqueue(pick, Queued::from_want(want), false, env) {
             if self.parked(pick, &ask.group, now) {
                 self.asked_parked.entry_or_default(k).insert_unique(pick);
             }

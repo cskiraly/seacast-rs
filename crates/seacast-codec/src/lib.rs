@@ -27,13 +27,13 @@ pub use segment::{
     Compressor, DESCRIPTOR_BYTES, Frame, MAX_CHUNKS, MAX_CODED_BODY, MAX_PLAIN_CHUNKS,
     MAX_SEGMENT_SIZE, SegmentDescriptor, Shard, SnappyBlockCompressor, UNIT, body_into, body_len,
     build_chunks, build_frame, build_group, check_frame, check_frame_proof, chunk_id,
-    complete_in_place, decode_and_reencode, frame_leaf_hash, group_id, group_key, proof_len,
-    split_frame,
+    chunk_id_of_parts, complete_in_place, decode_and_reencode, frame_leaf_hash, group_id,
+    group_key, proof_len, split_frame,
 };
 pub use segmented::SegmentedCodec;
 pub use sha256::{Sha256, sha256};
-pub use standalone::{check_standalone, standalone_group};
+pub use standalone::{StandaloneCodec, check_standalone, standalone_group};
 pub use wire::{
-    ChunkParts, SEACAST_V2_MAGIC, chunk_id_on, decode_rpc, decode_rpc_with, encode_rpc,
-    encode_rpc_framing, encode_rpc_into,
+    ChunkParts, MAX_RPC_CONTROL_BYTES, SEACAST_V2_MAGIC, chunk_id_on, decode_rpc, decode_rpc_with,
+    encode_rpc, encode_rpc_framing, encode_rpc_into,
 };

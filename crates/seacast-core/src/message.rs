@@ -39,6 +39,7 @@ pub struct Prune {
 /// (`protocol-v2.md` §2 `[c7, D3]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Have {
+    pub object_type: TypeId,
     pub group: GroupId,
     pub bits: Bitmap,
     /// `true`: `"you may ask me for these"` (an offer);
@@ -53,19 +54,26 @@ pub struct Have {
 
 impl Have {
     #[inline]
-    pub const fn holding(group: GroupId, bits: Bitmap, claim_all: bool, complete: bool) -> Self {
-        Self { group, bits, offer: false, claim_all, complete }
+    pub const fn holding(
+        object_type: TypeId,
+        group: GroupId,
+        bits: Bitmap,
+        claim_all: bool,
+        complete: bool,
+    ) -> Self {
+        Self { object_type, group, bits, offer: false, claim_all, complete }
     }
 
     #[inline]
-    pub const fn offer(group: GroupId, bits: Bitmap) -> Self {
-        Self { group, bits, offer: true, claim_all: false, complete: false }
+    pub const fn offer(object_type: TypeId, group: GroupId, bits: Bitmap) -> Self {
+        Self { object_type, group, bits, offer: true, claim_all: false, complete: false }
     }
 }
 
 /// `Want`: `"send me these"`, per recipient (`protocol-v2.md` §2 `[D2]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Want {
+    pub object_type: TypeId,
     pub group: GroupId,
     pub bits: Bitmap,
     /// Distinguishes an offer-driven pull ask (which starts a `PROMISE` timer
@@ -79,15 +87,20 @@ impl Want {
     /// Creates an offer-driven pull ask for a single index (starts a promise
     /// when written).
     #[inline]
-    pub fn pull_ask(ask: Ask) -> Self {
-        Self { group: ask.group, bits: Bitmap::singleton(ask.index), track_promise: true }
+    pub fn pull_ask(object_type: TypeId, ask: Ask) -> Self {
+        Self {
+            object_type,
+            group: ask.group,
+            bits: Bitmap::singleton(ask.index),
+            track_promise: true,
+        }
     }
 
     /// Creates a standing / direct `Want` (e.g. for samplers, probes, or repair
     /// custodian asks).
     #[inline]
-    pub const fn standing(group: GroupId, bits: Bitmap) -> Self {
-        Self { group, bits, track_promise: false }
+    pub const fn standing(object_type: TypeId, group: GroupId, bits: Bitmap) -> Self {
+        Self { object_type, group, bits, track_promise: false }
     }
 }
 

@@ -6,8 +6,8 @@
 
 use seacast_codec::{BufferPool, ChunkBytes, SegmentedCodec, Sha256};
 use seacast_core::{
-    Bitmap, Bytes32, ChunkId, ChunkMsg, Domain, GroupId, InlineVec, Join, NodeId, PeerId, Policy,
-    PreallocVec, Shape, Timestamp, TypeCodec, TypeId, TypeParams, ValidationResult,
+    Bitmap, Bytes32, ChunkId, ChunkMsg, Domain, GroupId, InlineVec, Join, MAX_JOINED_TYPES, NodeId,
+    PeerId, Policy, PreallocVec, Shape, Timestamp, TypeCodec, TypeId, TypeParams, ValidationResult,
 };
 
 use crate::PAYLOAD;
@@ -132,7 +132,7 @@ impl<Host: PayloadHost, Pool, B> Policy for PayloadCatalog<Host, Pool, B> {
         self.join
     }
 
-    fn joined_types(&self) -> InlineVec<TypeId, 8> {
+    fn joined_types(&self) -> InlineVec<TypeId, MAX_JOINED_TYPES> {
         InlineVec::singleton(PAYLOAD)
     }
 
