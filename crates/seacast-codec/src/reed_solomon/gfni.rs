@@ -48,6 +48,7 @@ pub(super) fn coeff(c: u8) -> Coeff {
 
 /// `dst[i] = sum_j coeffs[j] * srcs[j][at + i]` over the whole vectors of
 /// `dst`. Returns the bytes written, the caller's to finish.
+#[inline]
 pub(super) fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -> usize {
     let whole = dst.len() / WIDTH * WIDTH;
     assert_eq!(coeffs.len(), srcs.len());
@@ -84,6 +85,88 @@ pub(super) fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -
             }
             _mm512_storeu_si512(dst.as_mut_ptr().add(off).cast(), sum);
             off += WIDTH;
+        }
+    }
+    whole
+}
+
+/// `g ^= c * h`, then `h ^= g`, over the whole vectors of `g`: both in one pass
+/// over the two. Returns the bytes done, the caller's to finish.
+pub(super) fn butterfly(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+    let whole = g.len() / WIDTH * WIDTH;
+    assert!(h.len() >= whole);
+    // SAFETY: the module is compiled only with `gfni` and `avx512f` enabled. Every
+    // load and store is below `whole` of `g` and `h`, checked above.
+    unsafe {
+        let m = _mm512_set1_epi64(*c as i64);
+        for off in (0..whole).step_by(WIDTH) {
+            let (gp, hp) = (g.as_mut_ptr().add(off), h.as_mut_ptr().add(off));
+            let y = _mm512_loadu_si512(hp.cast());
+            let x = _mm512_xor_si512(
+                _mm512_loadu_si512(gp.cast()),
+                _mm512_gf2p8affine_epi64_epi8::<0>(y, m),
+            );
+            _mm512_storeu_si512(gp.cast(), x);
+            _mm512_storeu_si512(hp.cast(), _mm512_xor_si512(x, y));
+        }
+    }
+    whole
+}
+
+/// The reverse of [`butterfly`]: `h ^= g`, then `g ^= c * h`.
+pub(super) fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+    let whole = g.len() / WIDTH * WIDTH;
+    assert!(h.len() >= whole);
+    // SAFETY: as in `butterfly`.
+    unsafe {
+        let m = _mm512_set1_epi64(*c as i64);
+        for off in (0..whole).step_by(WIDTH) {
+            let (gp, hp) = (g.as_mut_ptr().add(off), h.as_mut_ptr().add(off));
+            let x = _mm512_loadu_si512(gp.cast());
+            let y = _mm512_xor_si512(x, _mm512_loadu_si512(hp.cast()));
+            _mm512_storeu_si512(hp.cast(), y);
+            let x = _mm512_xor_si512(x, _mm512_gf2p8affine_epi64_epi8::<0>(y, m));
+            _mm512_storeu_si512(gp.cast(), x);
+        }
+    }
+    whole
+}
+
+/// [`row`] for `G` rows at once, row `g` with the coefficients `coeffs[g *
+/// cols..][..cols]`, over the whole pairs of vectors of `len` bytes from `at`.
+/// A source is loaded once for all the rows. Returns the bytes written of each.
+///
+/// `G` is a constant so that the sums stay in registers: up to eight rows.
+pub(super) fn rows<const G: usize>(
+    coeffs: &[Coeff],
+    srcs: &[&[u8]],
+    at: usize,
+    len: usize,
+    dsts: &mut [&mut [u8]],
+) -> usize {
+    let (whole, cols) = (len / (2 * WIDTH) * (2 * WIDTH), srcs.len());
+    assert!(dsts.len() == G && coeffs.len() == G * cols);
+    assert!(srcs.iter().all(|src| src.len() >= at + whole));
+    assert!(dsts.iter().all(|dst| dst.len() >= at + whole));
+    // SAFETY: the module is compiled only with `gfni` and `avx512f` enabled. Every
+    // load is below `at + whole` of a source and every store below it of a
+    // destination, checked above; `coeffs` holds an entry per row and source.
+    unsafe {
+        for off in (at..at + whole).step_by(2 * WIDTH) {
+            let mut acc = [[_mm512_setzero_si512(); 2]; G];
+            for (j, src) in srcs.iter().enumerate() {
+                let x0 = _mm512_loadu_si512(src.as_ptr().add(off).cast());
+                let x1 = _mm512_loadu_si512(src.as_ptr().add(off + WIDTH).cast());
+                for (g, sum) in acc.iter_mut().enumerate() {
+                    let m = _mm512_set1_epi64(*coeffs.get_unchecked(g * cols + j) as i64);
+                    sum[0] = _mm512_xor_si512(sum[0], _mm512_gf2p8affine_epi64_epi8::<0>(x0, m));
+                    sum[1] = _mm512_xor_si512(sum[1], _mm512_gf2p8affine_epi64_epi8::<0>(x1, m));
+                }
+            }
+            for (dst, sum) in dsts.iter_mut().zip(&acc) {
+                _mm512_storeu_si512(dst.as_mut_ptr().add(off).cast(), sum[0]);
+                _mm512_storeu_si512(dst.as_mut_ptr().add(off + WIDTH).cast(), sum[1]);
+            }
         }
     }
     whole

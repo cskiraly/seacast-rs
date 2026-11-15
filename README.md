@@ -18,6 +18,8 @@ The protocol logic is a single-threaded state machine with no I/O. A host suppli
 - **Standalone types** are new: one chunk a group, no header and no proof, with the group id `sha256(0x04 || type || frame)` and a level 1 that is that hash, index 0 and a length limit. The specification defines no type without a header.
 - **The send queue and window** (`protocol-v2.md` §4.11, §4.12) are not in the node. The node hands each item to the host with `send` and filters it in `on_write`; `SendQueues` implements the specification's queue and window beside it, and a host may replace it.
 - **Serving** has two checks the specification's `on_want` does not have: an ask for an index this node neither holds nor has interest in, as the peer sees that interest, is refused and penalised (`AskOutsideOfferOrInterest`), and at most `max_served_per_heartbeat` chunks are served in a heartbeat over all peers, beside `SERVE_LIMIT` per peer and group.
+- **The claim at K** is what the type's codec says a node can produce from the chunks it holds (`TypeCodec::producible`), where the specification's `claim_group` sets all `N` bits. The default is all `N`, and a holding carries `claim_all` only when its bitmap is whole.
+- **`data_only_root`** (a cargo feature of `seacast-codec`, off by default) replaces the commitment of a coded group. The descriptor has two roots, one over the `K` data chunks and one over the `N - K` parity chunks, and a chunk's proof is a path in its own tree. Level 2 checks the data root and computes no parity, where the specification re-encodes and checks one root over all `N`. A node then holds the data chunks and the parity it received, claims those without `claim_all`, and repairs with data chunks only. The descriptor is 32 bytes longer, so group ids and the wire differ from a build without the feature. See "Completion, decode and delivery".
 - **State a peer can create** has limits the specification leaves open or does not name: `max_pairs` and `max_wide_pairs` on (peer, group) records, and `max_relations_per_link`.
 
 ## Crates
@@ -256,6 +258,8 @@ stateDiagram-v2
 
 At K chunks the node stops pulling and claims all N before decoding: a group that fails level 2 fails at every node, so the claim can only be wrong about a group everyone drops. `start_decode` tells the host; the host calls `decode_group` when it is ready, which runs `catalog.decode`, stores the rebuilt chunks, fills the other groups a chunk belongs to, pushes rebuilt chunks to peers still short, and delivers.
 
+With `data_only_root` the claim at K is the data indices and the parity held, with `complete` set and `claim_all` clear, and `decode_group` stores only the data chunks it rebuilt. A data root that matches proves the parity chunks decoded from; a parity chunk held and not decoded from has passed level 1 only. Parity that is committed and is not the code's fails only the decodes that read it: a node that reaches K with such a chunk fails the data root and drops the group, as it does without the feature. It does not go on to collect the data chunks (`NOTES.md`).
+
 `SegmentedCodec` in `seacast-codec` is the `TypeCodec` of a segmented type: its trait `check_proof` answers `Pending`, and `SegmentedCodec::check_proof` is the Merkle check the host runs. `PayloadCatalog` in `seacast-sim` is the payload object type for a node: a `SegmentedCodec`, a `Domain` that asks its `PayloadHost`, and the node's policy. `crates/seacast-sim/tests/payload.rs` runs real groups through a node with it, with a host that plays the consensus side.
 
 A host that keeps chunks in a slot store uses the codec's slice-level functions, which decode a group where its chunks already lie:
@@ -274,7 +278,7 @@ flowchart LR
   DK -- "body_into: the data slots end to end are the compressed stream" --> OUT["body buffer, reserved at the declared length"]
 ```
 
-The code is systematic, so the K data slots are the Snappy stream itself. If every data chunk arrived, no Reed-Solomon runs. Otherwise only the missing slots are computed. A chunk's bytes therefore move twice: from the network into its slot, and from the slots into the decompressed body.
+The code is systematic, so the K data slots are the Snappy stream itself. If every data chunk arrived, no Reed-Solomon runs. Otherwise only the missing slots are computed. Hashing follows the same rule: level 1 has already proved the leaf digest of every chunk that arrived, the host keeps it (32 bytes a chunk), and level 2 hashes only the chunks it computed before it rebuilds the tree's upper nodes and compares the root. The node's own decode does the same: `SegmentedCodec::check_proof` leaves the digest in the chunk's `memo`, a field of `ChunkMsg` the node carries and does not read, and `decode_and_reencode` takes it for the K chunks it decodes from. A chunk's bytes therefore move twice: from the network into its slot, and from the slots into the decompressed body.
 
 | function (`seacast-codec`) | what it does |
 | --- | --- |
@@ -282,10 +286,10 @@ The code is systematic, so the K data slots are the Snappy stream itself. If eve
 | `build_group` | body to descriptor and shards, at the publisher |
 | `group_id`, `group_key` | a descriptor's id, which the domain commits; a group's id from its type, that id and its context |
 | `split_frame`, `build_frame`, `build_chunks` | a segmented chunk's frame taken apart and put together; a group's chunks as a publisher hands them to the node |
-| `check_frame`, `check_frame_proof` | level 1 for one chunk: descriptor, group id, index and length; then the Merkle proof |
+| `check_frame`, `check_frame_proof`, `frame_leaf_hash` | level 1 for one chunk: descriptor, group id, index and length; then the Merkle proof. `frame_leaf_hash` is the proof check that returns the leaf digest it proved |
 | `chunk_id` | a chunk's id: group, index, and the Altair message id over a topic and the chunk as it is sent |
 | `standalone_group`, `check_standalone` | a type with one chunk a group and no header or proof: its group id is the hash of its frame |
-| `complete_in_place` | level 2 on a slot store: fill in what is missing, check the root, return the tree for proofs |
+| `complete_in_place` | level 2 on a slot store: fill in what is missing, hash it, check the root with the digests level 1 proved for the rest, return the tree for proofs. With `data_only_root`: the missing data only, and the data tree |
 | `body_len`, `body_into` | the object's length, and its bytes written into a caller's buffer |
 | `encode_rpc_framing` | a message's bytes except the chunk's data, which is the frame's last field, for a gathered send |
 | `decode_rpc_with` | decode with a closure that turns a range of the input into a buffer handle, so nothing is copied |
@@ -323,9 +327,14 @@ just fmt                                           # rustfmt, on the pinned nigh
 just clippy                                        # clippy, warnings denied
 cargo run --release -p seacast-sim                 # the five settings of protocol-v2.md §6.2
 cargo run --release -p seacast-codec --example bench   # timings of the codec's hot paths
+cargo test --release --workspace --all-features    # the same tests with data_only_root
 ```
 
-`.cargo/config.toml` sets `-C target-cpu=native`. The codec picks its SHA-256 and GF(2^8) kernels by `cfg(target_feature)`: SHA-NI or the ARMv8 SHA2 instructions, a 16-lane AVX-512 SHA-256 for Merkle leaves, and GFNI, AVX2 or NEON for Reed-Solomon, each beside a portable arm. Without that flag every build takes the portable arms, and with it a binary is tied to the CPU it was built on.
+`just clippy` passes `--all-features`, so it lints the `data_only_root` build. Lint the default build with `cargo clippy --no-deps --all-targets -- -D warnings`.
+
+`.cargo/config.toml` sets `-C target-cpu=native`. The codec picks its SHA-256 and GF(2^8) kernels by `cfg(target_feature)`: SHA-NI or the ARMv8 SHA2 instructions, a 16-lane AVX-512 SHA-256 for Merkle leaves with SHA-NI on four leaves at a time for those that do not fill its batch, and GFNI, AVX2 or NEON for Reed-Solomon, each beside a portable arm. Without that flag every build takes the portable arms, and with it a binary is tied to the CPU it was built on.
+
+Parity is computed two ways, with the same bytes. The general one multiplies the data by the generator matrix: K products a parity byte. When K is a power of two the points `0..2K` are closed under XOR, and an additive FFT (Lin, Chung and Han) gives all K parity chunks in K log K products a byte column. `rs_parity_rows` takes it for a `(K, 2K)` code with such a K when enough parity rows are asked for; every other K, and a few missing rows, stay on the matrix. Recovery of missing data chunks is always by matrix; its coefficients are Lagrange basis values in closed form, so nothing is inverted. On the GFNI arm the matrix path computes up to eight output chunks in one pass over the inputs.
 
 ## Layout of `seacast-core`
 

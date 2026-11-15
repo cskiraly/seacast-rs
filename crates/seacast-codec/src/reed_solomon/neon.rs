@@ -62,3 +62,53 @@ pub(super) fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -
     }
     whole
 }
+
+/// `c * x`.
+///
+/// # Safety
+/// Needs NEON, baseline on aarch64.
+#[inline(always)]
+unsafe fn mul(low: uint8x16_t, high: uint8x16_t, x: uint8x16_t) -> uint8x16_t {
+    unsafe {
+        let from_low = vqtbl1q_u8(low, vandq_u8(x, vdupq_n_u8(0x0f)));
+        veorq_u8(from_low, vqtbl1q_u8(high, vshrq_n_u8::<4>(x)))
+    }
+}
+
+/// `g ^= c * h`, then `h ^= g`, over the whole vectors of `g`: both in one pass
+/// over the two. Returns the bytes done, the caller's to finish.
+pub(super) fn butterfly(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+    let whole = g.len() / WIDTH * WIDTH;
+    assert!(h.len() >= whole);
+    // SAFETY: NEON is baseline on aarch64. Every load and store is below `whole`
+    // of `g` and `h`, checked above, or inside the 32-byte coefficient.
+    unsafe {
+        let (low, high) = (vld1q_u8(c.as_ptr()), vld1q_u8(c.as_ptr().add(16)));
+        for off in (0..whole).step_by(WIDTH) {
+            let (gp, hp) = (g.as_mut_ptr().add(off), h.as_mut_ptr().add(off));
+            let y = vld1q_u8(hp);
+            let x = veorq_u8(vld1q_u8(gp), mul(low, high, y));
+            vst1q_u8(gp, x);
+            vst1q_u8(hp, veorq_u8(x, y));
+        }
+    }
+    whole
+}
+
+/// The reverse of [`butterfly`]: `h ^= g`, then `g ^= c * h`.
+pub(super) fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+    let whole = g.len() / WIDTH * WIDTH;
+    assert!(h.len() >= whole);
+    // SAFETY: as in `butterfly`.
+    unsafe {
+        let (low, high) = (vld1q_u8(c.as_ptr()), vld1q_u8(c.as_ptr().add(16)));
+        for off in (0..whole).step_by(WIDTH) {
+            let (gp, hp) = (g.as_mut_ptr().add(off), h.as_mut_ptr().add(off));
+            let x = vld1q_u8(gp);
+            let y = veorq_u8(x, vld1q_u8(hp));
+            vst1q_u8(hp, y);
+            vst1q_u8(gp, veorq_u8(x, mul(low, high, y)));
+        }
+    }
+    whole
+}

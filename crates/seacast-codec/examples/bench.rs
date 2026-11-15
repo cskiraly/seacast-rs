@@ -7,10 +7,11 @@
 use std::{hint::black_box, time::Instant};
 
 use seacast_codec::{
-    Compressor, SnappyBlockCompressor, UNIT, VecBufferPool, body_into, build_chunks, build_group,
-    build_merkle_layers, check_frame, check_frame_proof, complete_in_place, decode_and_reencode,
-    merkle_proof_from_layers, node_hash, rs_parity, rs_reconstruct_data, sha256,
-    verify_merkle_proof,
+    Compressor, MerkleTree, SnappyBlockCompressor, UNIT, VecBufferPool, body_into, build_chunks,
+    build_group, build_merkle_layers, check_frame, check_frame_proof, complete_in_place,
+    decode_and_reencode, frame_leaf_hash, merkle_proof_from_layers, node_hash,
+    rs_complete_data_in_place, rs_complete_in_place, rs_parity, rs_parity_rows,
+    rs_reconstruct_data, sha256, verify_merkle_proof,
 };
 use seacast_core::{ChunkMsg, PreallocVec, TypeId};
 
@@ -63,6 +64,99 @@ fn structured(len: usize, seed: u64) -> Vec<u8> {
     }
     out.truncate(len);
     out
+}
+
+/// Level 2 of a `(K, 2K)` group of which a node holds `x` data chunks and `y =
+/// K - x` parity chunks, under two commitments, step by step and whole.
+///
+/// One root over all `N` leaves (`protocol.md` §3): recover the `y` missing
+/// data chunks, recompute the `K - y` missing parity chunks, check the root
+/// over `N` leaves. A root over the data leaves alone: recover the `y` missing
+/// data chunks, check the root over `K` leaves. The parity check that
+/// commitment leaves off the delivery path is not timed.
+///
+/// Only the chunks computed are hashed: the digests of the chunks held are
+/// those level 1 proved.
+fn reencode_sweep() {
+    const K: usize = 32;
+    let n = 2 * K;
+    let source: Vec<Vec<u8>> = (0..K).map(|i| random(UNIT, 500 + i as u64)).collect();
+    let coded = rs_parity(&source, K);
+    let leaves: Vec<&[u8]> = source.iter().chain(&coded).map(Vec::as_slice).collect();
+    let (tree_all, tree_data) = (build_merkle_layers(&leaves), build_merkle_layers(&leaves[..K]));
+    let proved: Vec<[u8; 32]> = (0..n).map(|i| tree_all.leaf(i)).collect();
+    // The root over the first `count` chunks, hashing those that are not held.
+    let root_of = |data: &[u8], parity: &[u8], count: usize, have: &dyn Fn(usize) -> bool| {
+        let (data, parity) = (data.as_chunks::<UNIT>().0, parity.as_chunks::<UNIT>().0);
+        let computed: Vec<usize> = (0..count).filter(|&i| !have(i)).collect();
+        let hashed = build_merkle_layers(
+            &computed
+                .iter()
+                .map(|&i| if i < K { &data[i] } else { &parity[i - K] })
+                .collect::<Vec<_>>(),
+        );
+        let mut digests = proved[..count].to_vec();
+        for (at, &i) in computed.iter().enumerate() {
+            digests[i] = hashed.leaf(at);
+        }
+        MerkleTree::from_leaf_hashes(&digests).root()
+    };
+
+    println!("level 2, K = {K}, N = {n}, 16 KiB chunks, X data and Y parity held, ms");
+    println!("{:>26} | {:>29} | {:>19}", "", "root over N", "root over K");
+    println!(
+        "{:>4} {:>4} {:>8} {:>7} | {:>9} {:>9} {:>9} | {:>9} {:>9}",
+        "X", "Y", "recover", "", "re-encode", "merkle", "whole", "merkle", "whole"
+    );
+    for y in [0, 1, 4, 8, 16, 24, 32] {
+        // Held: data `y..K` and parity `K..K + y`.
+        let have = |i: usize| (y..K + y).contains(&i);
+        let (mut data, mut parity) = (vec![0u8; K * UNIT], vec![0u8; K * UNIT]);
+        for i in (0..n).filter(|&i| have(i)) {
+            let slot = if i < K { &mut data[i * UNIT..] } else { &mut parity[(i - K) * UNIT..] };
+            slot[..UNIT].copy_from_slice(leaves[i]);
+        }
+        // What is filled in is the same every run; it is not reset.
+        let recover = best(20, || {
+            rs_complete_data_in_place(K, n, &mut data, &parity, have).expect("decodes");
+        });
+        let rows: Vec<usize> = (K..n).filter(|&r| !have(r)).collect();
+        let reencode = best(20, || {
+            let srcs: Vec<&[u8]> =
+                data.as_chunks::<UNIT>().0.iter().map(|segment| &segment[..]).collect();
+            let mut dsts: Vec<&mut [u8]> =
+                (parity.as_chunks_mut::<UNIT>().0.iter_mut().enumerate())
+                    .filter(|(r, _)| !have(K + r))
+                    .map(|(_, segment)| &mut segment[..])
+                    .collect();
+            if !rows.is_empty() {
+                rs_parity_rows(&srcs, n, &rows, &mut dsts);
+            }
+        });
+        let merkle_all = best(20, || assert!(root_of(&data, &parity, n, &have) == tree_all.root()));
+        let merkle_data =
+            best(20, || assert!(root_of(&data, &parity, K, &have) == tree_data.root()));
+        let whole_all = best(20, || {
+            rs_complete_in_place(K, n, &mut data, &mut parity, have).expect("decodes");
+            assert!(root_of(&data, &parity, n, &have) == tree_all.root());
+        });
+        let whole_data = best(20, || {
+            rs_complete_data_in_place(K, n, &mut data, &parity, have).expect("decodes");
+            assert!(root_of(&data, &parity, K, &have) == tree_data.root());
+        });
+        let ms = |seconds: f64| seconds * 1e3;
+        println!(
+            "{:>4} {y:>4} {:>8.3} {:>7} | {:>9.3} {:>9.3} {:>9.3} | {:>9.3} {:>9.3}",
+            K - y,
+            ms(recover),
+            "",
+            ms(reencode),
+            ms(merkle_all),
+            ms(whole_all),
+            ms(merkle_data),
+            ms(whole_data)
+        );
+    }
 }
 
 fn main() {
@@ -158,7 +252,11 @@ fn main() {
         let (descriptor, shards) = build_group::<Vec<u8>, _, _>(&body, &mut pool, &comp);
         // What a domain would put there: the codec only carries it.
         let context = [7u8; 40];
-        let all = build_chunks(TypeId(0), TOPIC, &context, &descriptor, &shards, &mut pool);
+        let mut all = build_chunks(TypeId(0), TOPIC, &context, &descriptor, &shards, &mut pool);
+        // As a node holds them: with the leaf digest level 1 leaves behind.
+        for chunk in &mut all {
+            chunk.memo = frame_leaf_hash(chunk.index, &chunk.frame, context.len()).expect("valid");
+        }
         let chunk = |index: usize| all[index].clone();
         let valid = |chunk: &ChunkMsg<Vec<u8>>| {
             let (index, frame) = (chunk.index, &chunk.frame[..]);
@@ -188,7 +286,7 @@ fn main() {
                 TOPIC,
             );
             assert_eq!(decoded.as_deref(), Some(&body[..]));
-            assert_eq!(rebuilt.len(), 2 * k);
+            assert!(cfg!(feature = "data_only_root") || rebuilt.len() == 2 * k);
             line(
                 &format!("decode_and_reencode, {name}, {case}"),
                 best(5, || {
@@ -209,6 +307,7 @@ fn main() {
         // computed there, the payload decompressed straight out of the data
         // slots.
         let (n, size) = (2 * k, descriptor.segment_size as usize);
+        let hashes: Vec<[u8; 32]> = all.iter().map(|chunk| chunk.memo).collect();
         for (case, have) in [
             ("nothing lost", (|_| true) as fn(usize) -> bool),
             ("half lost", |i| i % 2 == 1),
@@ -224,11 +323,14 @@ fn main() {
             let mut out = vec![0u8; body.len()];
             let seconds = best(5, || {
                 // What `complete_in_place` fills in is the same every run; it is not reset.
-                complete_in_place(&descriptor, &mut data, &mut parity, have).expect("consistent");
+                complete_in_place(&descriptor, &mut data, &mut parity, have, &hashes)
+                    .expect("consistent");
                 body_into(&descriptor, &data, &mut out).expect("well formed")
             });
             assert!(out == body);
             line(&format!("in place, {name}, {case}"), seconds, body.len());
         }
     }
+
+    reencode_sweep();
 }

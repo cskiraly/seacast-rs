@@ -125,26 +125,78 @@ pub(crate) fn sha256_pair(prefix: u8, left: &Bytes32, right: &Bytes32) -> Bytes3
 }
 
 /// `out[i] = sha256(prefix || inputs[i])`. Where a target hashes several
-/// messages at once, runs of equal-length inputs go through it.
+/// messages at once, the inputs go through it a batch at a time: those of the
+/// batch's common length together, the others, a group's short last data
+/// segment for one, on their own. What is left of the inputs goes a few at a
+/// time where the target has that.
 pub(crate) fn sha256_prefixed_many<T: AsRef<[u8]>>(prefix: u8, inputs: &[T], out: &mut [Bytes32]) {
     assert_eq!(inputs.len(), out.len());
     #[allow(unused_mut)]
     let mut at = 0;
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
     while at + x16::LANES <= inputs.len() {
-        let batch: [&[u8]; x16::LANES] = std::array::from_fn(|lane| inputs[at + lane].as_ref());
-        if batch.iter().any(|input| input.len() != batch[0].len()) {
-            break;
+        let len = |lane: usize| inputs[at + lane].as_ref().len();
+        // The length two of the first three share, and a lane that has it to
+        // stand in for one that has not.
+        let like = if len(0) == len(1) || len(0) == len(2) { 0 } else { 1 };
+        let batch: [&[u8]; x16::LANES] = std::array::from_fn(|lane| {
+            inputs[at + if len(lane) == len(like) { lane } else { like }].as_ref()
+        });
+        let digests = x16::sha256_prefixed(prefix, &batch);
+        for (lane, digest) in digests.iter().enumerate() {
+            out[at + lane] = match len(lane) == len(like) {
+                true => *digest,
+                false => one(prefix, inputs[at + lane].as_ref()),
+            };
         }
-        out[at..at + x16::LANES].copy_from_slice(&x16::sha256_prefixed(prefix, &batch));
         at += x16::LANES;
     }
-    for (input, digest) in inputs[at..].iter().zip(&mut out[at..]) {
-        let mut h = Sha256::new();
-        h.update(&[prefix]);
-        h.update(input.as_ref());
-        *digest = h.finalize();
+    // What does not fill such a batch: runs of one length, a few at a time.
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "sha",
+        target_feature = "sse4.1",
+        target_feature = "ssse3"
+    ))]
+    while at < inputs.len() {
+        let len = inputs[at].as_ref().len();
+        let run = (inputs[at..].iter().take(x86::STREAMS))
+            .take_while(|input| input.as_ref().len() == len)
+            .count();
+        let input = |s: usize| inputs[at + s].as_ref();
+        let out = &mut out[at..at + run];
+        match run {
+            4 => fill(out, &x86::sha256_prefixed::<4>(prefix, std::array::from_fn(input))),
+            3 => fill(out, &x86::sha256_prefixed::<3>(prefix, std::array::from_fn(input))),
+            2 => fill(out, &x86::sha256_prefixed::<2>(prefix, std::array::from_fn(input))),
+            _ => out[0] = one(prefix, input(0)),
+        }
+        at += run;
     }
+    for (input, digest) in inputs[at..].iter().zip(&mut out[at..]) {
+        *digest = one(prefix, input.as_ref());
+    }
+}
+
+/// The digests of `states`.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "sha",
+    target_feature = "sse4.1",
+    target_feature = "ssse3"
+))]
+fn fill(out: &mut [Bytes32], states: &[[u32; 8]]) {
+    for (out, state) in out.iter_mut().zip(states) {
+        *out = digest(state);
+    }
+}
+
+/// `sha256(prefix || input)`.
+fn one(prefix: u8, input: &[u8]) -> Bytes32 {
+    let mut h = Sha256::new();
+    h.update(&[prefix]);
+    h.update(input);
+    h.finalize()
 }
 
 /// Streaming FIPS 180-4 SHA-256 hasher.
@@ -217,21 +269,25 @@ pub fn sha256(data: &[u8]) -> Bytes32 {
 mod tests {
     use super::*;
 
-    /// Batches of equal lengths, a short input in the middle of them, and a
-    /// tail, against one message at a time.
+    /// Batches of equal lengths, an odd input in the middle of one and at the
+    /// start of another, and a tail, short and long enough to be a batch,
+    /// against one message at a time.
     #[test]
     fn test_sha256_prefixed_many_matches_one_at_a_time() {
         let byte = |i: usize| (i.wrapping_mul(2654435761) >> 13) as u8;
         for len in [0, 1, 54, 55, 56, 62, 63, 64, 65, 118, 119, 120, 127, 128, 129, 1000] {
-            let mut inputs: Vec<Vec<u8>> =
-                (0..53).map(|i| (0..len).map(|j| byte(i * 1009 + j)).collect()).collect();
-            inputs[20].push(7);
-            let mut out = vec![[0u8; 32]; inputs.len()];
-            sha256_prefixed_many(0x00, &inputs, &mut out);
-            for (input, digest) in inputs.iter().zip(&out) {
-                let mut message = vec![0x00];
-                message.extend_from_slice(input);
-                assert_eq!(*digest, sha256(&message), "length {len}");
+            for count in [45, 53] {
+                let mut inputs: Vec<Vec<u8>> =
+                    (0..count).map(|i| (0..len).map(|j| byte(i * 1009 + j)).collect()).collect();
+                inputs[20].push(7);
+                inputs[32].push(9);
+                let mut out = vec![[0u8; 32]; inputs.len()];
+                sha256_prefixed_many(0x00, &inputs, &mut out);
+                for (input, digest) in inputs.iter().zip(&out) {
+                    let mut message = vec![0x00];
+                    message.extend_from_slice(input);
+                    assert_eq!(*digest, sha256(&message), "length {len}, {count} inputs");
+                }
             }
         }
     }

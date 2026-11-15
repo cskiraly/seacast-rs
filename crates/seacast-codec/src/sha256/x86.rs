@@ -47,3 +47,107 @@ pub(crate) fn compress(state: &mut [u32; 8], blocks: &[u8]) {
         _mm_storeu_si128(state.as_mut_ptr().add(4).cast(), _mm_alignr_epi8(dchg, feba, 8));
     }
 }
+
+/// [`compress`] for `S` states at once, each over its own `blocks`, all the
+/// same whole number of 64-byte blocks. The rounds of one message wait on each
+/// other and those of different messages do not, so several go through in the
+/// time of one.
+fn compress_many<const S: usize>(states: &mut [[u32; 8]; S], blocks: [&[u8]; S]) {
+    let count = blocks[0].len() / 64;
+    assert!(blocks.iter().all(|b| b.len() == 64 * count));
+    // SAFETY: as in `compress`; every block read is inside its slice, checked
+    // above.
+    unsafe {
+        let swap = _mm_set_epi64x(0x0c0d0e0f08090a0b, 0x0405060700010203);
+        let mut abef = [_mm_setzero_si128(); S];
+        let mut cdgh = [_mm_setzero_si128(); S];
+        for (s, state) in states.iter().enumerate() {
+            let dcba = _mm_loadu_si128(state.as_ptr().cast());
+            let hgfe = _mm_loadu_si128(state.as_ptr().add(4).cast());
+            let cdab = _mm_shuffle_epi32(dcba, 0xB1);
+            let efgh = _mm_shuffle_epi32(hgfe, 0x1B);
+            abef[s] = _mm_alignr_epi8(cdab, efgh, 8);
+            cdgh[s] = _mm_blend_epi16(efgh, cdab, 0xF0);
+        }
+        for b in 0..count {
+            let (abef_in, cdgh_in) = (abef, cdgh);
+            let mut m: [[__m128i; 4]; S] = core::array::from_fn(|s| {
+                let block = blocks[s].as_ptr().add(64 * b);
+                core::array::from_fn(|i| {
+                    _mm_shuffle_epi8(_mm_loadu_si128(block.add(16 * i).cast()), swap)
+                })
+            });
+            for i in 0..16 {
+                let k = _mm_loadu_si128(K.as_ptr().add(4 * i).cast());
+                for (s, m) in m.iter_mut().enumerate() {
+                    if i >= 4 {
+                        let tail = _mm_alignr_epi8(m[(i + 3) % 4], m[(i + 2) % 4], 4);
+                        let head =
+                            _mm_add_epi32(_mm_sha256msg1_epu32(m[i % 4], m[(i + 1) % 4]), tail);
+                        m[i % 4] = _mm_sha256msg2_epu32(head, m[(i + 3) % 4]);
+                    }
+                    let wk = _mm_add_epi32(m[i % 4], k);
+                    cdgh[s] = _mm_sha256rnds2_epu32(cdgh[s], abef[s], wk);
+                    abef[s] = _mm_sha256rnds2_epu32(abef[s], cdgh[s], _mm_shuffle_epi32(wk, 0x0E));
+                }
+            }
+            for s in 0..S {
+                abef[s] = _mm_add_epi32(abef[s], abef_in[s]);
+                cdgh[s] = _mm_add_epi32(cdgh[s], cdgh_in[s]);
+            }
+        }
+        for (s, state) in states.iter_mut().enumerate() {
+            let feba = _mm_shuffle_epi32(abef[s], 0x1B);
+            let dchg = _mm_shuffle_epi32(cdgh[s], 0xB1);
+            _mm_storeu_si128(state.as_mut_ptr().cast(), _mm_blend_epi16(feba, dchg, 0xF0));
+            _mm_storeu_si128(state.as_mut_ptr().add(4).cast(), _mm_alignr_epi8(dchg, feba, 8));
+        }
+    }
+}
+
+/// Messages [`sha256_prefixed`] takes at once, at most: more gain nothing.
+pub(crate) const STREAMS: usize = 4;
+
+/// The states of `sha256(prefix || data[s])` for `S` `data` of one length,
+/// before their output as digests.
+///
+/// The prefix shifts the data by a byte against the blocks: the first block and
+/// what follows the last whole one are staged, with the padding, and the blocks
+/// between are read where they lie.
+pub(crate) fn sha256_prefixed<const S: usize>(prefix: u8, data: [&[u8]; S]) -> [[u32; 8]; S] {
+    let len = data[0].len();
+    assert!(data.iter().all(|d| d.len() == len));
+    // Ends the message in `staged`, which holds its last `filled` bytes: the
+    // blocks that makes.
+    let finish = |staged: &mut [u8; 128], filled: usize| {
+        staged[filled] = 0x80;
+        let blocks = if filled + 9 <= 64 { 1 } else { 2 };
+        staged[64 * blocks - 8..64 * blocks].copy_from_slice(&((len as u64 + 1) * 8).to_be_bytes());
+        blocks
+    };
+    let mut states = [super::H0; S];
+    let mut staged = [[0u8; 128]; S];
+    let head = len.min(63);
+    let mut blocks = 1;
+    for (staged, data) in staged.iter_mut().zip(data) {
+        staged[0] = prefix;
+        staged[1..1 + head].copy_from_slice(&data[..head]);
+        if len < 63 {
+            blocks = finish(staged, 1 + len);
+        }
+    }
+    compress_many(&mut states, core::array::from_fn(|s| &staged[s][..64 * blocks]));
+    if len < 63 {
+        return states;
+    }
+    let whole = (len - 63) / 64 * 64;
+    compress_many(&mut states, core::array::from_fn(|s| &data[s][63..63 + whole]));
+    let rest = len - 63 - whole;
+    staged = [[0u8; 128]; S];
+    for (staged, data) in staged.iter_mut().zip(data) {
+        staged[..rest].copy_from_slice(&data[63 + whole..]);
+        blocks = finish(staged, rest);
+    }
+    compress_many(&mut states, core::array::from_fn(|s| &staged[s][..64 * blocks]));
+    states
+}

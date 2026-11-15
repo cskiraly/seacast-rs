@@ -52,9 +52,24 @@ impl MerkleTree {
         assert!(width <= MAX_MERKLE_LEAVES, "leaf count exceeds MAX_MERKLE_LEAVES");
         let mut nodes = [[0u8; 32]; 2 * MAX_MERKLE_LEAVES];
         sha256_prefixed_many(0x00, leaves, &mut nodes[width..width + leaves.len()]);
+        Self::above(nodes, width, leaves.len())
+    }
+
+    /// The tree whose leaves have the digests `hashes` ([`leaf_hash`]): no leaf
+    /// is hashed.
+    pub fn from_leaf_hashes(hashes: &[Bytes32]) -> Self {
+        let width = tree_width(hashes.len());
+        assert!(width <= MAX_MERKLE_LEAVES, "leaf count exceeds MAX_MERKLE_LEAVES");
+        let mut nodes = [[0u8; 32]; 2 * MAX_MERKLE_LEAVES];
+        nodes[width..width + hashes.len()].copy_from_slice(hashes);
+        Self::above(nodes, width, hashes.len())
+    }
+
+    /// Fills in the nodes above the `count` leaf digests at `nodes[width..]`.
+    fn above(mut nodes: [Bytes32; 2 * MAX_MERKLE_LEAVES], width: usize, count: usize) -> Self {
         // `live` nodes of a level have a leaf below them. The rest are all one value,
         // the hash of an all-padding subtree, computed once per level.
-        let (mut level, mut live) = (width, leaves.len());
+        let (mut level, mut live) = (width, count);
         while level > 1 {
             let (parents, children) = nodes.split_at_mut(level);
             let (level_up, live_up) = (level / 2, live.div_ceil(2));
@@ -73,6 +88,12 @@ impl MerkleTree {
     #[inline]
     pub fn root(&self) -> Bytes32 {
         self.nodes[1]
+    }
+
+    /// The digest of leaf `index`.
+    #[inline]
+    pub fn leaf(&self, index: usize) -> Bytes32 {
+        self.nodes[self.width + index]
     }
 
     /// Extracts the stack-allocated [`MerkleProof`] for leaf `index`.
@@ -122,15 +143,28 @@ pub fn verify_merkle_proof(
     count: u32,
     proof: &[Bytes32],
 ) -> bool {
+    proven_leaf_hash(root, data, index, count, proof).is_some()
+}
+
+/// [`verify_merkle_proof`], giving the leaf digest it proved: the one committed
+/// under `root` at `index`.
+pub fn proven_leaf_hash(
+    root: &Bytes32,
+    data: &[u8],
+    index: u32,
+    count: u32,
+    proof: &[Bytes32],
+) -> Option<Bytes32> {
     if count == 0 || index >= count || proof.len() > MAX_PROOF_DEPTH {
-        return false;
+        return None;
     }
     let width = tree_width(count as usize);
     let expected_depth = width.trailing_zeros() as usize;
     if proof.len() != expected_depth {
-        return false;
+        return None;
     }
-    let mut cur = leaf_hash(data);
+    let leaf = leaf_hash(data);
+    let mut cur = leaf;
     let mut idx = index as usize;
     for sibling in proof {
         if idx & 1 == 0 {
@@ -140,7 +174,7 @@ pub fn verify_merkle_proof(
         }
         idx >>= 1;
     }
-    &cur == root
+    (&cur == root).then_some(leaf)
 }
 
 #[cfg(test)]

@@ -1,0 +1,72 @@
+# AGENTS.md
+
+## What this is
+
+A Rust implementation of SEACAST v2: chunked, erasure-coded diffusion of large objects between peers. The specification is the `informed-diffusion-spec` repository (`protocol-v2.md` is primary; `protocol.md` holds the rules it carries over). `README.md` describes the design, the host's contract, and every place the code departs from the specification. `NOTES.md` lists the open items: read it before starting, and keep it current.
+
+## Priorities
+
+The emphasis is on, in this order:
+
+1. **Performance.** This is latency-critical code. Nothing on the chunk path allocates, blocks or copies a chunk's bytes without need.
+2. **Simplicity.** Simple, predictable designs are easier to optimise, debug and scale.
+
+Assume a very high bar for engineering quality.
+
+- **Simplicity over complexity.** Be concise. Complexity spreads fast and kills performance.
+- **Simplicity is not laziness.** Simple does not mean the easiest path. Heavy abstractions (async everywhere, large frameworks) are quick to write and hard to reason about and optimise later. Real simplicity is clarity: code that is easy to understand a month from now and hides no cost behind layers. Convenience is not simplicity.
+- **Contain complexity.** Keep modules tight, scope narrow and interfaces explicit (no `pub use ::*`). Complexity that leaks across boundaries becomes spaghetti.
+
+## Design principles
+
+- **The core is domain-agnostic.** `seacast-core` knows a chunk's type, group, index and an opaque frame. It knows nothing of blocks, slots, bids, payloads or any concrete object type, and it has no clock but the host's. Do not add domain names, constants or rules to it.
+- **The codec is networking mechanics only.** `seacast-codec` holds segmentation, the segment descriptor, Reed-Solomon, Merkle, SHA-256, Snappy and the wire encoding. `SegmentedCodec` is the `TypeCodec` of a segmented type. No domain logic.
+- **Everything domain-specific lives in `seacast-sim`:** the type ids, the payload catalog and its host, the simulator.
+- **Three traits, three concerns.** `TypeCodec` (frame layout and the checks that need only the chunk), `Domain` (whether a group is authentic, and its deadline), `Policy` (types, interest, duty, parameters). Keep a new rule in the trait whose concern it is.
+- **Sans-io and single-threaded.** `SeacastNode` never blocks, spawns nothing and holds no lock. All I/O, timers, randomness and buffers come through `RuntimeEnv` and the other host traits.
+- **No allocation after `SeacastNode::new`.** Every table is sized once from `CapacityConfig`. A test in `crates/seacast-core/src/lib.rs` counts allocations.
+- **The node never reads a chunk's bytes.** It is generic over the buffer handle only, so a handle may point into a host's cache.
+- **The node keeps no send queue.** It hands items to the host with `RuntimeEnv::send` and filters them in `on_write`. `SendQueues` is a replaceable reference send path.
+- **Peer-created state is bounded.** A full table refuses a new key instead of failing, and state a peer can make the node keep is admitted against a limit first. A new table needs a capacity, a limit and a test in `crates/seacast-core/tests/limits.rs`.
+- **Lifetimes are deadlines or TTLs, never slots.** The domain may give a group a deadline; otherwise the node's TTLs apply.
+
+## Layout
+
+| crate | role |
+| --- | --- |
+| `crates/seacast-core` | the state machine, the host's traits, the reference send path. Only dependency: `fxhash`. |
+| `crates/seacast-codec` | the codec of segmented and standalone types, and the wire encoding |
+| `crates/seacast-sim` | the domain: type ids, the payload catalog, the discrete-event simulator |
+
+The README's last section lists the modules of `seacast-core`.
+
+## Building and checking
+
+```bash
+just fmt                                 # rustfmt on the pinned nightly
+just clippy                              # clippy, warnings denied
+cargo test --release --workspace         # unit, limit, end-to-end and simulation tests
+cargo run --release -p seacast-sim       # the five settings of protocol-v2.md §6.2
+cargo run --release -p seacast-codec --example bench
+```
+
+- Run `just fmt` and `just clippy` after every change; both must pass. `just clippy` does not cover test and example targets, so also run it with `--all-targets` when you touch them.
+- **The simulator's summary is the regression check for the core.** A change that is meant to preserve behaviour must leave the last lines of the simulator's output byte-identical: hash them before and after.
+- The codec benchmark is the check for the codec's hot paths: compare before and after a change there.
+
+## Working rules
+
+- **Minimal diffs.** No refactors unless asked.
+- **No new dependencies without asking.**
+- **Scope discipline.** Read only what the task needs. The spec files are large: search them for the rule in question instead of reading them through.
+- **Commit only when asked.** While work is uncommitted, copy `crates/` and `README.md` to a directory under `target/` (git-ignored) before a large change.
+- **Keep the README current** with every change to behaviour, names or the host's contract. Its section "Where this differs from the specification" must list every departure: add a bullet when a change introduces one. Its diagrams are Mermaid: check they still parse after editing them.
+- **Report faithfully.** Say what was verified and what was not, and flag uncertainty.
+
+## Style
+
+- Explicit, systems-style Rust, in the tone of the Linux kernel or Firedancer.
+- Comments are terse and factual, written for senior systems engineers, and only where the logic is not obvious. No tutorial comments. Cite the specification's rule (`protocol-v2.md` §4.6) where code implements one.
+- **Never put a measurement in a comment, a doc comment or this file.** It goes stale. A comment may say which way a result went and why, never by how much.
+- Simple technical English: concise, stable terminology, one term for one thing.
+- No em-dashes or en-dashes in prose. Never hard-wrap prose in Markdown: one paragraph is one line.

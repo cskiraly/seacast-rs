@@ -176,8 +176,8 @@ impl World {
     /// proof, then decode what the node asks to have decoded.
     fn run(&mut self) -> usize {
         let mut verified = 0;
-        while let Some((peer, chunk)) = self.node.pop_unverified() {
-            let verdict = self.catalog.codec.check_proof(&chunk);
+        while let Some((peer, mut chunk)) = self.node.pop_unverified() {
+            let verdict = self.catalog.codec.check_proof(&mut chunk);
             self.node.on_validated(
                 peer,
                 chunk,
@@ -213,6 +213,7 @@ fn chunks(
                 index: i as u32,
                 cached_id: chunk_id(TOPIC, PAYLOAD, &group, i as u32, &frame),
                 frame,
+                memo: [0; 32],
             }
         })
         .collect()
@@ -304,10 +305,29 @@ fn an_inconsistent_group_is_dropped() {
     let mut leaves: Vec<Vec<u8>> =
         good.iter().map(|c| split_frame(&c.frame, CONTEXT_LEN).unwrap().data.to_vec()).collect();
     leaves[k][0] ^= 1;
-    let tree = build_merkle_layers(&leaves);
-    let descriptor = SegmentDescriptor { root: tree.root(), ..descriptor };
-    let proofs: Vec<MerkleProof> =
-        (0..leaves.len()).map(|i| merkle_proof_from_layers(&tree, i)).collect();
+    #[cfg(not(feature = "data_only_root"))]
+    let (descriptor, proofs) = {
+        let tree = build_merkle_layers(&leaves);
+        let proofs: Vec<MerkleProof> =
+            (0..leaves.len()).map(|i| merkle_proof_from_layers(&tree, i)).collect();
+        (SegmentDescriptor { root: tree.root(), ..descriptor }, proofs)
+    };
+    // The parity has a tree of its own: the node decodes from it and fails the data
+    // root.
+    #[cfg(feature = "data_only_root")]
+    let (descriptor, proofs) = {
+        let tree = build_merkle_layers(&leaves[k..]);
+        let proofs: Vec<MerkleProof> = (0..leaves.len())
+            .map(|i| {
+                if i < k {
+                    split_frame(&good[i].frame, CONTEXT_LEN).unwrap().proof()
+                } else {
+                    merkle_proof_from_layers(&tree, i - k)
+                }
+            })
+            .collect();
+        (SegmentDescriptor { parity_root: tree.root(), ..descriptor }, proofs)
+    };
     let chunks = chunks(&descriptor, &leaves, &proofs);
     let group = chunks[0].group;
 
@@ -319,4 +339,33 @@ fn an_inconsistent_group_is_dropped() {
     assert_eq!(world.run(), k);
     assert_eq!(world.node.group_state(&group), Some(GroupState::Invalid));
     assert!(world.env.delivered.is_empty() && world.env.penalties.is_empty());
+}
+
+/// No parity is computed at level 2: the node holds the data chunks and the
+/// parity it received, and its holding claims those and not the group.
+#[cfg(feature = "data_only_root")]
+#[test]
+fn a_node_claims_what_it_can_serve() {
+    let body = body(4 * UNIT + 321);
+    let (descriptor, chunks) = built(&body);
+    let k = descriptor.k() as usize;
+    let group = chunks[0].group;
+    let mut world = World::new();
+    world.install(&descriptor);
+
+    // One data chunk short, made up by one parity chunk.
+    for chunk in &chunks[1..=k] {
+        world.chunk(chunk.clone());
+    }
+    assert_eq!(world.run(), k);
+    assert_eq!(world.env.delivered, vec![(group, body)]);
+    assert!(world.env.penalties.is_empty());
+    for chunk in &chunks[..=k] {
+        let held = world.node.chunks.get(&(group, chunk.index)).expect("held");
+        assert_eq!((&held.frame, held.cached_id), (&chunk.frame, chunk.cached_id));
+    }
+    assert_eq!(world.node.chunks.len(), k + 1);
+    let holding = world.node.holding_of(group, world.node.have_bits(&group), &world.catalog);
+    assert!(holding.bits == seacast_core::Bitmap::all_bits(k as u32 + 1));
+    assert!(holding.complete && !holding.claim_all);
 }

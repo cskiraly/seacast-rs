@@ -214,7 +214,7 @@ fn chunk(group: GroupId, index: u32, root: BlockRoot) -> Chunk {
     cached_id[36] = root[0];
     let mut frame = root.to_vec();
     frame.extend_from_slice(&[index as u8; 8]);
-    ChunkMsg { type_id: TYPE, group, index, frame, cached_id }
+    ChunkMsg { type_id: TYPE, group, index, frame, cached_id, memo: [0; 32] }
 }
 
 fn peer_join(interest: InterestKind) -> Join {

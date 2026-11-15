@@ -327,7 +327,7 @@ where
                 index,
                 frame: &input[range.clone()],
             });
-            Some(ChunkMsg { type_id, group, index, frame: buffer(range), cached_id })
+            Some(ChunkMsg { type_id, group, index, frame: buffer(range), cached_id, memo: [0; 32] })
         }
         None => None,
     };
@@ -441,7 +441,14 @@ mod tests {
                 duty: Duty::Forward,
                 colours: 1,
             }),
-            chunk: Some(ChunkMsg { type_id: TypeId(0), group, index: 2, frame, cached_id: cid }),
+            chunk: Some(ChunkMsg {
+                type_id: TypeId(0),
+                group,
+                index: 2,
+                frame,
+                cached_id: cid,
+                memo: [0; 32],
+            }),
             haves: InlineVec::from_slice(&[
                 Have::holding(group, Bitmap::all_bits(8), true, true),
                 Have::offer(group, Bitmap::singleton(3)),

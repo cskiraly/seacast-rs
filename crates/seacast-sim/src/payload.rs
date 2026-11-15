@@ -6,7 +6,7 @@
 
 use seacast_codec::{BufferPool, ChunkBytes, SegmentedCodec, Sha256};
 use seacast_core::{
-    Bytes32, ChunkId, ChunkMsg, Domain, GroupId, InlineVec, Join, NodeId, PeerId, Policy,
+    Bitmap, Bytes32, ChunkId, ChunkMsg, Domain, GroupId, InlineVec, Join, NodeId, PeerId, Policy,
     PreallocVec, Shape, Timestamp, TypeCodec, TypeId, TypeParams, ValidationResult,
 };
 
@@ -88,6 +88,10 @@ where
         out_rebuilt: &mut PreallocVec<Chunk<B>>,
     ) -> Option<B> {
         self.codec.decode(t, group, available, shape, out_rebuilt)
+    }
+
+    fn producible(&self, t: TypeId, shape: &Shape, held: &Bitmap) -> Bitmap {
+        self.codec.producible(t, shape, held)
     }
 
     fn wire_size(&self, chunk: &Chunk<B>) -> usize {

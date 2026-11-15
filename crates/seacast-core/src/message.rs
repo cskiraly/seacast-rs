@@ -1,7 +1,9 @@
 use crate::{
     bitmap::Bitmap,
     collections::{InlineVec, MAX_ENTRY_CONTROL},
-    types::{Ask, ChunkId, Colour, Direction, Duty, FamilyId, GroupId, InterestKind, TypeId},
+    types::{
+        Ask, Bytes32, ChunkId, Colour, Direction, Duty, FamilyId, GroupId, InterestKind, TypeId,
+    },
 };
 
 /// `Join`: per link and object type, sent by both ends (`protocol-v2.md` §2
@@ -102,6 +104,9 @@ pub struct ChunkMsg<B> {
     pub frame: B,
     /// Cached 56-byte structured chunk ID (`chunk_id(f)` / `message_id(f)`).
     pub cached_id: ChunkId,
+    /// What the type's codec keeps of the chunk from its level 1 for its level
+    /// 2; zero until the codec sets it. The node does not read it.
+    pub memo: Bytes32,
 }
 
 /// `Evidence`: fraud-proof object published when a group fails Level 2

@@ -326,9 +326,10 @@ pub trait TypeCodec<B: ChunkBuffer> {
     /// belongs to.
     fn context<'a>(&self, chunk: &'a ChunkMsg<B>) -> &'a [u8];
 
-    /// Level 2 (`T.decode`): decodes `available`, re-encodes, checks
-    /// consistency, and writes every chunk of the group to `out_rebuilt`.
-    /// `None` if the group is inconsistent.
+    /// Level 2 (`T.decode`): decodes `available`, checks consistency, and
+    /// writes to `out_rebuilt` the chunk at every index in
+    /// [`producible`](Self::producible) of `available`'s, lowest first. `None`
+    /// if the group is inconsistent.
     fn decode(
         &mut self,
         t: TypeId,
@@ -337,6 +338,14 @@ pub trait TypeCodec<B: ChunkBuffer> {
         shape: &Shape,
         out_rebuilt: &mut PreallocVec<ChunkMsg<B>>,
     ) -> Option<B>;
+
+    /// The indices a node that holds the chunks `held` of a group, enough to
+    /// decode it, holds or can produce: what it claims before it decodes
+    /// (`protocol.md` §4.6) and what `decode` gives. Every index where
+    /// `decode` re-encodes.
+    fn producible(&self, _t: TypeId, shape: &Shape, _held: &Bitmap) -> Bitmap {
+        Bitmap::all_bits(shape.n)
+    }
 
     /// Every `(group, index)` pair a single chunk fills (`T.project(f)`, `R4`).
     fn project(&self, _t: TypeId, chunk: &ChunkMsg<B>) -> InlineVec<(GroupId, u32), MAX_PROJECTED> {

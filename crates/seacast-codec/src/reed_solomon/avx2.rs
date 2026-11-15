@@ -68,3 +68,59 @@ pub(super) fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -
     }
     whole
 }
+
+/// `c * x`.
+///
+/// # Safety
+/// Needs `avx2`, which the module is compiled only with.
+#[inline(always)]
+unsafe fn mul(low: __m256i, high: __m256i, x: __m256i) -> __m256i {
+    unsafe {
+        let nibble = _mm256_set1_epi8(0x0f);
+        let from_low = _mm256_shuffle_epi8(low, _mm256_and_si256(x, nibble));
+        let from_high =
+            _mm256_shuffle_epi8(high, _mm256_and_si256(_mm256_srli_epi64::<4>(x), nibble));
+        _mm256_xor_si256(from_low, from_high)
+    }
+}
+
+/// `g ^= c * h`, then `h ^= g`, over the whole vectors of `g`: both in one pass
+/// over the two. Returns the bytes done, the caller's to finish.
+pub(super) fn butterfly(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+    let whole = g.len() / WIDTH * WIDTH;
+    assert!(h.len() >= whole);
+    // SAFETY: the module is compiled only with `avx2` enabled. Every load and
+    // store is below `whole` of `g` and `h`, checked above, or inside the 32-byte
+    // coefficient.
+    unsafe {
+        let low = _mm256_broadcastsi128_si256(_mm_loadu_si128(c.as_ptr().cast()));
+        let high = _mm256_broadcastsi128_si256(_mm_loadu_si128(c.as_ptr().add(16).cast()));
+        for off in (0..whole).step_by(WIDTH) {
+            let (gp, hp) = (g.as_mut_ptr().add(off), h.as_mut_ptr().add(off));
+            let y = _mm256_loadu_si256(hp.cast());
+            let x = _mm256_xor_si256(_mm256_loadu_si256(gp.cast()), mul(low, high, y));
+            _mm256_storeu_si256(gp.cast(), x);
+            _mm256_storeu_si256(hp.cast(), _mm256_xor_si256(x, y));
+        }
+    }
+    whole
+}
+
+/// The reverse of [`butterfly`]: `h ^= g`, then `g ^= c * h`.
+pub(super) fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+    let whole = g.len() / WIDTH * WIDTH;
+    assert!(h.len() >= whole);
+    // SAFETY: as in `butterfly`.
+    unsafe {
+        let low = _mm256_broadcastsi128_si256(_mm_loadu_si128(c.as_ptr().cast()));
+        let high = _mm256_broadcastsi128_si256(_mm_loadu_si128(c.as_ptr().add(16).cast()));
+        for off in (0..whole).step_by(WIDTH) {
+            let (gp, hp) = (g.as_mut_ptr().add(off), h.as_mut_ptr().add(off));
+            let x = _mm256_loadu_si256(gp.cast());
+            let y = _mm256_xor_si256(x, _mm256_loadu_si256(hp.cast()));
+            _mm256_storeu_si256(hp.cast(), y);
+            _mm256_storeu_si256(gp.cast(), _mm256_xor_si256(x, mul(low, high, y)));
+        }
+    }
+    whole
+}

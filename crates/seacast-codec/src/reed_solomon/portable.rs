@@ -16,3 +16,14 @@ pub(super) fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -
     super::scalar_row(coeffs, srcs, at, dst);
     dst.len()
 }
+
+/// `g ^= c * h`, then `h ^= g`. Returns the bytes done: none, the table
+/// finishes them.
+pub(super) fn butterfly(_c: &Coeff, _g: &mut [u8], _h: &mut [u8]) -> usize {
+    0
+}
+
+/// The reverse of [`butterfly`].
+pub(super) fn butterfly_back(_c: &Coeff, _g: &mut [u8], _h: &mut [u8]) -> usize {
+    0
+}

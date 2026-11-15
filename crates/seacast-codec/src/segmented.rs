@@ -6,6 +6,8 @@
 
 use std::marker::PhantomData;
 
+#[cfg(feature = "data_only_root")]
+use seacast_core::Bitmap;
 use seacast_core::{
     Bytes32, ChunkMsg, GroupId, PreallocVec, Shape, TypeCodec, TypeId, ValidationResult,
 };
@@ -13,8 +15,8 @@ use seacast_core::{
 use crate::{
     buffer::{BufferPool, ChunkBytes},
     segment::{
-        DESCRIPTOR_BYTES, SnappyBlockCompressor, check_frame, check_frame_proof,
-        decode_and_reencode, group_id, split_frame,
+        DESCRIPTOR_BYTES, SnappyBlockCompressor, check_frame, decode_and_reencode, frame_leaf_hash,
+        group_id, split_frame,
     },
 };
 
@@ -36,15 +38,18 @@ impl<Pool, B> SegmentedCodec<Pool, B> {
 
     /// The rest of level 1 for a chunk [`TypeCodec::check_proof`] answered
     /// `Pending` for: its Merkle proof. The host runs it wherever it sees
-    /// fit before it calls `on_validated`.
-    pub fn check_proof(&self, chunk: &Chunk<B>) -> ValidationResult
+    /// fit before it calls `on_validated`. The leaf digest it proved is left in
+    /// the chunk's `memo`, for level 2 not to hash the chunk again.
+    pub fn check_proof(&self, chunk: &mut Chunk<B>) -> ValidationResult
     where
         B: ChunkBytes,
     {
-        if check_frame_proof(chunk.index, chunk.frame.as_bytes(), self.context_len) {
-            ValidationResult::Accept
-        } else {
-            ValidationResult::Reject
+        match frame_leaf_hash(chunk.index, chunk.frame.as_bytes(), self.context_len) {
+            Some(leaf) => {
+                chunk.memo = leaf;
+                ValidationResult::Accept
+            }
+            None => ValidationResult::Reject,
         }
     }
 }
@@ -103,6 +108,12 @@ where
             out_rebuilt,
             &self.topic,
         )
+    }
+
+    /// No parity is computed: the data chunks, and the chunks held.
+    #[cfg(feature = "data_only_root")]
+    fn producible(&self, _t: TypeId, shape: &Shape, held: &Bitmap) -> Bitmap {
+        Bitmap::all_bits(shape.k) | held
     }
 
     /// The chunk as it is sent: its type, group and index, then its frame.

@@ -76,15 +76,14 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             let all_sent = n > 0 && bits.popcount() >= n;
             (all_sent, all_sent)
         } else {
-            let is_decoding = self.groups.get(&group).and_then(|r| r.state.as_ref()) ==
-                Some(&GroupState::Decoding);
             let mine_count = self
                 .groups
                 .get(&group)
                 .and_then(|r| r.mine.as_ref())
                 .map(|b| b.popcount())
                 .unwrap_or(0);
-            let whole = is_decoding || (n > 0 && mine_count >= n);
+            // A decoding node claims what it can produce, which may be less than all.
+            let whole = n > 0 && mine_count >= n;
             let done = self
                 .groups
                 .get(&group)

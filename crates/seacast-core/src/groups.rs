@@ -512,9 +512,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             .unwrap_or_else(|| catalog.type_of_group(&group));
         if catalog.decode_at_k(t, &group) {
             self.groups.rec(group).state.replace(GroupState::Decoding);
-            if let Some(h) = self.groups.get(&group).and_then(|r| r.hdr.as_ref()) {
-                let n = h.n;
-                self.groups.rec(group).mine.replace(Bitmap::all_bits(n));
+            if let Some(h) = self.groups.get(&group).and_then(|r| r.hdr.as_ref()).copied() {
+                let rec = self.groups.rec(group);
+                let held = rec.mine.unwrap_or(Bitmap::EMPTY);
+                rec.mine.replace(catalog.producible(t, &h, &held));
             }
         } else {
             self.groups.rec(group).state.replace(GroupState::Complete);
@@ -592,9 +593,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         // group's.
         let held =
             self.groups.get(&group).and_then(|r| r.mine.as_ref()).copied().unwrap_or(Bitmap::EMPTY);
+        let mut given = Bitmap::EMPTY;
         for i in held.iter() {
             if let Some(ch) = self.chunks.get(&(group, i)) {
                 let _ = self.decode_in_scratch.push(ch.clone());
+                given.set(i);
             }
         }
         if self.decode_in_scratch.is_empty() {
@@ -626,9 +629,14 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let mut filled_groups: InlineVec<GroupId, MAX_CHUNKS> = InlineVec::new();
         let now = env.now();
 
+        // A chunk's place in the group is its place in `producible`, not its own index:
+        // a chunk of two groups keeps the index of its first (`R4`).
+        let mut places = catalog.producible(t, &h, &given).iter();
         for idx in 0..self.decode_out_scratch.len() {
             let ch = self.decode_out_scratch[idx].clone();
-            let i = idx as u32;
+            let Some(i) = places.next() else {
+                break;
+            };
             if !recv.has(i) {
                 let _ = new_indices.push(i);
                 self.store_chunk(group, i, ch.clone(), now);

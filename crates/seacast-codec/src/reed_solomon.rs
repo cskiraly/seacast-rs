@@ -5,7 +5,8 @@
 //! Encoding and decoding are both "each output segment is a fixed combination
 //! of input segments" ([`combine`]). The combination of one stretch of one
 //! output is the kernel, chosen per target: [`gfni`], [`avx2`], [`neon`] or
-//! [`portable`].
+//! [`portable`]. The parity of a `(K, 2K)` code with `K` a power of two has a
+//! second path, [`fft`], which gives the same bytes.
 
 use std::sync::OnceLock;
 
@@ -15,6 +16,7 @@ use std::sync::OnceLock;
     not(all(target_feature = "gfni", target_feature = "avx512f"))
 ))]
 mod avx2;
+mod fft;
 #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"))]
 mod gfni;
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -189,12 +191,51 @@ fn combine(m: &Matrix, srcs: &[&[u8]], dsts: &mut [&mut [u8]]) {
     assert!(srcs.iter().all(|src| src.len() == size) && dsts.iter().all(|dst| dst.len() == size));
     for at in (0..size).step_by(STRIP) {
         let end = (at + STRIP).min(size);
-        for (r, dst) in dsts.iter_mut().enumerate() {
+        let grouped = grouped_rows(m, srcs, at, end, dsts);
+        for (r, dst) in dsts.iter_mut().enumerate().skip(grouped) {
             let dst = &mut dst[at..end];
             let done = kernel::row(&m.coeffs[r * m.cols..][..m.cols], srcs, at, dst);
             scalar_row(m.row(r), srcs, at + done, &mut dst[done..]);
         }
     }
+}
+
+/// [`combine`] over `at..end` of every segment, by the kernel that takes
+/// several rows a pass: eight while there are, then four, then two. Returns the
+/// rows done: the rest are the caller's.
+#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"))]
+fn grouped_rows(
+    m: &Matrix,
+    srcs: &[&[u8]],
+    at: usize,
+    end: usize,
+    dsts: &mut [&mut [u8]],
+) -> usize {
+    let mut r = 0;
+    for size in [8, 4, 2] {
+        while r + size <= dsts.len() {
+            let group = &mut dsts[r..r + size];
+            let coeffs = &m.coeffs[r * m.cols..][..size * m.cols];
+            let done = match size {
+                8 => kernel::rows::<8>(coeffs, srcs, at, end - at, group),
+                4 => kernel::rows::<4>(coeffs, srcs, at, end - at, group),
+                _ => kernel::rows::<2>(coeffs, srcs, at, end - at, group),
+            };
+            // What is left of the strip, a row at a time.
+            for (g, dst) in group.iter_mut().enumerate() {
+                let (at, dst) = (at + done, &mut dst[at + done..end]);
+                let done = kernel::row(&m.coeffs[(r + g) * m.cols..][..m.cols], srcs, at, dst);
+                scalar_row(m.row(r + g), srcs, at + done, &mut dst[done..]);
+            }
+            r += size;
+        }
+    }
+    r
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f")))]
+fn grouped_rows(_: &Matrix, _: &[&[u8]], _: usize, _: usize, _: &mut [&mut [u8]]) -> usize {
+    0
 }
 
 /// Rows `k..n` of the systematic generator over the points `0..n`: row `r`
@@ -315,6 +356,13 @@ pub fn rs_parity_rows(srcs: &[&[u8]], n: usize, rows: &[usize], dsts: &mut [&mut
     assert!(
         k >= 1 && n <= 256 && rows.len() == dsts.len() && rows.iter().all(|r| (k..n).contains(r))
     );
+    // The transform costs the same whatever the rows asked for, the matrix a
+    // pass over the data for each: the transform from a number of rows that
+    // grows with its depth.
+    let fft = n == 2 * k && k.is_power_of_two() && rows.len() >= 4 * k.ilog2() as usize;
+    if fft && !srcs[0].is_empty() {
+        return fft::parity(srcs, rows, dsts);
+    }
     let parity = parity_of(k, n);
     if rows.iter().copied().eq(k..n) {
         return combine(&parity, srcs, dsts);
@@ -342,10 +390,12 @@ pub fn rs_parity(padded_data_segs: &[Vec<u8>], parity_count: usize) -> Vec<Vec<u
 /// segments, lowest first, and a matrix with a row for each and a column per
 /// chunk, in the order `indices` names them. No matrix if nothing is missing.
 ///
-/// A parity chunk is `G_r . data`. With the data split into the missing and the
-/// present, `A . missing = parity + B . present`, `A` and `B` being the columns
-/// of the used parity rows at the missing and at the present segments. So
-/// `missing = A^-1 . parity + (A^-1 . B) . present`.
+/// The data are the values at the points `0..k` of a polynomial below degree
+/// `k`, a chunk its value at the chunk's index. So a missing segment `c` is the
+/// sum over the chunks `s` held of chunk `s` times the Lagrange basis
+/// polynomial of `s` at `c`: the product of `c - t` over the others held, over
+/// that of `s - t`. No difference is zero, so the products are sums of
+/// logarithms.
 fn solve_missing(k: usize, n: usize, indices: &[u32]) -> Option<(Vec<usize>, Option<Matrix>)> {
     if k == 0 || n > 256 || k > n || indices.len() != k {
         return None;
@@ -360,28 +410,23 @@ fn solve_missing(k: usize, n: usize, indices: &[u32]) -> Option<(Vec<usize>, Opt
         position[index] = at;
     }
     let missing: Vec<usize> = (0..k).filter(|&c| position[c] == usize::MAX).collect();
-    let parity_used: Vec<usize> = (k..n).filter(|&r| position[r] != usize::MAX).collect();
-    debug_assert_eq!(missing.len(), parity_used.len());
-    let m = missing.len();
-    if m == 0 {
+    if missing.is_empty() {
         return Some((missing, None));
     }
 
-    let parity = parity_of(k, n);
-    let used: Vec<&[u8]> = parity_used.iter().map(|&r| parity.row(r - k)).collect();
-    let a: Vec<u8> = used.iter().flat_map(|row| missing.iter().map(|&c| row[c])).collect();
-    let a_inv = Matrix::new(m, invert(m, &a)?);
-    // `A^-1 . G_used`: its columns at the present segments are `A^-1 . B`.
-    let mut product = vec![0u8; m * k];
-    combine(&a_inv, &used, &mut product.chunks_exact_mut(k).collect::<Vec<_>>());
-    let mut solve = vec![0u8; m * k];
-    for (i, row) in solve.chunks_exact_mut(k).enumerate() {
-        for (at, &index) in indices.iter().enumerate() {
-            let index = index as usize;
-            row[at] = match parity_used.iter().position(|&r| r == index) {
-                Some(p) => a_inv.row(i)[p],
-                None => product[i * k + index],
-            };
+    // The logarithm of the product of `x - t` over the chunks held but `x`.
+    let log = |x: u32| GF256.log[x as usize] as u32;
+    let others =
+        |x: u32| indices.iter().filter(|&&t| t != x).map(|&t| log(x ^ t)).sum::<u32>() % 255;
+    let denominators: Vec<u32> = indices.iter().map(|&s| others(s)).collect();
+    let mut solve = vec![0u8; missing.len() * k];
+    for (row, &c) in solve.chunks_exact_mut(k).zip(&missing) {
+        let c = c as u32;
+        let numerator = others(c);
+        for ((out, &s), denominator) in row.iter_mut().zip(indices).zip(&denominators) {
+            // All but the factor `c - s`, over the denominator.
+            let exponent = numerator + (255 - log(c ^ s)) + (255 - denominator);
+            *out = GF256.exp[exponent as usize % 255];
         }
     }
     Some((missing, Some(Matrix::new(k, solve))))
@@ -437,6 +482,32 @@ pub fn rs_complete_in_place(
     parity: &mut [u8],
     have: impl Fn(usize) -> bool,
 ) -> Option<()> {
+    rs_complete_data_in_place(k, n, data, parity, &have)?;
+    let size = data.len() / k;
+    if size == 0 {
+        return Some(());
+    }
+    let rows: Vec<usize> = (k..n).filter(|&r| !have(r)).collect();
+    if !rows.is_empty() {
+        let srcs: Vec<&[u8]> = data.chunks_exact(size).collect();
+        let mut dsts: Vec<&mut [u8]> = (parity.chunks_exact_mut(size).enumerate())
+            .filter(|(r, _)| !have(k + r))
+            .map(|(_, segment)| segment)
+            .collect();
+        rs_parity_rows(&srcs, n, &rows, &mut dsts);
+    }
+    Some(())
+}
+
+/// The data half of [`rs_complete_in_place`]: the missing data segments are
+/// filled in and `parity` is left as it is.
+pub fn rs_complete_data_in_place(
+    k: usize,
+    n: usize,
+    data: &mut [u8],
+    parity: &[u8],
+    have: impl Fn(usize) -> bool,
+) -> Option<()> {
     if k == 0 || k > n || n > 256 || !data.len().is_multiple_of(k) {
         return None;
     }
@@ -449,35 +520,22 @@ pub fn rs_complete_in_place(
     if parity_used.len() < missing_data {
         return None;
     }
-    if size == 0 {
+    if size == 0 || missing_data == 0 {
         return Some(());
     }
-    if missing_data > 0 {
-        let indices: Vec<u32> =
-            (0..k).filter(|&c| have(c)).chain(parity_used).map(|i| i as u32).collect();
-        let (_, solve) = solve_missing(k, n, &indices)?;
-        let (mut srcs, mut dsts) = (Vec::with_capacity(k), Vec::with_capacity(missing_data));
-        for (c, segment) in data.chunks_exact_mut(size).enumerate() {
-            if have(c) {
-                srcs.push(&*segment);
-            } else {
-                dsts.push(segment);
-            }
+    let indices: Vec<u32> =
+        (0..k).filter(|&c| have(c)).chain(parity_used).map(|i| i as u32).collect();
+    let (_, solve) = solve_missing(k, n, &indices)?;
+    let (mut srcs, mut dsts) = (Vec::with_capacity(k), Vec::with_capacity(missing_data));
+    for (c, segment) in data.chunks_exact_mut(size).enumerate() {
+        if have(c) {
+            srcs.push(&*segment);
+        } else {
+            dsts.push(segment);
         }
-        srcs.extend(
-            indices[srcs.len()..].iter().map(|&r| &parity[(r as usize - k) * size..][..size]),
-        );
-        combine(&solve?, &srcs, &mut dsts);
     }
-    let rows: Vec<usize> = (k..n).filter(|&r| !have(r)).collect();
-    if !rows.is_empty() {
-        let srcs: Vec<&[u8]> = data.chunks_exact(size).collect();
-        let mut dsts: Vec<&mut [u8]> = (parity.chunks_exact_mut(size).enumerate())
-            .filter(|(r, _)| !have(k + r))
-            .map(|(_, segment)| segment)
-            .collect();
-        rs_parity_rows(&srcs, n, &rows, &mut dsts);
-    }
+    srcs.extend(indices[srcs.len()..].iter().map(|&r| &parity[(r as usize - k) * size..][..size]));
+    combine(&solve?, &srcs, &mut dsts);
     Some(())
 }
 
@@ -555,6 +613,36 @@ mod tests {
                     let expected =
                         (0..k).fold(0, |acc, c| acc ^ GF256.mul(generator[k + p][c], data[c][at]));
                     assert_eq!(byte, expected, "size {size} parity {p} byte {at}");
+                }
+            }
+        }
+    }
+
+    /// The transform against the matrix: every `k` it takes, lengths around
+    /// every vector width and strip, all the parity rows and some of them.
+    #[test]
+    fn test_fft_parity_is_the_matrix_one() {
+        for k in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+            let matrix = parity_matrix(k, 2 * k);
+            for size in [1, 15, 16, 17, 63, 64, 65, 255, 1023, 1024, 1025, 2500] {
+                let data: Vec<Vec<u8>> = (0..k).map(|i| bytes(size, (k * 13 + i) as u64)).collect();
+                let srcs: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
+                let mut expected = vec![vec![0u8; size]; k];
+                combine(
+                    &matrix,
+                    &srcs,
+                    &mut expected.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>(),
+                );
+                for step in [1, 3] {
+                    // Highest first, so a row's place in `rows` is not its place in the code.
+                    let rows: Vec<usize> = (k..2 * k).rev().step_by(step).collect();
+                    let mut parity = vec![vec![0x5au8; size]; rows.len()];
+                    let mut dsts: Vec<&mut [u8]> =
+                        parity.iter_mut().map(Vec::as_mut_slice).collect();
+                    fft::parity(&srcs, &rows, &mut dsts);
+                    for (r, row) in rows.iter().zip(&parity) {
+                        assert!(row == &expected[r - k], "k {k} size {size} row {r}");
+                    }
                 }
             }
         }

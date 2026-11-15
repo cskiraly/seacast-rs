@@ -2,14 +2,18 @@ use seacast_core::{
     Bytes32, ChunkBuffer, ChunkId, ChunkMsg, GroupId, MAX_BITMAP_BITS, PreallocVec, TypeId,
 };
 
+#[cfg(feature = "data_only_root")]
+use crate::reed_solomon::rs_complete_data_in_place;
+#[cfg(not(feature = "data_only_root"))]
+use crate::reed_solomon::rs_complete_in_place;
 use crate::{
     buffer::{BufferPool, ChunkBytes},
     merkle::{
-        MerkleProof, MerkleTree, build_merkle_layers, merkle_proof_from_layers, tree_width,
-        verify_merkle_proof,
+        MerkleProof, MerkleTree, build_merkle_layers, merkle_proof_from_layers, proven_leaf_hash,
+        tree_width,
     },
-    reed_solomon::{rs_complete_in_place, rs_parity_rows, rs_reconstruct_into},
-    sha256::Sha256,
+    reed_solomon::{rs_parity_rows, rs_reconstruct_into},
+    sha256::{Sha256, sha256_prefixed_many},
     snappy,
 };
 
@@ -35,7 +39,11 @@ pub const MAX_CODED_BODY: usize = (MAX_CHUNKS as usize / 2) * UNIT;
 
 /// Serialized size of a `SegmentDescriptor` in bytes (`1 + 1 + 1 + 4 + 4 + 8 +
 /// 32 = 51`).
+#[cfg(not(feature = "data_only_root"))]
 pub const DESCRIPTOR_BYTES: usize = 51;
+/// With the parity root after the root.
+#[cfg(feature = "data_only_root")]
+pub const DESCRIPTOR_BYTES: usize = 83;
 
 /// Pluggable pre-coding body compressor (`encoding = 1` in
 /// `SegmentDescriptor`).
@@ -76,12 +84,17 @@ pub struct SegmentDescriptor {
     pub segment_size: u32,
     /// Length of the segmented byte string.
     pub total_length: u64,
-    /// Merkle root over the `N` chunks.
+    /// Merkle root over the `N` chunks. With `data_only_root`, over the `K`
+    /// data chunks.
     pub root: Bytes32,
+    /// Merkle root over the `N - K` parity chunks of a coded group; zero in a
+    /// plain one.
+    #[cfg(feature = "data_only_root")]
+    pub parity_root: Bytes32,
 }
 
 impl SegmentDescriptor {
-    /// Serializes the descriptor into its 51-byte SSZ layout (`serialize(d)` in
+    /// Serializes the descriptor into its SSZ layout (`serialize(d)` in
     /// `protocol.md` §1).
     pub fn serialize(&self) -> [u8; DESCRIPTOR_BYTES] {
         let mut out = [0u8; DESCRIPTOR_BYTES];
@@ -92,10 +105,12 @@ impl SegmentDescriptor {
         out[7..11].copy_from_slice(&self.segment_size.to_le_bytes());
         out[11..19].copy_from_slice(&self.total_length.to_le_bytes());
         out[19..51].copy_from_slice(&self.root);
+        #[cfg(feature = "data_only_root")]
+        out[51..83].copy_from_slice(&self.parity_root);
         out
     }
 
-    /// Deserializes a `SegmentDescriptor` from 51 bytes.
+    /// Deserializes a `SegmentDescriptor` from [`DESCRIPTOR_BYTES`] bytes.
     pub fn deserialize(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < DESCRIPTOR_BYTES {
             return None;
@@ -110,6 +125,8 @@ impl SegmentDescriptor {
             segment_size: u32::from_le_bytes([bytes[7], bytes[8], bytes[9], bytes[10]]),
             total_length: u64::from_le_bytes(bytes[11..19].try_into().unwrap()),
             root,
+            #[cfg(feature = "data_only_root")]
+            parity_root: bytes[51..83].try_into().unwrap(),
         })
     }
 
@@ -144,6 +161,27 @@ impl SegmentDescriptor {
         }
     }
 
+    /// The tree chunk `index` is a leaf of: its root, the leaf's place in it
+    /// and its leaf count.
+    fn tree_of(&self, index: u32) -> (&Bytes32, u32, u32) {
+        #[cfg(feature = "data_only_root")]
+        if self.version == 2 {
+            let k = self.k();
+            return if index < k {
+                (&self.root, index, k)
+            } else {
+                (&self.parity_root, index - k, self.count.saturating_sub(k))
+            };
+        }
+        (&self.root, index, self.count)
+    }
+
+    /// The digests in the proof of any chunk of the group. A coded group's two
+    /// trees have `K` leaves each.
+    fn proof_len(&self) -> usize {
+        proof_len(self.tree_of(0).2)
+    }
+
     /// Checks whether this descriptor is valid before allocating group state
     /// (`valid_descriptor(d)` in `protocol.md` §1).
     pub fn is_valid(&self) -> bool {
@@ -159,6 +197,10 @@ impl SegmentDescriptor {
         }
         let last_len = self.total_length.checked_sub(((k - 1) as u64) * (self.segment_size as u64));
         if !matches!(last_len, Some(l) if l > 0 && l <= (self.segment_size as u64)) {
+            return false;
+        }
+        #[cfg(feature = "data_only_root")]
+        if self.version == 1 && self.parity_root != [0u8; 32] {
             return false;
         }
         match self.version {
@@ -191,14 +233,14 @@ pub fn group_key(type_id: TypeId, header_id: &Bytes32, context: &[u8]) -> GroupI
     h.finalize()
 }
 
-/// The digests in the proof of any chunk of a group of `count` chunks.
+/// The digests in the proof of any leaf of a tree of `count` leaves.
 pub fn proof_len(count: u32) -> usize {
     tree_width(count as usize).trailing_zeros() as usize
 }
 
 /// A segmented chunk's frame: `descriptor | context | proof | data`. Every
 /// length is given: the descriptor's is fixed, the context's is its type's, the
-/// proof's follows from the descriptor's count, and the data is the rest.
+/// proof's follows from the descriptor, and the data is the rest.
 pub struct Frame<'a> {
     pub descriptor: SegmentDescriptor,
     pub context: &'a [u8],
@@ -225,7 +267,7 @@ pub fn split_frame(frame: &[u8], context_len: usize) -> Option<Frame<'_>> {
     }
     let rest = &frame[DESCRIPTOR_BYTES..];
     let (context, rest) = rest.split_at_checked(context_len)?;
-    let (proof, data) = rest.split_at_checked(32 * proof_len(descriptor.count))?;
+    let (proof, data) = rest.split_at_checked(32 * descriptor.proof_len())?;
     Some(Frame { descriptor, context, proof, data })
 }
 
@@ -321,6 +363,11 @@ where
         (0..k).map(|i| &data[(i * size).min(total)..((i + 1) * size).min(total)]).collect();
     leaves.extend(parity.chunks_exact(size));
 
+    // Plain, `leaves[k..]` is empty and its root is zero.
+    #[cfg(feature = "data_only_root")]
+    let (tree, parity_tree) =
+        (build_merkle_layers(&leaves[..k]), build_merkle_layers(&leaves[k..]));
+    #[cfg(not(feature = "data_only_root"))]
     let tree = build_merkle_layers(&leaves);
     let root = tree.root();
 
@@ -332,10 +379,15 @@ where
         segment_size: size as u32,
         total_length: total as u64,
         root,
+        #[cfg(feature = "data_only_root")]
+        parity_root: parity_tree.root(),
     };
 
     let mut shards = Vec::with_capacity(leaves.len());
     for (i, leaf) in leaves.into_iter().enumerate() {
+        #[cfg(feature = "data_only_root")]
+        let proof = if i < k { tree.proof(i) } else { parity_tree.proof(i - k) };
+        #[cfg(not(feature = "data_only_root"))]
         let proof = merkle_proof_from_layers(&tree, i);
         shards.push(Shard { index: i as u32, proof, data: pool.alloc_from_slice(leaf) });
     }
@@ -362,12 +414,18 @@ pub fn check_frame(
         f.data.len() == f.descriptor.segment_length(index)
 }
 
-/// The rest of level 1: the data is leaf `index` of the tree with the
-/// descriptor's root.
+/// The rest of level 1: the data is the leaf of chunk `index` in its tree
+/// under the descriptor.
 pub fn check_frame_proof(index: u32, frame: &[u8], context_len: usize) -> bool {
-    split_frame(frame, context_len).is_some_and(|f| {
-        verify_merkle_proof(&f.descriptor.root, f.data, index, f.descriptor.count, &f.proof())
-    })
+    frame_leaf_hash(index, frame, context_len).is_some()
+}
+
+/// [`check_frame_proof`], giving the leaf digest it proved: what
+/// [`complete_in_place`] takes for a chunk that is there.
+pub fn frame_leaf_hash(index: u32, frame: &[u8], context_len: usize) -> Option<Bytes32> {
+    let f = split_frame(frame, context_len)?;
+    let (root, leaf, count) = f.descriptor.tree_of(index);
+    proven_leaf_hash(root, f.data, leaf, count, &f.proof())
 }
 
 /// The chunks of a group built by [`build_group`], as a publisher hands them to
@@ -395,6 +453,7 @@ where
                 index: shard.index,
                 cached_id: chunk_id(topic, type_id, &group, shard.index, &frame),
                 frame: pool.alloc_from_slice(&frame),
+                memo: [0; 32],
             }
         })
         .collect()
@@ -407,29 +466,53 @@ where
 /// Every missing chunk is computed into its place, nothing present is moved,
 /// and the tree over all `N` must have the committed root.
 ///
+/// `hashes[i]` is the leaf digest of chunk `i` as level 1 proved it
+/// ([`frame_leaf_hash`]), for every chunk that is there; the other entries are
+/// not read. Only the chunks computed here are hashed: a proved digest is the
+/// committed one, so the root is the same as from hashing every chunk. A slot
+/// that changed after its level 1 is therefore not detected.
+///
 /// The tree gives the proofs of the chunks filled in. `None` if `K` chunks are
 /// not there, or if the root differs: the group is inconsistent, and what was
 /// filled in is not to be used.
+///
+/// With `data_only_root` only the missing data chunks are computed, `parity`
+/// is left as it is, and the tree is the one over the `K` data chunks.
 pub fn complete_in_place(
     descriptor: &SegmentDescriptor,
     data: &mut [u8],
     parity: &mut [u8],
     have: impl Fn(usize) -> bool,
+    hashes: &[Bytes32],
 ) -> Option<MerkleTree> {
     if !descriptor.is_valid() {
         return None;
     }
     let (k, n) = (descriptor.k() as usize, descriptor.n() as usize);
     let size = descriptor.segment_size as usize;
-    if data.len() != k * size || parity.len() != (n - k) * size {
+    if data.len() != k * size || parity.len() != (n - k) * size || hashes.len() != n {
         return None;
     }
-    rs_complete_in_place(k, n, data, parity, have)?;
-    let leaves: Vec<&[u8]> = (0..k)
-        .map(|i| &data[i * size..][..descriptor.segment_length(i as u32)])
-        .chain(parity.chunks_exact(size))
+    #[cfg(feature = "data_only_root")]
+    rs_complete_data_in_place(k, n, data, parity, &have)?;
+    #[cfg(not(feature = "data_only_root"))]
+    rs_complete_in_place(k, n, data, parity, &have)?;
+    // The leaves of the tree under `descriptor.root`.
+    let count = if cfg!(feature = "data_only_root") { k } else { n };
+    let computed: Vec<usize> = (0..count).filter(|&i| !have(i)).collect();
+    let leaves: Vec<&[u8]> = (computed.iter())
+        .map(|&i| match i < k {
+            true => &data[i * size..][..descriptor.segment_length(i as u32)],
+            false => &parity[(i - k) * size..][..size],
+        })
         .collect();
-    let tree = build_merkle_layers(&leaves);
+    let mut digests = vec![[0u8; 32]; leaves.len()];
+    sha256_prefixed_many(0x00, &leaves, &mut digests);
+    let mut all = hashes[..count].to_vec();
+    for (&i, digest) in computed.iter().zip(digests) {
+        all[i] = digest;
+    }
+    let tree = MerkleTree::from_leaf_hashes(&all);
     (tree.root() == descriptor.root).then_some(tree)
 }
 
@@ -471,6 +554,11 @@ fn data_at<B: ChunkBytes>(chunk: &ChunkMsg<B>, skip: usize) -> &[u8] {
 /// in `available`, re-encodes parity, verifies the Merkle root, populates
 /// `out_rebuilt` with all `N` chunks, and returns the decompressed body
 /// allocated via `pool` (`decode_and_reencode` in `protocol.md` §1, §4.6).
+///
+/// With `data_only_root` no parity is computed: the data root is checked, and
+/// `out_rebuilt` is the `K` data chunks, then the parity chunks given. A data
+/// root that matches proves the parity chunks decoded from; the others given
+/// have passed level 1 only.
 pub fn decode_and_reencode<B, Pool, Comp>(
     available_chunks: &[ChunkMsg<B>],
     context_len: usize,
@@ -499,7 +587,7 @@ where
     let (type_id, group) = (first_chunk.type_id, first_chunk.group);
     // Every chunk of the group has the same header, context and proof length before
     // its data.
-    let skip = DESCRIPTOR_BYTES + context_len + 32 * proof_len(descriptor.count);
+    let skip = DESCRIPTOR_BYTES + context_len + 32 * descriptor.proof_len();
 
     // The first chunk given of each index.
     let mut given: [Option<&ChunkMsg<B>>; MAX_PLAIN_CHUNKS] = [None; MAX_PLAIN_CHUNKS];
@@ -512,10 +600,14 @@ where
     // The data segments end to end, every one `seg_size` bytes; coded, the parity
     // chunks that were not among the `k` decoded from.
     let mut data = Vec::new();
+    #[cfg(not(feature = "data_only_root"))]
     let mut parity = Vec::new();
     let mut leaves: Vec<&[u8]> = Vec::with_capacity(n);
+    // The chunks whose bytes the leaves are: the others are computed.
+    let decoded_from: Vec<&ChunkMsg<B>>;
     if descriptor.version == 2 {
         let used = &available_chunks[..k];
+        decoded_from = used.iter().collect();
         if used.iter().any(|ch| {
             ch.index as usize >= n || data_at(ch, skip).len() != descriptor.segment_length(ch.index)
         }) {
@@ -538,24 +630,30 @@ where
         data.resize(k * seg_size, 0);
         rs_reconstruct_into(k, n, &indices, &chunks, &mut data)?;
 
+        leaves.extend((0..k).map(|i| &data[i * seg_size..][..descriptor.segment_length(i as u32)]));
+
         // Decoding from `k` chunks and coding again gives those `k` back whatever they
         // hold, so only the other parity chunks are computed; the root check
         // below covers them all.
-        let other_parity: Vec<usize> = (k..n).filter(|r| !indices.contains(&(*r as u32))).collect();
-        parity.resize(other_parity.len() * seg_size, 0);
-        let srcs: Vec<&[u8]> = data.chunks_exact(seg_size).collect();
-        let mut dsts: Vec<&mut [u8]> = parity.chunks_exact_mut(seg_size).collect();
-        rs_parity_rows(&srcs, n, &other_parity, &mut dsts);
+        #[cfg(not(feature = "data_only_root"))]
+        {
+            let other_parity: Vec<usize> =
+                (k..n).filter(|r| !indices.contains(&(*r as u32))).collect();
+            parity.resize(other_parity.len() * seg_size, 0);
+            let srcs: Vec<&[u8]> = data.chunks_exact(seg_size).collect();
+            let mut dsts: Vec<&mut [u8]> = parity.chunks_exact_mut(seg_size).collect();
+            rs_parity_rows(&srcs, n, &other_parity, &mut dsts);
 
-        leaves.extend((0..k).map(|i| &data[i * seg_size..][..descriptor.segment_length(i as u32)]));
-        let mut computed = parity.chunks_exact(seg_size);
-        for r in k..n {
-            leaves.push(match used.iter().find(|ch| ch.index as usize == r) {
-                Some(ch) => data_at(ch, skip),
-                None => computed.next()?,
-            });
+            let mut computed = parity.chunks_exact(seg_size);
+            for r in k..n {
+                leaves.push(match used.iter().find(|ch| ch.index as usize == r) {
+                    Some(ch) => data_at(ch, skip),
+                    None => computed.next()?,
+                });
+            }
         }
     } else {
+        decoded_from = given[..k].iter().flatten().copied().collect();
         for chunk in &given[..k] {
             let bytes = data_at((*chunk)?, skip);
             leaves.push(bytes);
@@ -563,7 +661,22 @@ where
         }
     }
 
-    let tree = build_merkle_layers(&leaves);
+    // The digest of a chunk decoded from is the one its level 1 proved, if that
+    // left it in `memo`: the committed one, so only the other leaves are hashed.
+    let mut digests = vec![[0u8; 32]; leaves.len()];
+    for ch in decoded_from {
+        if let Some(digest) = digests.get_mut(ch.index as usize) {
+            *digest = ch.memo;
+        }
+    }
+    let unknown: Vec<usize> = (0..leaves.len()).filter(|&i| digests[i] == [0; 32]).collect();
+    let to_hash: Vec<&[u8]> = unknown.iter().map(|&i| leaves[i]).collect();
+    let mut hashed = vec![[0u8; 32]; to_hash.len()];
+    sha256_prefixed_many(0x00, &to_hash, &mut hashed);
+    for (&i, digest) in unknown.iter().zip(hashed) {
+        digests[i] = digest;
+    }
+    let tree = MerkleTree::from_leaf_hashes(&digests);
     if tree.root() != descriptor.root {
         return None;
     }
@@ -589,9 +702,14 @@ where
                 index: idx,
                 cached_id: chunk_id(topic, type_id, &group, idx, &frame),
                 frame: pool.alloc_from_slice(&frame),
+                memo: tree.leaf(i),
             };
             let _ = out_rebuilt.push(msg);
         }
+    }
+    #[cfg(feature = "data_only_root")]
+    for existing in given[k..n].iter().flatten() {
+        let _ = out_rebuilt.push((*existing).clone());
     }
     Some(body_buf)
 }
@@ -604,6 +722,9 @@ mod tests {
     const TOPIC: &[u8] = b"topic";
     /// What a domain would put there: these tests only carry it.
     const CONTEXT: [u8; 40] = [3; 40];
+    /// Level 2 computes no parity: it gives the data chunks and the parity
+    /// chunks it was given.
+    const DATA_ONLY: bool = cfg!(feature = "data_only_root");
 
     fn valid(chunk: &ChunkMsg<Vec<u8>>) -> bool {
         let (index, frame) = (chunk.index, &chunk.frame[..]);
@@ -632,11 +753,39 @@ mod tests {
         let recovered =
             decode_and_reencode(&subset, CONTEXT.len(), &mut pool, &comp, &mut rebuilt, TOPIC)
                 .expect("level 2 decode");
-        assert_eq!(rebuilt.len(), 10);
+        assert_eq!(rebuilt.len(), if DATA_ONLY { 8 } else { 10 });
         assert_eq!(recovered, body);
         for ch in rebuilt.iter() {
             assert!(valid(ch));
         }
+    }
+
+    /// Level 2 takes the digest level 1 left in a chunk it decodes from, and
+    /// leaves one in every chunk it makes: the same verdict and chunks as from
+    /// hashing, and a digest that is not the committed one fails the root.
+    #[test]
+    fn test_decode_takes_the_digests_of_level_1() {
+        let mut pool = VecBufferPool;
+        let comp = SnappyBlockCompressor;
+        let body: Vec<u8> = (0..(UNIT * 4 + 1234)).map(|i| (i % 251) as u8).collect();
+        let (desc, shards) = build_group(&body, &mut pool, &comp);
+        let mut subset = chunks_of(&desc, &shards, [1, 3, 5, 7, 9].into_iter());
+        for ch in &mut subset {
+            ch.memo = frame_leaf_hash(ch.index, &ch.frame, CONTEXT.len()).expect("valid");
+        }
+        let mut rebuilt = PreallocVec::with_capacity(16);
+        let recovered =
+            decode_and_reencode(&subset, CONTEXT.len(), &mut pool, &comp, &mut rebuilt, TOPIC);
+        assert_eq!(recovered.as_deref(), Some(&body[..]));
+        for ch in rebuilt.iter() {
+            assert!(valid(ch));
+            assert_eq!(Some(ch.memo), frame_leaf_hash(ch.index, &ch.frame, CONTEXT.len()));
+        }
+        subset[0].memo[0] ^= 1;
+        assert!(
+            decode_and_reencode(&subset, CONTEXT.len(), &mut pool, &comp, &mut rebuilt, TOPIC)
+                .is_none()
+        );
     }
 
     fn chunks_of(
@@ -687,8 +836,11 @@ mod tests {
                         TOPIC,
                     );
                     assert_eq!(decoded.as_ref(), Some(&body), "{len} bytes from {subset:?}");
-                    assert_eq!(rebuilt.len(), n);
-                    for (i, ch) in rebuilt.iter().enumerate() {
+                    // The indices of the chunks decoding gives, lowest first.
+                    let expected: Vec<usize> =
+                        (0..n).filter(|i| !DATA_ONLY || *i < k || subset.contains(i)).collect();
+                    assert_eq!(rebuilt.len(), expected.len());
+                    for (ch, i) in rebuilt.iter().zip(expected) {
                         let frame = split_frame(&ch.frame, CONTEXT.len()).expect("a frame");
                         assert_eq!(
                             (ch.index as usize, frame.data, frame.proof()),
@@ -755,6 +907,8 @@ mod tests {
             segment_size: 1,
             total_length: u64::MAX,
             root: [0; 32],
+            #[cfg(feature = "data_only_root")]
+            parity_root: [0; 32],
         };
         assert!(!base.is_valid());
         for (segment_size, total_length, count, version, encoding) in [
@@ -781,6 +935,11 @@ mod tests {
             let body: Vec<u8> = (0..len).map(|i| (i / 5 % 17) as u8 ^ (i >> 9) as u8).collect();
             let (desc, shards) = build_group::<Vec<u8>, _, _>(&body, &mut pool, &comp);
             let (k, n, size) = (desc.k() as usize, desc.n() as usize, desc.segment_size as usize);
+            // What level 1 gives for each chunk.
+            let mut hashes = vec![[0u8; 32]; n];
+            for shard in &shards {
+                hashes[shard.index as usize] = crate::merkle::leaf_hash(&shard.data);
+            }
             for kept in [0, 1, 2] {
                 // Every chunk, the parity alone, and every other one.
                 let have = |i: usize| match kept {
@@ -795,10 +954,13 @@ mod tests {
                         if i < k { &mut data[i * size..] } else { &mut parity[(i - k) * size..] };
                     slot[..shard.data.len()].copy_from_slice(&shard.data);
                 }
-                let tree =
-                    complete_in_place(&desc, &mut data, &mut parity, have).expect("consistent");
+                let tree = complete_in_place(&desc, &mut data, &mut parity, have, &hashes)
+                    .expect("consistent");
                 for shard in &shards {
                     let i = shard.index as usize;
+                    if DATA_ONLY && i >= k {
+                        continue;
+                    }
                     let slot = if i < k { &data[i * size..] } else { &parity[(i - k) * size..] };
                     assert_eq!(
                         &slot[..shard.data.len()],
@@ -821,9 +983,47 @@ mod tests {
                 slot[..shard.data.len()].copy_from_slice(&shard.data);
             }
             parity[0] ^= 1;
-            assert!(complete_in_place(&desc, &mut data, &mut parity, |i| i >= k).is_none());
-            assert!(complete_in_place(&desc, &mut data, &mut parity, |i| i > k).is_none());
+            assert!(
+                complete_in_place(&desc, &mut data, &mut parity, |i| i >= k, &hashes).is_none()
+            );
+            assert!(complete_in_place(&desc, &mut data, &mut parity, |i| i > k, &hashes).is_none());
+            // A digest that is not the committed one fails the root too.
+            parity[0] ^= 1;
+            let mut wrong = hashes.clone();
+            wrong[if DATA_ONLY { 0 } else { n - 1 }][0] ^= 1;
+            assert!(complete_in_place(&desc, &mut data, &mut parity, |_| true, &wrong).is_none());
+            assert!(complete_in_place(&desc, &mut data, &mut parity, |_| true, &hashes).is_some());
         }
+    }
+
+    /// Parity that is committed and is not the code's: every chunk passes level
+    /// 1, the data chunks alone decode, and a decode that reads a parity chunk
+    /// fails the data root.
+    #[cfg(feature = "data_only_root")]
+    #[test]
+    fn test_bad_parity_does_not_block_the_data() {
+        let mut pool = VecBufferPool;
+        let comp = SnappyBlockCompressor;
+        let body: Vec<u8> = (0..5 * UNIT).map(|i| (i * i % 251) as u8).collect();
+        let (desc, mut shards) = build_group::<Vec<u8>, _, _>(&body, &mut pool, &comp);
+        let k = desc.k() as usize;
+        for shard in &mut shards[k..] {
+            shard.data[0] ^= 1;
+        }
+        let leaves: Vec<&[u8]> = shards[k..].iter().map(|shard| &shard.data[..]).collect();
+        let tree = build_merkle_layers(&leaves);
+        for (i, shard) in shards[k..].iter_mut().enumerate() {
+            shard.proof = merkle_proof_from_layers(&tree, i);
+        }
+        let desc = SegmentDescriptor { parity_root: tree.root(), ..desc };
+        assert!(chunks_of(&desc, &shards, 0..2 * k).iter().all(valid));
+
+        let mut rebuilt = PreallocVec::with_capacity(2 * k);
+        let mut decode = |available: &[ChunkMsg<Vec<u8>>]| {
+            decode_and_reencode(available, CONTEXT.len(), &mut pool, &comp, &mut rebuilt, TOPIC)
+        };
+        assert_eq!(decode(&chunks_of(&desc, &shards, 0..k)), Some(body));
+        assert_eq!(decode(&chunks_of(&desc, &shards, 1..k + 1)), None);
     }
 
     /// The content id is the Altair message id over the topic and the chunk as

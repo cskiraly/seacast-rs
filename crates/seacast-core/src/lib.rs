@@ -189,6 +189,7 @@ mod tests {
                     index: i,
                     frame,
                     cached_id,
+                    memo: [0; 32],
                 });
             }
             Some(pool.alloc_from_slice(&[0xAA; 16]))
@@ -276,6 +277,7 @@ mod tests {
             index: 0,
             frame: pool_tmp.alloc_from_slice(&[10, 20, 30, 40]),
             cached_id: id0,
+            memo: [0; 32],
         };
         let mut id1 = [0u8; 56];
         id1[..32].copy_from_slice(&group);
@@ -286,6 +288,7 @@ mod tests {
             index: 1,
             frame: pool_tmp.alloc_from_slice(&[50, 60, 70, 80]),
             cached_id: id1,
+            memo: [0; 32],
         };
 
         // A peer's messages count once it has joined the type on the link
