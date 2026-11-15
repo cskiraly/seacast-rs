@@ -48,10 +48,13 @@ An experiment behind a cargo feature of `seacast-codec` (README, "Where this dif
 ## Reed-Solomon
 
 - **The FFT parity path covers K a power of two only.** For another K the points `0..2K` are not closed under XOR and the matrix is used. Whether such a K can use a transform without changing the code is open; padding K up changes the parity, so it is a specification change.
-- **The NEON `butterfly` and `butterfly_back` have not been compiled or run.** No aarch64 target was installed where it was written. The GFNI, AVX2 and portable arms pass the tests.
+- **The NEON and ARMv8 SHA2 arms are compiled for `aarch64-apple-darwin` and linted, not run, on the machine they are written on.** The butterflies and `row` ran on an Apple core through the benchmark, which asserts every root. The grouped `rows` and the interleaved `compress_many` there have not run yet.
+- **`STREAMS` is four on aarch64 by analogy with x86**, not measured.
+- **The NEON three-input XOR needs the `sha3` target feature**; without it two XORs are used. Only the `sha3` path is compiled here.
 - **The row count from which `rs_parity_rows` takes the transform** is one constant for the GFNI kernel, measured, and one for the others, placed from the benchmark's sweep on AVX2 and on one NEON machine: two shapes each, not a sweep of both paths.
 - **`combine` copies each strip of the sources side by side on the kernels that make a pass per row**, since segments of one buffer evict each other from the cache. Measured on AVX2; on NEON it is inferred from one machine's benchmark, where the in-place lines were several times slower than the same work on separately allocated chunks, and not yet rerun there. The destinations are still written where they lie.
-- **Only the GFNI arm computes several rows a pass.** The table-lookup arms need two table registers a coefficient, so the same grouping was not tried there.
+- **The GFNI and NEON arms compute several rows a pass; AVX2 does not.** It has sixteen registers and needs two for a coefficient's tables, so at most four rows of one vector; not tried.
+- **The row count from which the transform is taken on NEON predates its grouped kernel.** It is the constant of the kernels with a pass per row, and should rise once the grouped kernel is measured.
 - **Running the transform in the parity chunks themselves, with no work buffer, was tried and was slower.** Chunks a multiple of the page size apart land in the same cache sets.
 - **`fft::parity` allocates its work buffer on every call**, K strips.
 - **Recovery is still by matrix.** Its cost grows with the chunks lost; a transform-based erasure decode would bound it. Not tried.
@@ -60,7 +63,6 @@ An experiment behind a cargo feature of `seacast-codec` (README, "Where this dif
 ## Level 2 hashing
 
 - **Four leaves at a time on SHA-NI matched the 16-lane AVX-512 kernel on full batches** on the one machine tried (Zen 5), so `sha256/x16.rs` could go there. Not measured on an Intel core, where the SHA-NI rounds may not overlap as well; the 16-lane kernel stays until it is.
-- **The aarch64 arm hashes leaves one at a time.** The same interleaving should apply to the ARMv8 SHA2 instructions; not written.
 - **`ChunkMsg::memo` is 32 bytes a chunk the node holds**, in every table of chunks. Memory has not been measured with it.
 - **A chunk whose `memo` is zero is hashed at level 2**: one from the wire that the host's proof check did not go through `SegmentedCodec::check_proof`, and a publisher's own (`build_chunks` leaves it zero, since it would have to hash each leaf again).
 - **`decode_and_reencode` takes the digest of the K chunks it decodes from only.** A parity chunk given beyond those is computed again and hashed, as the specification's re-encode does, so that every node gives the same verdict. `complete_in_place` does not: it leaves a chunk that is there as it is, so a group whose committed parity is not the code's passes at a node that holds all the data. That was so before the digests were reused.

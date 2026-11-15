@@ -29,7 +29,7 @@ mod x86;
 mod x16;
 
 #[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
-use aarch64::compress;
+use aarch64::{STREAMS, compress, compress_many};
 #[cfg(not(any(
     all(target_arch = "aarch64", target_feature = "sha2"),
     all(
@@ -40,13 +40,42 @@ use aarch64::compress;
     )
 )))]
 use portable as compress;
+
+/// Messages [`compress_many`] is given at once, at most: one, where the
+/// compression is the portable one.
+#[cfg(not(any(
+    all(target_arch = "aarch64", target_feature = "sha2"),
+    all(
+        target_arch = "x86_64",
+        target_feature = "sha",
+        target_feature = "sse4.1",
+        target_feature = "ssse3"
+    )
+)))]
+const STREAMS: usize = 1;
+
+/// [`compress`] for each of `states` over its own `blocks`.
+#[cfg(not(any(
+    all(target_arch = "aarch64", target_feature = "sha2"),
+    all(
+        target_arch = "x86_64",
+        target_feature = "sha",
+        target_feature = "sse4.1",
+        target_feature = "ssse3"
+    )
+)))]
+fn compress_many<const S: usize>(states: &mut [[u32; 8]; S], blocks: [&[u8]; S]) {
+    for (state, blocks) in states.iter_mut().zip(blocks) {
+        compress(state, blocks);
+    }
+}
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "sha",
     target_feature = "sse4.1",
     target_feature = "ssse3"
 ))]
-use x86::compress;
+use x86::{STREAMS, compress, compress_many};
 
 /// Absorb `blocks`, a whole number of 64-byte blocks, into `state`. The
 /// reference for the hardware arms, and the arm of a target with no SHA
@@ -152,39 +181,68 @@ pub(crate) fn sha256_prefixed_many<T: AsRef<[u8]>>(prefix: u8, inputs: &[T], out
         at += x16::LANES;
     }
     // What does not fill such a batch: runs of one length, a few at a time.
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "sha",
-        target_feature = "sse4.1",
-        target_feature = "ssse3"
-    ))]
     while at < inputs.len() {
         let len = inputs[at].as_ref().len();
-        let run = (inputs[at..].iter().take(x86::STREAMS))
+        let run = (inputs[at..].iter().take(STREAMS))
             .take_while(|input| input.as_ref().len() == len)
             .count();
         let input = |s: usize| inputs[at + s].as_ref();
         let out = &mut out[at..at + run];
         match run {
-            4 => fill(out, &x86::sha256_prefixed::<4>(prefix, std::array::from_fn(input))),
-            3 => fill(out, &x86::sha256_prefixed::<3>(prefix, std::array::from_fn(input))),
-            2 => fill(out, &x86::sha256_prefixed::<2>(prefix, std::array::from_fn(input))),
+            4 => fill(out, &prefixed::<4>(prefix, std::array::from_fn(input))),
+            3 => fill(out, &prefixed::<3>(prefix, std::array::from_fn(input))),
+            2 => fill(out, &prefixed::<2>(prefix, std::array::from_fn(input))),
             _ => out[0] = one(prefix, input(0)),
         }
         at += run;
     }
-    for (input, digest) in inputs[at..].iter().zip(&mut out[at..]) {
-        *digest = one(prefix, input.as_ref());
+}
+
+/// The states of `sha256(prefix || data[s])` for `S` `data` of one length,
+/// before their output as digests.
+///
+/// The prefix shifts the data by a byte against the blocks: the first block and
+/// what follows the last whole one are staged, with the padding, and the blocks
+/// between are read where they lie.
+fn prefixed<const S: usize>(prefix: u8, data: [&[u8]; S]) -> [[u32; 8]; S] {
+    let len = data[0].len();
+    assert!(data.iter().all(|d| d.len() == len));
+    // Ends the message in `staged`, which holds its last `filled` bytes: the
+    // blocks that makes.
+    let finish = |staged: &mut [u8; 128], filled: usize| {
+        staged[filled] = 0x80;
+        let blocks = if filled + 9 <= 64 { 1 } else { 2 };
+        staged[64 * blocks - 8..64 * blocks].copy_from_slice(&((len as u64 + 1) * 8).to_be_bytes());
+        blocks
+    };
+    let mut states = [H0; S];
+    let mut staged = [[0u8; 128]; S];
+    let head = len.min(63);
+    let mut blocks = 1;
+    for (staged, data) in staged.iter_mut().zip(data) {
+        staged[0] = prefix;
+        staged[1..1 + head].copy_from_slice(&data[..head]);
+        if len < 63 {
+            blocks = finish(staged, 1 + len);
+        }
     }
+    compress_many(&mut states, core::array::from_fn(|s| &staged[s][..64 * blocks]));
+    if len < 63 {
+        return states;
+    }
+    let whole = (len - 63) / 64 * 64;
+    compress_many(&mut states, core::array::from_fn(|s| &data[s][63..63 + whole]));
+    let rest = len - 63 - whole;
+    staged = [[0u8; 128]; S];
+    for (staged, data) in staged.iter_mut().zip(data) {
+        staged[..rest].copy_from_slice(&data[63 + whole..]);
+        blocks = finish(staged, rest);
+    }
+    compress_many(&mut states, core::array::from_fn(|s| &staged[s][..64 * blocks]));
+    states
 }
 
 /// The digests of `states`.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "sha",
-    target_feature = "sse4.1",
-    target_feature = "ssse3"
-))]
 fn fill(out: &mut [Bytes32], states: &[[u32; 8]]) {
     for (out, state) in out.iter_mut().zip(states) {
         *out = digest(state);
