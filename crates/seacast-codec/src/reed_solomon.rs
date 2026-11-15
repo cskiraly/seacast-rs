@@ -238,6 +238,14 @@ fn grouped_rows(_: &Matrix, _: &[&[u8]], _: usize, _: usize, _: &mut [&mut [u8]]
     0
 }
 
+/// Twice the parity rows, for each level of the transform, from which
+/// [`fft`] is ahead of the matrix: more where the matrix takes several rows a
+/// pass.
+#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"))]
+const FFT_FROM_HALF_ROWS: usize = 8;
+#[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f")))]
+const FFT_FROM_HALF_ROWS: usize = 3;
+
 /// Rows `k..n` of the systematic generator over the points `0..n`: row `r`
 /// holds the Lagrange basis polynomials of the points `0..k`, evaluated at `r`.
 /// Addition being XOR, the difference of two points is their XOR.
@@ -359,7 +367,8 @@ pub fn rs_parity_rows(srcs: &[&[u8]], n: usize, rows: &[usize], dsts: &mut [&mut
     // The transform costs the same whatever the rows asked for, the matrix a
     // pass over the data for each: the transform from a number of rows that
     // grows with its depth.
-    let fft = n == 2 * k && k.is_power_of_two() && rows.len() >= 4 * k.ilog2() as usize;
+    let enough = rows.len() >= FFT_FROM_HALF_ROWS * k.max(1).ilog2() as usize / 2;
+    let fft = n == 2 * k && k.is_power_of_two() && enough;
     if fft && !srcs[0].is_empty() {
         return fft::parity(srcs, rows, dsts);
     }

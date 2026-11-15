@@ -49,7 +49,7 @@ An experiment behind a cargo feature of `seacast-codec` (README, "Where this dif
 
 - **The FFT parity path covers K a power of two only.** For another K the points `0..2K` are not closed under XOR and the matrix is used. Whether such a K can use a transform without changing the code is open; padding K up changes the parity, so it is a specification change.
 - **The NEON `butterfly` and `butterfly_back` have not been compiled or run.** No aarch64 target was installed where it was written. The GFNI, AVX2 and portable arms pass the tests.
-- **The row count from which `rs_parity_rows` takes the transform was chosen on the GFNI kernel**, against the matrix kernel that takes several rows a pass. AVX2 and NEON have no such kernel, so their crossover is lower and the transform is used later than it should be there. Not measured.
+- **The row count from which `rs_parity_rows` takes the transform** is one constant for the GFNI kernel, measured, and one for the others, placed from the benchmark's sweep on AVX2 and on one NEON machine: two shapes each, not a sweep of both paths.
 - **Only the GFNI arm computes several rows a pass.** The table-lookup arms need two table registers a coefficient, so the same grouping was not tried there.
 - **Running the transform in the parity chunks themselves, with no work buffer, was tried and was slower.** Chunks a multiple of the page size apart land in the same cache sets.
 - **`fft::parity` allocates its work buffer on every call**, K strips.
