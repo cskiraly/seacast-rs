@@ -26,7 +26,10 @@ Assume a very high bar for engineering quality.
 - **Sans-io and single-threaded.** `SeacastNode` never blocks, spawns nothing and holds no lock. All I/O, timers, randomness and buffers come through `RuntimeEnv` and the other host traits.
 - **No allocation after `SeacastNode::new`.** Every table is sized once from `CapacityConfig`. A test in `crates/seacast-core/src/lib.rs` counts allocations.
 - **The node never reads a chunk's bytes.** It is generic over the buffer handle only, so a handle may point into a host's cache.
-- **The node keeps no send queue.** It hands items to the host with `RuntimeEnv::send` and filters them in `on_write`. `SendQueues` is a replaceable reference send path.
+- **The node owns its send queues** (`SendQueues`): the host's writer takes what to write with `next_to_send`, and there is one send path.
+- **Slow steps leave the node's thread as a request and return as a result:** the proof check (`pop_unverified`, `on_validated`), level 2 (`start_decode`, `on_decoded`) and the domain's word (`Defer`, `on_groups_authenticated`). Do not add a call that blocks the node on any of them.
+- **A `PeerId` is a connection's and indexes a slab.** The host keeps peer ids below `max_peers` and may use one again after `disconnect_peer`. State kept by the peer alone, or by peer and type, is a field of `Peer` and is reset when the connection closes. State that must outlive a connection is keyed by `NodeId`. A peer id the node gives out to take back later (a timer, a chunk to verify) is stamped (`PeerSlab::stamp`, `GenerationPeerId`) and resolved on return.
+- **No walk over the peers on the chunk path, and no list of peers of a fixed length.** Who is in a relation, who is linked for a type, who offers or holds a group and who waits for a chunk are bitmasks by key (`PeerSets`), kept as the state changes. A set of peers is named by a `PeerSet` and read in place: `walk` and `for_each` hand the node to a closure for each peer, `peers_of`, `count` and `in_set` read it. Do not copy a set out to loop over it. Where a set must be ordered or sampled, use the node's scratch lists, which have room for every peer.
 - **Peer-created state is bounded.** A full table refuses a new key instead of failing, and state a peer can make the node keep is admitted against a limit first. A new table needs a capacity, a limit and a test in `crates/seacast-core/tests/limits.rs`.
 - **Lifetimes are deadlines or TTLs, never slots.** The domain may give a group a deadline; otherwise the node's TTLs apply.
 
@@ -34,7 +37,7 @@ Assume a very high bar for engineering quality.
 
 | crate | role |
 | --- | --- |
-| `crates/seacast-core` | the state machine, the host's traits, the reference send path. Only dependency: `fxhash`. |
+| `crates/seacast-core` | the state machine with its send queues, the host's traits. Only dependency: `fxhash`. |
 | `crates/seacast-codec` | the codec of segmented and standalone types, and the wire encoding |
 | `crates/seacast-sim` | the domain: type ids, the payload catalog, the discrete-event simulator |
 

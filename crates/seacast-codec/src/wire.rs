@@ -16,8 +16,10 @@ pub const CONTROL_TYPE: TypeId = TypeId(0xffff);
 /// transport does.
 pub const MAX_CONTROL_BYTES: usize = 2 +
     (2 + MAX_ENTRY_CONTROL * (2 + 1 + 8 + 1 + 2)) +
-    2 * (2 + MAX_ENTRY_CONTROL * (1 + 2 + 32 + 2 + MAX_HAVE_BYTES)) +
-    2 * (2 + MAX_ENTRY_CONTROL * (2 + 4 + 2 + 1)) +
+    (2 + MAX_ENTRY_CONTROL * (1 + 2 + 32 + 2 + MAX_HAVE_BYTES)) +
+    (2 + MAX_ENTRY_CONTROL * (2 + 2 + 32 + 2 + MAX_HAVE_BYTES)) +
+    (2 + MAX_ENTRY_CONTROL * (2 + 4 + 2 + 1 + 1)) +
+    (2 + MAX_ENTRY_CONTROL * (2 + 4 + 2 + 1)) +
     (2 + 32 + 4);
 
 /// What a chunk is sent with before its frame: `type | group | index`. A
@@ -107,7 +109,9 @@ where
     // 4. Wants
     put_u16(out, rpc.wants.len() as u16);
     for w in &rpc.wants {
-        out.push(u8::from(w.track_promise));
+        // Bit 0 `standing`, bit 1 `probe` (`protocol-v2.md` §7); then the hops.
+        out.push(u8::from(w.standing) | u8::from(w.probe) << 1);
+        out.push(w.hops);
         put_u16(out, w.object_type.0);
         out.extend_from_slice(&w.group);
         let wire_len = w.bits.encode_to_slice(&mut wire_bits_buf);
@@ -122,6 +126,7 @@ where
         put_u32(out, g.family);
         put_u16(out, g.colour);
         out.push(encode_dir(g.direction));
+        out.push(u8::from(g.answer));
     }
 
     // 6. Prunes
@@ -247,7 +252,9 @@ where
     }
     let mut wants: InlineVec<Want, MAX_ENTRY_CONTROL> = InlineVec::new();
     for _ in 0..wants_len {
-        let track_promise = get_u8(input, &mut pos)? != 0;
+        // The other bits are ignored.
+        let flags = get_u8(input, &mut pos)?;
+        let hops = get_u8(input, &mut pos)?;
         let object_type = TypeId(get_u16(input, &mut pos)?);
         let group = get_bytes32(input, &mut pos)?;
         let bits_len = get_u16(input, &mut pos)? as usize;
@@ -256,7 +263,15 @@ where
         }
         let bits = Bitmap::from_wire_bytes(&input[pos..pos + bits_len])?;
         pos += bits_len;
-        let _ = wants.push(Want { object_type, group, bits, track_promise });
+        let _ = wants.push(Want {
+            object_type,
+            group,
+            bits,
+            standing: flags & 1 != 0,
+            hops,
+            probe: flags & 2 != 0,
+            track_promise: false,
+        });
     }
 
     // 5. Grafts
@@ -270,7 +285,8 @@ where
         let family = get_u32(input, &mut pos)?;
         let colour = get_u16(input, &mut pos)?;
         let direction = decode_dir(get_u8(input, &mut pos)?)?;
-        let _ = grafts.push(Graft { object_type, family, colour, direction });
+        let answer = get_u8(input, &mut pos)? != 0;
+        let _ = grafts.push(Graft { object_type, family, colour, direction, answer });
     }
 
     // 6. Prunes
@@ -402,7 +418,7 @@ fn get_bytes32(input: &[u8], pos: &mut usize) -> Option<Bytes32> {
 
 #[cfg(test)]
 mod tests {
-    use seacast_core::{Ask, MAX_BITMAP_BITS};
+    use seacast_core::MAX_BITMAP_BITS;
 
     use super::*;
     use crate::buffer::VecBufferPool;
@@ -423,12 +439,18 @@ mod tests {
                 Have::holding(TypeId(0), group, Bitmap::all_bits(8), true, true),
                 Have::offer(TypeId(3), group, Bitmap::singleton(3)),
             ]),
-            wants: InlineVec::singleton(Want::pull_ask(TypeId(4), Ask::new(group, 5))),
+            // What is sent of an ask: `track_promise` is the sender's own.
+            wants: InlineVec::singleton(Want {
+                hops: 3,
+                probe: true,
+                ..Want::standing(TypeId(4), group, Bitmap::singleton(5))
+            }),
             grafts: InlineVec::singleton(Graft {
                 object_type: TypeId(0),
                 family: 0,
                 colour: 0,
                 direction: Direction::Both,
+                answer: true,
             }),
             prunes: InlineVec::singleton(Prune {
                 object_type: TypeId(1),

@@ -6,6 +6,22 @@ The protocol logic is a single-threaded state machine with no I/O. A host suppli
 
 ## Where this differs from the specification
 
+- **The specification implemented is `protocol-v2.md` of draft v0.10.1.** Applied from it since the draft this code was written against: a refusal's PRUNE names its sender's side; a GRAFT is answered, the grafter entering the relation at the yes, with a backoff after a PRUNE (§4.1); the symmetric relation (`SYMMETRIC`), and candidates whose interest holds the family (§4.1); a JOIN, GRAFT or PRUNE is owed at a full queue, in order; a source's holding and offers follow a chunk's acknowledgement, and a source with no relation peer for a colour pushes and offers to its links (§4.7 `origin_acked`, `source_pool`); a tied index beyond the group's count is dropped at release, and a tie on a group never told of expires; the announcers beyond an ask's list are tried in a keyed order (`protocol.md` §6.1); `DEFER_WINDOW` is one second; the probe of a claim (R5) is marked (`Want.probe`), draws a random index, is answered by the claimant once for the asker and group whatever the asker holds, and passes only on the claimant's own copy; a sampler asks one peer for each sample in two phases, and a sample no link serves goes as a routed request (§4.5, §4.10). The bullets below say where these differ from the draft.
+- **The node opens no link: it reports what the floors are short of.** `keep_floor` and `keep_coverage` open links (§4.1). Here `SeacastNode::link_deficits` reports, per family, the links missing for the relation floor and for the floors `Policy::link_floors` states (repair, source, coverage), and the host opens them. A link counts once both JOINs are in, not from its opening, so the host subtracts the links it has opened and that are not joined yet. Which candidate to open, the draft's most families covered, is the host's.
+- **`FORWARD_LIMIT` is per period, not per slot.** The node has no slots. `SeacastNode::reset_period` starts a new period; a host with slots calls it at each slot boundary. The count is kept by `NodeId`, so connecting again does not reset it; the draft does not say. The counts are bounded by `max_peers`: with the table full, a request of a node without a count is not passed on. A host must therefore call `reset_period`.
+- **A routed request's first hop is drawn at random.** The draft takes the link nearest the sample's family where routing neighbours are kept (`route_next`, `ROUTE_FLOOR`, an option); none are kept here. With `ROUTE_HOPS` above one, a further step goes to any forwarding link.
+- **A forwarder picks its next hop by a keyed hash, not by a draw**, as it has no source of randomness where an ask is handled. It passes a request on only where it also keeps the request standing, since the answer returns by that.
+- **The keyed order is under `fxhash`, not HMAC-SHA-256.** `protocol.md` §6.1 asks only for an order no peer can predict or arrange, and gives HMAC as the reference. `fxhash` under `NodeConfig::order_key` is not cryptographic: a peer that saw many of the node's choices could recover the key. The same hash picks a forwarder's next hop.
+- **The scope of "one sample per peer" is the domain's.** The draft keys `sampled_from` by block. Here `Domain::sample_scope` maps a group to an opaque id, the group itself unless the domain says otherwise, and an entry lasts `group_ttl` from the ask.
+- **The asks held back by `SAMPLE_OUTSTANDING` are taken also when the group of the wait that ended has expired.** The draft returns before that; the asks held may be of another group of the scope.
+- **A peer of high custody is the policy's to tell** (`Policy::high_custody`): the base custody count is the domain's. The default knows only interest `ALL`.
+- **A stale tie is told by its sender's silence, not by a slot.** The draft drops a tie when the slot its sender's first copy named leaves the live window. Here a tie on a group with no state goes when its sender has not named the group for `group_ttl`.
+- **`FORWARD_LIMIT` defaults to 1 and `PRUNE_BACKOFF` to 12 seconds.** The draft states both by their bounds.
+- **A link counts from the JOIN's hand-over, not from its queueing.** The draft counts a link in `links(T)` only once its JOIN is queued; here `join_sent` is set when the JOIN is handed to the host, which may still owe it. What is sent before it is written is ignored by the peer.
+- **The backoff after a PRUNE is kept only for a relation this node held or had asked for.** The draft records it for any PRUNE; that would let a peer make the node keep an entry per family and colour it names.
+- **The window's timeout acknowledges without the room's check.** On `TimerEvent::WindowTimeout` the node frees the room if it is still held and, for a chunk it published, takes the event as the acknowledgement when no holding came. It does the second on any such event of a group it publishes, whether or not the room was still held; after a holding the chunk is acknowledged already, so the result is the same.
+- **A departed claimant's claims go with its connection**, and it is then not judged by its probe. The draft announces this and has not yet written it into its pseudocode.
+- **A claimant's exempt answer keeps its room in the window at the asker's holding.** The answer to a probe is written whatever the asker holds, so a holding that names it frees nothing: the room goes at `WINDOW_TIMEOUT`.
 - **Bitmaps are 1024 bits** (`BITMAP_WORDS` in `bitmap.rs`). `protocol.md` allows 8192 indices in a plain group and a HAVE bitmap. 1024 chunks carry a 16 MiB body uncoded, which is past what consensus gossip lets one message be; a group or an index beyond it is refused. Every table, message and queue item that holds a bitmap grows with the constant, which is why it is not 8192.
 - **Evidence** (`[D6]`) is carried in the message types and not acted on. The specification carries it and does not define it.
 - **The wire encoding** in `seacast-codec::wire` is this implementation's. `protocol-v2.md` §7 leaves the standalone binding's bytes open, and the gossipsub bindings are not implemented.
@@ -15,15 +31,16 @@ The protocol logic is a single-threaded state machine with no I/O. A host suppli
 - **The group id** is `sha256(0x03 || type || header id || context)`. The specification's `group_key` is `sha256(0x03 || group id || slot)`: the type and the block root are not bound.
 - **The chunk id** is `group | index | content`, with `content` the first 20 bytes of the digest of the chunk's Merkle leaf, or of the group id for a standalone chunk. The specification's content id is the Altair message id over a topic and the chunk. Level 1 binds a chunk's data to its group and index, so the leaf's digest names the same bytes, and it is the hash level 1 computes anyway: the chunk is not hashed a second time, and no topic is needed.
 - **The gate** is one call, `on_groups_authenticated`, where the specification has `on_block_installed` and `on_header_validated`.
+- **Level 2 may run away from the node.** The draft's `decode_group` decodes in place. Here `RuntimeEnv::start_decode` hands the host the chunks to decode and `SeacastNode::on_decoded` takes the result, so the decode may run on another thread; the chunks are those held when the decode was started. `SeacastNode::decode_group` does both on the node's thread.
 - **Level 1** is three steps where the specification has one `validate_chunk`: the codec's check of the chunk alone, the domain's answer on the group, then the proof. The domain is asked once a group and its answer is kept, so later chunks of an authentic group run only the codec's steps.
 - **The live window** is a deadline the domain gives a group (`Domain::deadline`), a time on the host's clock, where the specification has the group's slot. A group and its deferred chunks go at the deadline at the latest, and its tombstone is kept until it. A group with no deadline has only the node's lifetimes: a deferred chunk goes `GROUP_TTL` after it arrived and a tombstone after `tombstone_ttl`.
 - **Standalone types** are new: one chunk a group, no header and no proof, with the group id `sha256(0x04 || type || frame)` and a level 1 that is that hash, index 0 and a length limit. The specification defines no type without a header.
 - **HAVE and WANT carry their group's object type**, which the specification's do not. With more than one type a node cannot tell the type of a group it knows only from an offer otherwise.
-- **The send queue and window** (`protocol-v2.md` §4.11, §4.12) are not in the node. The node hands each item to the host with `send` and filters it in `on_write`; `SendQueues` implements the specification's queue and window beside it, and a host may replace it.
-- **Serving** has two checks the specification's `on_want` does not have: an ask for an index this node neither holds nor has interest in, as the peer sees that interest, is refused and penalised (`AskOutsideOfferOrInterest`), and at most `max_served_per_heartbeat` chunks are served in a heartbeat over all peers, beside `SERVE_LIMIT` per peer and group.
+- **Serving** has two checks the specification's `on_want` does not have: an ask for an index this node neither holds nor has interest in, as the peer sees that interest, is refused and penalised (`AskOutsideOfferOrInterest`), a routed request to a node with duty excepted, and at most `max_served_per_heartbeat` chunks are served in a heartbeat over all peers, beside `SERVE_LIMIT` per peer and group.
 - **The claim at K** is what the type's codec says a node can produce from the chunks it holds (`TypeCodec::producible`), where the specification's `claim_group` sets all `N` bits. The default is all `N`, and a holding carries `claim_all` only when its bitmap is whole.
 - **`data_only_root`** (a cargo feature of `seacast-codec`, off by default) replaces the commitment of a coded group. The descriptor has two roots, one over the `K` data chunks and one over the `N - K` parity chunks, and a chunk's proof is a path in its own tree. Level 2 checks the data root and computes no parity, where the specification re-encodes and checks one root over all `N`. A node then holds the data chunks and the parity it received, claims those without `claim_all`, and repairs with data chunks only. The descriptor is 32 bytes longer, so group ids and the wire differ from a build without the feature. See "Completion, decode and delivery".
 - **State a peer can create** has limits the specification leaves open or does not name: `max_pairs` and `max_wide_pairs` on (peer, group) records, and `max_relations_per_link`.
+- **The asks open at one peer are bounded** by `max_asks_per_peer`, and the ask records of the node by `max_ask_peers`. The specification bounds only the asks made of a peer within a heartbeat (`MAX_IHAVE_LENGTH`). An ask over a bound is not made: its group is taken up again at the next heartbeat, as for an offer over the IHAVE limits.
 
 ## Crates
 
@@ -52,31 +69,42 @@ flowchart LR
   T -- "connect_peer / disconnect_peer" --> N
   TW -- "on_timer(event)" --> N
   V -- "on_validated(peer, chunk, verdict)" --> N
-  D -- "decode_group(group)" --> N
+  D -- "on_decoded(group, given, object, rebuilt)" --> N
   CS -- "on_groups_authenticated(groups), end_group(group)" --> N
 
   N -. "schedule_after(delay, event)" .-> TW
-  N -. "send(peer, item, urgent), cancel_chunk(peer, group, index)" .-> T
-  N -. "start_decode(group)" .-> D
+  N -. "wake_writer(peer)" .-> T
+  N -. "start_decode(group, job)" .-> D
   N -. "deliver(group, object), penalise(peer)" .-> CS
-  T -- "on_write(peer, item)" --> N
+  T == "next_to_send(peer)" ==> N
   V == "pop_unverified()" ==> N
 ```
 
-Solid arrows are calls into the node. Dotted arrows are `RuntimeEnv` callbacks: they only record what the host should do. The thick arrow is polled by the host. The node keeps no send queue: it hands each item to the host with `send`, and the host passes an item to `on_write` as it writes it.
+Solid arrows are calls into the node. Dotted arrows are `RuntimeEnv` callbacks: they only record what the host should do. The thick arrows are polled by the host. The node owns the send queues: `wake_writer` says a peer has something to write, and the host takes it with `next_to_send`.
+
+A `PeerId` names a connection, not a node: the host may use it again once the connection has closed. Every peer id is below `CapacityConfig::max_peers`: the per-connection records are a slab indexed by peer id, and the node panics on an id out of range. Admission of a connection is therefore the host's. What the node gives out for a connection and takes back later carries a `GenerationPeerId`: the peer id with the count of its slot's connections in the high 32 bits. `pop_unverified` returns one, `on_validated` takes it, and `TimerEvent::Resample` holds one. The host passes it back unchanged and reads the peer with `peer_id()`. A verdict or a timer for a connection that has closed is dropped, though another connection has its peer id. The node takes the connection's `NodeId` from `Policy::node_id` at `connect_peer`, and the host allows one connection a node at a time. All state of a connection goes at `disconnect_peer`, except its parks, which are kept by `NodeId` until their end and return on the node's next connection. The count of routed requests passed on (`forwarded`) is by `NodeId` from the start.
+
+Three steps may run on other threads, each as a request out and a result back in: the proof check (`pop_unverified`, `on_validated`), level 2 (`start_decode`, `on_decoded`) and the domain's word on a group (`Domain::authenticate` answers `Defer`, the host calls `on_groups_authenticated`). The node itself stays on one thread.
 
 The traits a host implements, in `seacast_core::traits`:
 
 | trait | role |
 | --- | --- |
 | `ChunkBuffer` | A handle to a chunk's bytes. The node stores, clones and compares handles and asks only `len()`. It never reads the bytes, so a handle may be a reference into a ring cache. |
-| `RuntimeEnv` | Clock, timers, the send path's callbacks, decode trigger, delivery, penalties. |
+| `RuntimeEnv` | Clock, timers, the writer's wake-up, the decode job, delivery, penalties. |
 | `TypeCodec` | The networking mechanics of the object types: how a chunk's frame is laid out, its index count and threshold, the checks that need no outside knowledge, decode, projection onto groups. |
-| `Domain` | What a group belongs to, whether that is authentic, and when its window closes. Asked once a group, with the id of the group's header and the chunk's context bytes. |
-| `Policy` | What this node takes part in: its types, interest, duty and parameters (`TypeParams`). |
+| `Domain` | What a group belongs to, whether that is authentic, and when its window closes. Asked once a group, with the id of the group's header and the chunk's context bytes. Called on the node's thread: a domain whose state lives elsewhere answers from a cache, and `Defer` on a miss. Also the scope within which no peer is asked for two samples (`sample_scope`). |
+| `Policy` | What this node takes part in: its types, interest, duty and parameters (`TypeParams`), the link floors it keeps (`link_floors`), and which peers hold a family (`holds_family`) or are of high custody (`high_custody`). |
 | `ObjectCatalog` | The three together: what the node is given. |
 | `DeferredStore` | Reservations for chunks that wait for the domain's word on their group. |
 | `RngSource` | Randomness. |
+
+Two entry points are for a host that keeps links and has periods of its own:
+
+- `SeacastNode::link_deficits(type, catalog, report)` reports each family in which the node has fewer links than a floor asks for, with the number missing. The host polls it, for example at its heartbeat, and opens the links. The floors are the relation floor (`F_LO` links per family with duty) and those of `Policy::link_floors`. `Policy::holds_family` says whether a peer's derived interest holds a family.
+- `SeacastNode::reset_period()` starts a new period of the limits the specification counts per slot: at present the routed requests passed on per peer (`FORWARD_LIMIT`).
+
+`NodeConfig::order_key` is a secret the host draws at start. It orders the announcers beyond an ask's list and picks a routed request's next hop.
 
 ## An object's life
 
@@ -124,7 +152,7 @@ Every length in the frame follows from the type and the header, so no field carr
 
 ## Receiving a chunk
 
-`on_rpc` handles an RPC's parts in a fixed order: joins, the chunk, offers, asks, grafts, prunes, holdings, then one combined response. A message for an object type the peer has not joined on the link is ignored.
+`on_rpc` handles an RPC's parts in a fixed order: joins, the chunk, offers, asks, grafts, prunes, holdings, then one combined response. A GRAFT's answer is not part of that response: it goes through `RuntimeEnv::send_relation`, as every JOIN, GRAFT and PRUNE does, which the host must not lose to a full queue and must keep in order. A message for an object type the peer has not joined on the link is ignored.
 
 ```mermaid
 flowchart TB
@@ -195,26 +223,17 @@ sequenceDiagram
 
 Asks for one offer leave as the bits of one WANT, so none is left behind however many indices it names. When every announcer of a chunk is parked, a last-resort timer asks one of them again, with a doubling wait. Nothing is asked for before its group can be authenticated.
 
+A sampler asks without an offer (`SeacastNode::sample`, `protocol-v2.md` §4.9). Each index goes in a WANT of its own, and no peer is asked for two samples of one scope. The first ask goes to a link whose interest holds the index, else as a routed request (`hops = ROUTE_HOPS`) to a forwarding link. After `SAMPLE_RETRY` without the chunk the peer is parked and another is asked, peers of high custody last, each waiting `SAMPLE_RETRY2`, with at most `SAMPLE_OUTSTANDING` asks of a scope in flight; the rest are held. When nobody is left the host is told through `RuntimeEnv::unreachable`.
+
+A node with duty that cannot serve a routed request passes it one step on, to a link that serves the index, at most `FORWARD_LIMIT` times per asking peer and period. Beyond the limit it is silent. The answer returns through the standing ask.
+
 ## Sending
 
-The node does not queue. It hands the host each item to send with `RuntimeEnv::send(peer, item, urgent)`; an item is small: a chunk's key `(group, index)` or one control message. Order, batching and flow control are the host's. When the host writes an item it calls `SeacastNode::on_write(peer, item)`, which returns the frame, or `None` if the item is no longer to be sent, and starts the promise of an ask. A host that writes somewhere it cannot call the node from reports each write afterwards with `SeacastNode::on_written(peer, item, written_at)` instead, and drops what is no longer to be sent on the cancel callbacks below.
-
-The other send callbacks have defaults that do nothing, so a host implements the ones its send path can use:
-
-| callback | meaning |
-| --- | --- |
-| `cancel_chunk(peer, group, index)` | the peer holds the chunk: a copy waiting to be sent to it is not needed, and one in flight has arrived |
-| `cancel_asks(peer, group, bits)` | the asks for these indices waiting to be sent are withdrawn |
-| `cancel_group(group)` | the group has ended: nothing of it is to be sent |
-| `owe_offer`, `owe_answer` | an offer or an answer `send` refused is still owed to the peer |
-| `merge_holding(peer, have)` | merge a holding into one of the same group still waiting, if there is one |
-| `ask_waiting(peer, ask)` | whether an ask is waiting to be sent, so that it is not made twice |
-
-`SendQueues` (`queue.rs`) is the reference send path, which the simulator and the tests use: the queue and window of `protocol-v2.md` §4.11 and §4.12. A host keeps one beside its node and gives the node `SendQueues::env(&mut env)` as its environment, or wraps its environment in `WithQueues`. Each peer has a queue with two lanes: urgent (holdings, joins) and normal (chunks, offers, asks, relation control). The entry that goes on the wire is built when it is sent.
+The node queues what it sends (`SeacastNode::sends`, a `SendQueues`): the queue and window of `protocol-v2.md` §4.11 and §4.12. A queued item is small: a chunk's key `(group, index)` or one control message. Each peer has a queue with two lanes: urgent (holdings, joins) and normal (chunks, offers, asks, relation control). `RuntimeEnv::wake_writer(peer)` tells the host that a peer has something to write; the host then calls `SeacastNode::next_to_send(peer)` until it gives nothing. The entry that goes on the wire is built when it is taken, so what is no longer to be sent is dropped then and an ask's promise starts then.
 
 ```mermaid
 flowchart TB
-  E["send(peer, item)"] --> E1{"queue has room?"}
+  E["enqueue(peer, item)"] --> E1{"queue has room?"}
   E1 -- "no" --> E2["refused: an offer or an answer is owed instead"]
   E1 -- "yes" --> E3["urgent or normal lane; wake_writer(peer)"]
 
@@ -243,7 +262,7 @@ flowchart TB
   FR -.-> S
 ```
 
-`SendQueues::next_to_send` returns `Send(entry)`, `Wait` or `Empty`. An entry carries at most one chunk, whose frame is one buffer handle, plus control messages. The window is in bytes and node-wide; control takes no room in it. Because the chunk is chosen at the moment of sending, a host that polls keeps the late choice: while the window is full, items wait and the rarest goes first when room returns.
+`next_to_send` returns `Send(entry)`, `Wait` or `Empty`. An entry carries at most one chunk, whose frame is one buffer handle, plus control messages. The window is in bytes and node-wide; control takes no room in it. Because the chunk is chosen at the moment of sending, a host that polls keeps the late choice: while the window is full, items wait and the rarest goes first when room returns.
 
 ## Completion, decode and delivery
 
@@ -259,7 +278,7 @@ stateDiagram-v2
   Invalid --> [*]: expiry
 ```
 
-At K chunks the node stops pulling and claims all N before decoding: a group that fails level 2 fails at every node, so the claim can only be wrong about a group everyone drops. `start_decode` tells the host; the host calls `decode_group` when it is ready, which runs `catalog.decode`, stores the rebuilt chunks, fills the other groups a chunk belongs to, pushes rebuilt chunks to peers still short, and delivers.
+At K chunks the node stops pulling and claims all N before decoding: a group that fails level 2 fails at every node, so the claim can only be wrong about a group everyone drops. `RuntimeEnv::start_decode(group, job)` then hands the host the decode: the type, the shape, and the handles of the chunks held with their indices. The job borrows the node's scratch, so the host copies the handles out before it returns. The host runs `TypeCodec::decode` on them, on any thread, and passes the object and the rebuilt chunks to `SeacastNode::on_decoded` with the job's `given`. `on_decoded` stores the rebuilt chunks, fills the other groups a chunk belongs to, pushes rebuilt chunks to peers still short, and delivers. A host that decodes on the node's thread calls `decode_group` instead, which does all of it.
 
 With `data_only_root` the claim at K is the data indices and the parity held, with `complete` set and `claim_all` clear, and `decode_group` stores only the data chunks it rebuilt. A data root that matches proves the parity chunks decoded from; a parity chunk held and not decoded from has passed level 1 only. Parity that is committed and is not the code's fails only the decodes that read it: a node that reaches K with such a chunk fails the data root and drops the group, as it does without the feature. It does not go on to collect the data chunks (`NOTES.md`).
 
@@ -309,11 +328,22 @@ A group's state lives `GROUP_TTL` after its last chunk or its completion. The do
 
 | kept per | where | holds |
 | --- | --- | --- |
-| group | `groups: Groups`, one `Group` record | type, header, state, the received, rebuilt and held bitmaps, interest, timestamps, claims, probe and repair sampling |
-| chunk | `chunks`, `known_id`, `holders`, `standing` | the handle and id, who holds it, who asked for it ahead of its arrival |
-| ask | `offers`, `tried`, `promises`, `asked_at` | announcers in order, whom was asked and when, running promises |
+| group | `groups: Groups`, one `Group` record | type, header, state, the received, rebuilt and held bitmaps, interest, timestamps, probe and repair sampling |
+| chunk | `chunks`, `known_id` | the handle and id |
+| chunk | `holders`, `standing`, `asked_parked` | who holds it, who asked for it ahead of its arrival, who was asked for it while parked: a bitmask of peers each |
+| group | `claims` | the peers that claim it whole, a bitmask |
+| ask | `offers`, `asked_at` | announcers in order, when it was last asked |
+| ask and peer | `tried`, `promises` | when the peer was asked, its running promise: one flat map each, with a bitmask of peers an ask, bounded by `max_ask_peers` in all and `max_asks_per_peer` a peer |
 | peer and group | `pairs: Pairs`, one record a pair | what the peer holds, what was pushed and sent to it, its offers, its park; bitmaps of 128 bits in the record, wider ones in a pool |
-| peer | `join_*`, `named` | the link's declarations |
+| peer | `slots: PeerSlab<Peer>`, one record a connection, indexed by peer id | the connection's `NodeId`, the JOINs received and sent by type, the relation counts by type, the counts per peer of the limits; reset when the connection closes |
+| peer | `sends.queue: PeerSlab<PeerQueue>`, indexed by peer id | the two lanes, the offers, answers and relation messages owed |
+| type, family and colour | `push_in`, `push_out`: `Relations` | the peers of each direction of the push relation, a bitmask of `max_peers` bits a key |
+| type | `linked` | the peers linked for the type (both JOINs crossed), a bitmask |
+| group | inside `pairs` | the peers with offers of the group and those with a holding of it, a bitmask each |
+| peer and group | `named`, `tied` | the groups a peer has named, the chunks tied to a root |
+| node | `forwarded` | the routed requests passed on for it this period |
+| node and group | `kept_parks` | the parks of a node without a connection, until their end |
+| sample scope | `sampled_from`, `samples_in_flight`, `held_samples` | the peers asked for a sample, the asks in flight, the asks held back |
 
 All tables are sized once, in `SeacastNode::new`, from `CapacityConfig`, and nothing allocates afterwards; a test in `crates/seacast-core/src/lib.rs` counts allocations to check it. Maps are fixed-capacity `FxHashMap`s.
 
@@ -322,7 +352,8 @@ A full table refuses a new key instead of failing, and state a peer can make the
 - groups without a header that a peer names: `max_pending_groups` per peer;
 - groups that are only named and groups that are open: `max_groups` each, counted apart, so naming groups cannot stop real ones from opening;
 - push relations on one link: `max_relations_per_link` per direction;
-- ties to groups the domain cannot tell of yet: `max_pending_groups` per peer.
+- ties to groups the domain cannot tell of yet: `max_pending_groups` per peer;
+- routed sample requests passed on: `FORWARD_LIMIT` per asking peer and period.
 
 ## Building and running
 
@@ -346,14 +377,14 @@ Parity is computed two ways, with the same bytes. The general one multiplies the
 | module | contents |
 | --- | --- |
 | `node.rs` | `SeacastNode`: its tables, peer lifecycle, `on_rpc`, `on_timer`, admission |
-| `relations.rs` | joins and the coloured push relation: `on_join`, `on_graft`, `on_prune`, `maintain_relations` |
+| `relations.rs` | joins and the coloured push relation: `on_join`, `on_graft`, `on_prune`, `maintain_relations`, `link_deficits` |
 | `groups.rs` | chunk arrival, validation routing, deferral and ties, completion, decode, expiry |
 | `push.rs` | holdings, `forward`, `choose_push`, `announce`, `publish` |
 | `pull.rs` | offers, asks, promises, parking, serving |
 | `repair.rs` | holdings from peers, claims and the probe, repair pushes, sampler pulls |
 | `gossip.rs` | the heartbeat, gossip, heartbeat-counted lifetimes |
-| `window.rs` | `on_write` and the filter applied to an item as it is written |
-| `queue.rs` | `SendQueues`, the reference send path: the per-peer queue, the byte window, `next_to_send` |
-| `state.rs` | `Group`, `Groups`, `Pairs`, `PeerQueue`, `AskPeers`, `GossipHistory` |
+| `window.rs` | `enqueue` and the filter applied to an entry as it is taken to be written |
+| `queue.rs` | `SendQueues`: the per-peer queue and the byte window; `next_to_send` |
+| `state.rs` | `Peer`, `Relations`, `Group`, `Groups`, `Pairs`, `PeerQueue`, `AskPeers`, `GossipHistory` |
 | `message.rs`, `types.rs`, `traits.rs` | messages, parameters, the host's traits |
-| `bitmap.rs`, `collections.rs` | the bitmap and the fixed-capacity collections |
+| `bitmap.rs`, `collections.rs` | the bitmap, the fixed-capacity collections, `PeerSlab` and `PeerSets` |

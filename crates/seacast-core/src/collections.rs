@@ -7,6 +7,8 @@ use std::{
 
 use fxhash::{FxHashMap, FxHashSet};
 
+use crate::types::{GenerationPeerId, PeerId};
+
 /// Maximum connected peers supported by inline peer sets (`MAX_PEERS`).
 pub const MAX_INLINE_PEERS: usize = 64;
 
@@ -747,5 +749,258 @@ impl<T: Eq + Hash> PreallocSet<T> {
 impl<T: fmt::Debug> fmt::Debug for PreallocSet<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_set().entries(self.items.iter()).finish()
+    }
+}
+
+/// One record a connection, indexed by `PeerId`. Every slot is allocated at
+/// creation. A closed slot stays allocated for the next connection with its
+/// id. Indexing panics on a peer id not below the capacity.
+#[derive(Debug, Clone)]
+pub struct PeerSlab<T> {
+    slots: Box<[T]>,
+    live: Box<[bool]>,
+    /// Counts the connections each slot has had.
+    generation: Box<[u32]>,
+}
+
+impl<T> PeerSlab<T> {
+    pub fn with_capacity(max_peers: usize, slot: impl FnMut() -> T) -> Self {
+        Self {
+            slots: std::iter::repeat_with(slot).take(max_peers).collect(),
+            live: vec![false; max_peers].into_boxed_slice(),
+            generation: vec![0; max_peers].into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    pub fn contains(&self, peer: PeerId) -> bool {
+        self.live[peer as usize]
+    }
+
+    #[inline]
+    pub fn get(&self, peer: PeerId) -> Option<&T> {
+        let i = peer as usize;
+        self.live[i].then(|| &self.slots[i])
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, peer: PeerId) -> Option<&mut T> {
+        let i = peer as usize;
+        self.live[i].then(|| &mut self.slots[i])
+    }
+
+    /// Opens `peer`'s slot. Returns `false` if it was open.
+    pub fn open(&mut self, peer: PeerId) -> bool {
+        let i = peer as usize;
+        let opened = !std::mem::replace(&mut self.live[i], true);
+        if opened {
+            self.generation[i] = self.generation[i].wrapping_add(1);
+        }
+        opened
+    }
+
+    /// `peer` with the generation of its slot.
+    #[inline]
+    pub fn stamp(&self, peer: PeerId) -> GenerationPeerId {
+        GenerationPeerId::new(peer, self.generation[peer as usize])
+    }
+
+    /// The peer of `id`, if the connection `id` was stamped for is open.
+    #[inline]
+    pub fn resolve(&self, id: GenerationPeerId) -> Option<PeerId> {
+        let peer = id.peer_id();
+        let i = peer as usize;
+        (self.live[i] && self.generation[i] == id.generation()).then_some(peer)
+    }
+
+    /// Closes `peer`'s slot and returns it, for the caller to reset.
+    pub fn close(&mut self, peer: PeerId) -> Option<&mut T> {
+        let i = peer as usize;
+        std::mem::replace(&mut self.live[i], false).then(|| &mut self.slots[i])
+    }
+
+    /// The open slots, in peer id order.
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.slots.iter().zip(self.live.iter()).filter(|(_, live)| **live).map(|(slot, _)| slot)
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.slots.iter_mut().zip(self.live.iter()).filter(|(_, live)| **live).map(|(slot, _)| slot)
+    }
+}
+
+/// The peers of word `w` of a bitmask row, in peer id order.
+pub fn word_bits(w: usize, word: u64) -> WordBits {
+    WordBits { w, left: word }
+}
+
+/// The peers of a bitmask row, in peer id order.
+pub fn peer_bits(row: &[u64]) -> impl Iterator<Item = PeerId> + '_ {
+    row.iter().enumerate().flat_map(|(w, &word)| word_bits(w, word))
+}
+
+/// Sets of peers by key: a bitmask of `max_peers` bits a key, all in one block
+/// allocated at creation. A key holds a row while its set is not empty. With
+/// no row free a new key is refused.
+#[derive(Debug, Clone)]
+pub struct PeerSets<K> {
+    rows: PreallocMap<K, u32>,
+    words: Box<[u64]>,
+    free: Vec<u32>,
+    width: usize,
+}
+
+impl<K: Eq + Hash + Copy> PeerSets<K> {
+    pub fn with_capacity(keys: usize, max_peers: usize) -> Self {
+        let width = max_peers.div_ceil(64).max(1);
+        Self {
+            rows: PreallocMap::with_capacity(keys),
+            words: vec![0; keys * width].into_boxed_slice(),
+            free: (0..keys as u32).rev().collect(),
+            width,
+        }
+    }
+
+    /// Words a row.
+    #[inline]
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.rows.keys()
+    }
+
+    /// The keys with a set.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    #[inline]
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.rows.contains_key(key)
+    }
+
+    /// Drops the set of `key`.
+    pub fn remove_key(&mut self, key: &K) {
+        if let Some(row) = self.rows.remove(key) {
+            let at = row as usize * self.width;
+            self.words[at..at + self.width].fill(0);
+            self.free.push(row);
+        }
+    }
+
+    #[inline]
+    pub fn row(&self, key: &K) -> Option<&[u64]> {
+        let at = *self.rows.get(key)? as usize * self.width;
+        Some(&self.words[at..at + self.width])
+    }
+
+    #[inline]
+    pub fn contains(&self, key: &K, peer: PeerId) -> bool {
+        self.row(key).is_some_and(|row| row[peer as usize / 64] & (1 << (peer % 64)) != 0)
+    }
+
+    /// Word `w` of the set of `key`.
+    #[inline]
+    pub fn word(&self, key: &K, w: usize) -> u64 {
+        self.rows.get(key).map_or(0, |&row| self.words[row as usize * self.width + w])
+    }
+
+    /// The peers of `key`, in peer id order.
+    pub fn iter<'a>(&'a self, key: &K) -> impl Iterator<Item = PeerId> + use<'a, K> {
+        peer_bits(self.row(key).unwrap_or(&[]))
+    }
+
+    pub fn count(&self, key: &K) -> usize {
+        self.row(key).map_or(0, |row| row.iter().map(|w| w.count_ones() as usize).sum())
+    }
+
+    /// Adds `peer` to the set of `key`. Returns `false` if there is no row for
+    /// a new key.
+    pub fn insert(&mut self, key: K, peer: PeerId) -> bool {
+        let row = match self.rows.get(&key) {
+            Some(&row) => row,
+            None => {
+                let Some(row) = self.free.pop() else {
+                    return false;
+                };
+                self.rows.insert(key, row);
+                row
+            }
+        };
+        self.words[row as usize * self.width + peer as usize / 64] |= 1 << (peer % 64);
+        true
+    }
+
+    /// Takes `peer` out of the set of `key`. Returns whether it was in it.
+    pub fn remove(&mut self, key: &K, peer: PeerId) -> bool {
+        let Some(&row) = self.rows.get(key) else {
+            return false;
+        };
+        let at = row as usize * self.width;
+        let word = &mut self.words[at + peer as usize / 64];
+        let was = *word & (1 << (peer % 64)) != 0;
+        *word &= !(1 << (peer % 64));
+        if was && self.words[at..at + self.width].iter().all(|&w| w == 0) {
+            self.rows.remove(key);
+            self.free.push(row);
+        }
+        was
+    }
+
+    /// Takes `peer` out of every set.
+    pub fn remove_peer(&mut self, peer: PeerId) {
+        let (words, free, width) = (&mut self.words, &mut self.free, self.width);
+        self.rows.retain(|_, &mut row| {
+            let at = row as usize * width;
+            words[at + peer as usize / 64] &= !(1 << (peer % 64));
+            let kept = words[at..at + width].iter().any(|&w| w != 0);
+            if !kept {
+                free.push(row);
+            }
+            kept
+        });
+    }
+
+    /// Keeps the sets of the keys `keep` accepts.
+    pub fn retain_keys(&mut self, mut keep: impl FnMut(&K) -> bool) {
+        let (words, free, width) = (&mut self.words, &mut self.free, self.width);
+        self.rows.retain(|key, &mut row| {
+            let kept = keep(key);
+            if !kept {
+                let at = row as usize * width;
+                words[at..at + width].fill(0);
+                free.push(row);
+            }
+            kept
+        });
+    }
+}
+
+/// The peers of one word of a bitmask row, in peer id order.
+#[derive(Debug, Clone)]
+pub struct WordBits {
+    w: usize,
+    left: u64,
+}
+
+impl Iterator for WordBits {
+    type Item = PeerId;
+
+    #[inline]
+    fn next(&mut self) -> Option<PeerId> {
+        if self.left == 0 {
+            return None;
+        }
+        let bit = self.left.trailing_zeros() as u64;
+        self.left &= self.left - 1;
+        Some(self.w as u64 * 64 + bit)
     }
 }

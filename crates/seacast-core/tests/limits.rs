@@ -4,13 +4,15 @@
 
 use seacast_core::{
     Ask, Bitmap, BoundedDeferredStore, ChunkId, ChunkMsg, Direction, DispatchOutcome, Domain, Duty,
-    Graft, GroupId, GroupState, Have, InlineVec, InterestKind, Join, MAX_JOINED_TYPES, NodeConfig,
-    NodeId, PeerId, PenaltyReason, Policy, PreallocVec, Rpc, RuntimeEnv, SeacastNode, Shape,
-    SplitMix64, TimerEvent, Timestamp, TypeCodec, TypeId, TypeParams, ValidationResult, Want,
+    FamilyId, Graft, GroupId, GroupState, Have, InlineVec, InterestKind, Join, LinkFloor,
+    MAX_CHUNKS, MAX_JOINED_TYPES, NodeConfig, NodeId, PeerId, PenaltyReason, Policy, PreallocVec,
+    Rpc, RuntimeEnv, SeacastNode, Shape, SplitMix64, TimerEvent, Timestamp, TypeCodec, TypeId,
+    TypeParams, ValidationResult, Want,
 };
 
 type Chunk = ChunkMsg<Vec<u8>>;
 const TYPE: TypeId = TypeId(0);
+const NODES: u64 = 32;
 type BlockRoot = [u8; 32];
 type Node = SeacastNode<Vec<u8>>;
 
@@ -31,10 +33,7 @@ impl RuntimeEnv<Vec<u8>> for Env {
             self.retries += 1;
         }
     }
-    fn send(&mut self, _peer: PeerId, _item: seacast_core::Queued, _urgent: bool) -> bool {
-        false
-    }
-    fn start_decode(&mut self, _group: GroupId) {}
+    fn start_decode(&mut self, _group: GroupId, _job: seacast_core::DecodeJob<'_, Vec<u8>>) {}
     fn deliver(&mut self, _group: GroupId, _object: Vec<u8>) {
         self.delivered += 1;
     }
@@ -68,6 +67,12 @@ struct Catalog {
     deadline: Option<Timestamp>,
     /// A second index every chunk is said to fill, as a faulty `project` would.
     stray_index: Option<u32>,
+    /// The node joins with a derived interest, and keeps its duty.
+    derived: bool,
+    /// The peers whose derived interest holds every family, if not all do.
+    covering: Option<Vec<PeerId>>,
+    /// The link floors beyond the relation floor.
+    floors: Vec<LinkFloor>,
 }
 
 impl Catalog {
@@ -85,6 +90,9 @@ impl Catalog {
             too_early: false,
             deadline: None,
             stray_index: None,
+            derived: false,
+            covering: None,
+            floors: Vec::new(),
         }
     }
 }
@@ -181,7 +189,11 @@ impl Policy for Catalog {
         assert_eq!(t, TYPE, "asked for a type this node does not run");
         Join {
             object_type: t,
-            interest: if self.declared { InterestKind::Declared } else { InterestKind::All },
+            interest: match (self.declared, self.derived) {
+                (true, _) => InterestKind::Declared,
+                (_, true) => InterestKind::Derived,
+                _ => InterestKind::All,
+            },
             custody_count: 0,
             duty: if self.declared { Duty::None } else { Duty::Forward },
             colours: 1,
@@ -190,12 +202,26 @@ impl Policy for Catalog {
     fn joined_types(&self) -> InlineVec<TypeId, MAX_JOINED_TYPES> {
         InlineVec::singleton(TYPE)
     }
+    fn holds_family(
+        &self,
+        _t: TypeId,
+        _family: FamilyId,
+        peer: PeerId,
+        _node_id: &NodeId,
+        _join: &Join,
+    ) -> bool {
+        self.covering.as_ref().is_none_or(|peers| peers.contains(&peer))
+    }
+    fn link_floors(&self, _t: TypeId) -> InlineVec<LinkFloor, MAX_CHUNKS> {
+        InlineVec::from_slice(&self.floors)
+    }
     fn tiebreak(&self, chunk_id: &ChunkId, peer: PeerId) -> u64 {
         (chunk_id[0] as u64).wrapping_add(peer)
     }
     fn node_id(&self, peer: PeerId) -> NodeId {
         let mut id = [0u8; 32];
-        id[..8].copy_from_slice(&peer.to_le_bytes());
+        // Peer ids `NODES` apart are connections of one node.
+        id[..8].copy_from_slice(&(peer % NODES).to_le_bytes());
         id
     }
 }
@@ -223,7 +249,7 @@ fn peer_join(interest: InterestKind) -> Join {
 
 struct World {
     node: Node,
-    env: seacast_core::WithQueues<Env>,
+    env: Env,
     catalog: Catalog,
     rng: SplitMix64,
     store: BoundedDeferredStore,
@@ -242,19 +268,13 @@ impl World {
         interest: InterestKind,
     ) -> Self {
         let mut world = Self {
-            node: SeacastNode::new(config.clone()),
-            env: seacast_core::WithQueues::new(config, Env {
-                now: 1.0,
-                delivered: 0,
-                retries: 0,
-                penalties: 0,
-            }),
+            node: SeacastNode::new(config),
+            env: Env { now: 1.0, delivered: 0, retries: 0, penalties: 0 },
             catalog,
             rng: SplitMix64::new(7),
             store: BoundedDeferredStore::default(),
         };
         for peer in 1..=peers {
-            world.env.queues.connect(peer);
             world.node.connect_peer(peer, true, &mut world.env, &world.catalog);
             let mut rpc = Rpc::default();
             let _ = rpc.joins.push(peer_join(interest));
@@ -289,7 +309,7 @@ impl World {
     fn drain(&mut self, peer: PeerId) -> Vec<seacast_core::QueueEntry<Vec<u8>>> {
         let mut sent = Vec::new();
         while let DispatchOutcome::Send(entry) =
-            self.env.next_to_send(&mut self.node, peer, &self.catalog)
+            self.node.next_to_send(peer, &mut self.env, &self.catalog)
         {
             sent.push(entry);
         }
@@ -320,12 +340,13 @@ fn a_peer_cannot_overflow_the_tables() {
                 family,
                 colour,
                 direction: Direction::Both,
+                answer: false,
             });
         }
         world.rpc(1, rpc);
     }
     assert!(world.node.push_in.len() <= per_link && world.node.push_out.len() <= per_link);
-    assert!(world.node.push_in.iter().all(|&(_, _, _, colour)| colour == 0));
+    assert!(world.node.push_in.iter().all(|(_, _, _, colour)| colour == 0));
 
     // Offers, holdings and asks of every index for thousands of groups nobody has a
     // header for.
@@ -396,7 +417,7 @@ fn a_group_expires_and_leaves_a_tombstone() {
     assert!(node.offers.is_empty() && node.pairs.is_empty() && node.tried.is_empty());
     assert!(node.asked_at.is_empty() && node.promises.is_empty() && node.seen_ids.is_empty());
     assert!(node.holders.is_empty());
-    assert!(node.listed_count.iter().all(|(_, &listed)| listed == 0));
+    assert!(node.slots.iter().all(|slot| slot.listed_count == 0));
 
     // Expired for good: a chunk, an offer and a holding of it are ignored.
     world.rpc(1, chunk_rpc(chunk(g, 1, [0; 32])));
@@ -478,11 +499,20 @@ fn a_deadline_ends_a_group_and_bounds_its_tombstone() {
     assert!(world.node.tombstones.is_empty());
 }
 
+/// A configuration whose bounds on the asks of one peer refuse none.
+fn unbounded_asks() -> NodeConfig {
+    let mut config = NodeConfig::default();
+    config.max_asks_per_peer = config.capacities.max_asks;
+    config.capacities.max_ask_peers = config.capacities.max_asks;
+    config
+}
+
 /// Every index an offer makes the node ask for leaves in a WANT, however many
 /// there are.
 #[test]
 fn every_ask_of_an_offer_is_sent() {
-    let mut world = World::new(Catalog::new(300, 300), 1, InterestKind::All);
+    let mut world =
+        World::with_config(unbounded_asks(), Catalog::new(300, 300), 1, InterestKind::All);
     let mut rpc = Rpc::default();
     for tag in 0..3 {
         let _ = rpc.haves.push(Have::offer(TYPE, group(tag), Bitmap::all_bits(300)));
@@ -516,7 +546,7 @@ fn owed_offers_are_never_dropped() {
     }
     offered.sort_unstable();
     assert_eq!(offered, (0..50).map(group).collect::<Vec<_>>());
-    assert!(world.env.queues.queue.get(&1).is_some_and(|q| q.owed.is_empty()));
+    assert!(world.node.sends.queue.get(1).is_some_and(|q| q.owed.is_empty()));
 }
 
 /// A chunk that waited for its block from a peer that then left can still
@@ -531,7 +561,6 @@ fn a_departed_peer_does_not_block_its_deferred_chunks() {
     world.rpc(1, chunk_rpc(waiting.clone()));
     assert_eq!(world.node.pending_ids.len(), 1);
     world.node.disconnect_peer(1, &mut world.env, &mut world.store);
-    world.env.queues.disconnect(1, &mut world.env.env);
     assert!(world.node.pending.is_empty() && world.node.pending_ids.is_empty());
 
     // The block installs, and the same chunk comes from the other peer.
@@ -566,7 +595,6 @@ fn a_sampler_completes_on_its_declared_indices() {
 fn messages_of_an_unjoined_type_are_ignored() {
     let mut world = World::new(Catalog::new(8, 8), 1, InterestKind::All);
     world.node.connect_peer(2, false, &mut world.env, &world.catalog);
-    world.env.queues.connect(2);
     let g = group(1);
     world.rpc(1, chunk_rpc(chunk(g, 0, [0; 32])));
     world.drain(1);
@@ -603,13 +631,13 @@ fn a_chunk_waits_for_its_verdict() {
 
     let (from, first) = world.node.pop_unverified().expect("the first copy");
     let (_, second) = world.node.pop_unverified().expect("the other chunk");
-    assert_eq!((from, first.index, second.index), (1, 0, 1));
+    assert_eq!((from.peer_id(), first.index, second.index), (1, 0, 1));
     assert!(world.node.pop_unverified().is_none());
 
     let (env, catalog, rng, store) =
         (&mut world.env, &mut world.catalog, &mut world.rng, &mut world.store);
-    world.node.on_validated(1, first, ValidationResult::Accept, env, catalog, rng, store);
-    world.node.on_validated(1, second, ValidationResult::Reject, env, catalog, rng, store);
+    world.node.on_validated(from, first, ValidationResult::Accept, env, catalog, rng, store);
+    world.node.on_validated(from, second, ValidationResult::Reject, env, catalog, rng, store);
     assert!(world.node.chunks.contains_key(&(g, 0)) && !world.node.chunks.contains_key(&(g, 1)));
     assert!(world.node.verifying.is_empty());
     // The accepted chunk is claimed to its sender; the rejected one is seen, so
@@ -690,13 +718,13 @@ fn a_validated_header_resumes_its_deferred_chunks() {
 #[test]
 fn a_join_of_an_unknown_type_is_ignored() {
     let mut world = World::new(Catalog::new(8, 8), 1, InterestKind::All);
-    let joined = world.node.join_recv.len();
+    let joined = world.node.slots.get(1).expect("connected").join_recv.len();
     for t in 1..=2000u16 {
         let mut rpc = Rpc::default();
         let _ = rpc.joins.push(Join { object_type: TypeId(t), ..peer_join(InterestKind::All) });
         world.rpc(1, rpc);
     }
-    assert_eq!(world.node.join_recv.len(), joined);
+    assert_eq!(world.node.slots.get(1).expect("connected").join_recv.len(), joined);
     assert!(world.drain(1).is_empty());
 }
 
@@ -704,7 +732,8 @@ fn a_join_of_an_unknown_type_is_ignored() {
 /// heartbeat takes it up.
 #[test]
 fn offers_over_the_limits_arm_no_timer() {
-    let mut world = World::new(Catalog::new(1024, 1024), 1, InterestKind::All);
+    let mut world =
+        World::with_config(unbounded_asks(), Catalog::new(1024, 1024), 1, InterestKind::All);
     let offer = |world: &mut World, tag: u32| {
         let mut rpc = Rpc::default();
         let _ = rpc.haves.push(Have::offer(TYPE, group(tag), Bitmap::all_bits(1024)));
@@ -749,6 +778,62 @@ fn an_unrecorded_ask_is_not_made() {
         assert!(world.env.retries <= 16 * (round + 1));
         world.env.now += 1.0;
     }
+}
+
+/// One peer is asked for no more chunks at once than its bound. What is left
+/// goes to another announcer, or waits for the heartbeat.
+#[test]
+fn the_asks_of_one_peer_are_bounded() {
+    let per_peer = 128;
+    let config = NodeConfig { max_asks_per_peer: per_peer, ..NodeConfig::default() };
+    let mut world = World::with_config(config, Catalog::new(300, 300), 2, InterestKind::All);
+    let offer = |world: &mut World, peer: PeerId| {
+        let mut rpc = Rpc::default();
+        let _ = rpc.haves.push(Have::offer(TYPE, group(1), Bitmap::all_bits(300)));
+        world.rpc(peer, rpc);
+    };
+    offer(&mut world, 1);
+    assert_eq!(world.node.tried.count_of(1), per_peer);
+    assert_eq!(world.node.asked_at.len(), per_peer);
+    let sent: usize = world
+        .drain(1)
+        .iter()
+        .flat_map(|e| e.wants.iter())
+        .map(|w| w.bits.popcount() as usize)
+        .sum();
+    assert_eq!(sent, per_peer);
+    assert_eq!(world.node.promises.count_of(1), per_peer);
+
+    // The heartbeat takes the group up again and finds the peer still full.
+    world.env.now += 0.7;
+    world.heartbeat();
+    assert_eq!(world.node.tried.count_of(1), per_peer);
+
+    world.env.now += 0.7;
+    offer(&mut world, 2);
+    assert_eq!(world.node.tried.count_of(2), per_peer);
+    assert_eq!(world.node.tried.len(), 2 * per_peer);
+
+    world.node.disconnect_peer(1, &mut world.env, &mut world.store);
+    assert_eq!(world.node.tried.count_of(1), 0);
+    assert_eq!(world.node.promises.count_of(1), 0);
+    assert_eq!(world.node.tried.len(), per_peer);
+}
+
+/// The records of every peer together stay within the table.
+#[test]
+fn the_ask_records_of_the_node_are_bounded() {
+    let mut config = NodeConfig::default();
+    config.capacities.max_ask_peers = 16;
+    let mut world = World::with_config(config, Catalog::new(300, 300), 2, InterestKind::All);
+    for peer in 1..=2 {
+        let mut rpc = Rpc::default();
+        let _ = rpc.haves.push(Have::offer(TYPE, group(peer as u32), Bitmap::all_bits(300)));
+        world.rpc(peer, rpc);
+    }
+    assert_eq!(world.node.tried.len(), 16);
+    assert_eq!(world.node.asked_at.len(), 16);
+    assert_eq!(world.env.retries, 16);
 }
 
 /// An offer naming an index past the group's count is refused whole and counts
@@ -805,6 +890,175 @@ fn an_ask_outside_offer_and_interest_is_refused() {
     assert!(!world.node.standing.contains_key(&(g, 6)));
 }
 
+/// A GRAFT counts for nothing until it is answered: the relation is entered at
+/// the peer's yes, a peer's own GRAFT is answered yes, a PRUNE ends the
+/// relation and holds the next GRAFT back for the backoff, and none of these is
+/// lost to a full queue (`protocol-v2.md` §4.1).
+#[test]
+fn a_graft_is_answered_and_a_prune_backs_off() {
+    let grafts = |world: &mut World| -> Vec<Graft> {
+        world.drain(1).iter().flat_map(|e| e.grafts.iter().copied()).collect()
+    };
+    let relation = (1, TYPE, 0, 0);
+    let mut world = World::new(Catalog::new(8, 8), 1, InterestKind::All);
+    world.heartbeat();
+    let ours = grafts(&mut world);
+    assert!(ours.iter().any(|g| g.direction == Direction::In && !g.answer));
+    assert!(ours.iter().any(|g| g.direction == Direction::Out && !g.answer));
+    assert!(!world.node.push_in.contains(&relation) && !world.node.push_out.contains(&relation));
+    // Unanswered, the peer is not grafted again.
+    world.heartbeat();
+    assert!(grafts(&mut world).is_empty());
+
+    // The yes to our "push me" is the peer's "I will push you": entered, not
+    // answered.
+    let graft = |direction, answer| {
+        let mut rpc = Rpc::default();
+        let _ =
+            rpc.grafts.push(Graft { object_type: TYPE, family: 0, colour: 0, direction, answer });
+        rpc
+    };
+    world.rpc(1, graft(Direction::Out, true));
+    assert!(world.node.push_in.contains(&relation));
+    assert!(grafts(&mut world).is_empty());
+    // A GRAFT of the peer's own for a relation held is answered yes again, a yes is
+    // not.
+    world.rpc(1, graft(Direction::Out, false));
+    let again = grafts(&mut world);
+    assert!(again.len() == 1 && again[0].direction == Direction::In && again[0].answer);
+    world.rpc(1, graft(Direction::Out, true));
+    assert!(grafts(&mut world).is_empty());
+    // The peer's "push me" crosses our unanswered "I will push you": that is the
+    // yes.
+    world.rpc(1, graft(Direction::In, false));
+    assert!(world.node.push_out.contains(&relation));
+    assert!(grafts(&mut world).is_empty());
+
+    // The peer's PRUNE ends the relation, and it is not grafted again at once.
+    let mut rpc = Rpc::default();
+    let _ = rpc.prunes.push(seacast_core::Prune {
+        object_type: TYPE,
+        family: 0,
+        colour: 0,
+        direction: Direction::Out,
+    });
+    world.rpc(1, rpc);
+    assert!(!world.node.push_in.contains(&relation));
+    world.heartbeat();
+    assert!(grafts(&mut world).iter().all(|g| g.direction != Direction::In));
+    world.env.now += 13.0;
+    world.heartbeat();
+    assert!(grafts(&mut world).iter().any(|g| g.direction == Direction::In));
+
+    // A full queue owes the answers, in the order they were made.
+    let mut config = NodeConfig::default();
+    config.capacities.max_queue_entries_per_peer = 2;
+    let mut world = World::with_config(config, Catalog::new(8, 8), 1, InterestKind::All);
+    for tag in 1..=3 {
+        world.rpc(1, chunk_rpc(chunk(group(tag), 0, [0; 32])));
+    }
+    assert!(!world.node.sends.queue.get(1).expect("connected").has_room());
+    world.rpc(1, graft(Direction::Out, false));
+    world.rpc(1, graft(Direction::In, false));
+    let sent = grafts(&mut world);
+    let directions: Vec<Direction> = sent.iter().map(|g| g.direction).collect();
+    assert_eq!(directions, [Direction::In, Direction::Out]);
+    assert!(sent.iter().all(|g| g.answer));
+}
+
+/// A source with no relation peer pushes to its links, and offers a chunk to
+/// the links it did not push it to when a copy is known to have arrived: at a
+/// holding that names it, or at its window's timeout, and once
+/// (`protocol-v2.md` §4.7 `source_pool`, `origin_acked`).
+#[test]
+fn a_source_offers_at_the_acknowledgement() {
+    let offers = |world: &mut World, peer: PeerId| -> usize {
+        world.drain(peer).iter().flat_map(|e| e.haves.iter()).filter(|h| h.offer).count()
+    };
+    for by_timeout in [false, true] {
+        let mut world = World::new(Catalog::new(2, 2), 4, InterestKind::All);
+        let g = group(1);
+        let shards = [chunk(g, 0, [0; 32]), chunk(g, 1, [0; 32])];
+        let (env, catalog, rng) = (&mut world.env, &world.catalog, &mut world.rng);
+        world.node.publish(g, Shape { n: 2, k: 2 }, &shards, env, catalog, rng);
+        // Each chunk goes to its budget of links, and nobody is offered anything.
+        let mut pushed = [0usize; 2];
+        let mut unpushed = Vec::new();
+        for peer in 1..=4 {
+            let sent = world.drain(peer);
+            assert!(sent.iter().all(|e| e.haves.iter().all(|h| !h.offer)));
+            let got: Vec<u32> =
+                sent.iter().filter_map(|e| e.chunk.as_ref()).map(|f| f.index).collect();
+            for &i in &got {
+                pushed[i as usize] += 1;
+            }
+            if !got.contains(&0) {
+                unpushed.push(peer);
+            }
+        }
+        assert_eq!(pushed, [2, 2]);
+        assert_eq!(unpushed.len(), 2);
+        // Chunk 0 is acknowledged: the links not pushed it are offered it, once.
+        let ack = |world: &mut World| {
+            if by_timeout {
+                let event = TimerEvent::WindowTimeout { peer: 1, group: g, index: 0, at_bits: 0 };
+                let (env, catalog, rng, store) =
+                    (&mut world.env, &mut world.catalog, &mut world.rng, &mut world.store);
+                world.node.on_timer(event, env, catalog, rng, store);
+            } else {
+                let holder = (1..=4).find(|peer| !unpushed.contains(peer)).expect("a target");
+                let mut rpc = Rpc::default();
+                let _ = rpc.haves.push(Have::holding(TYPE, g, Bitmap::singleton(0), false, false));
+                world.rpc(holder, rpc);
+            }
+        };
+        ack(&mut world);
+        for &peer in &unpushed {
+            assert_eq!(offers(&mut world, peer), 1, "by timeout: {by_timeout}");
+        }
+        ack(&mut world);
+        for peer in 1..=4 {
+            assert_eq!(offers(&mut world, peer), 0);
+        }
+    }
+}
+
+/// A claimant answers the probe of its claim whatever the asker holds, once for
+/// the group: the answer is written though the asker holds the chunk, and a
+/// second marked ask is an ask for a claimed chunk (`protocol-v2.md` §4.6, R5).
+#[test]
+fn a_probe_of_a_claim_is_answered_once() {
+    let mut world = World::new(Catalog::new(8, 8), 2, InterestKind::All);
+    let g = group(1);
+    world.rpc(1, chunk_rpc(chunk(g, 0, [0; 32])));
+    world.drain(2);
+    // The asker holds the chunk, and probes it.
+    let mut held = Rpc::default();
+    let _ = held.haves.push(Have::holding(TYPE, g, Bitmap::singleton(0), false, false));
+    world.rpc(2, held);
+    let probe = |world: &mut World| {
+        let mut rpc = Rpc::default();
+        let _ = rpc.wants.push(Want::probe(TYPE, g, Bitmap::singleton(0)));
+        world.rpc(2, rpc);
+        world.drain(2).iter().filter(|entry| entry.chunk.is_some()).count()
+    };
+    assert_eq!((probe(&mut world), world.env.penalties), (1, 0));
+    assert!(world.node.probe_answers.is_empty());
+    assert_eq!((probe(&mut world), world.env.penalties), (0, 1));
+    // An unmarked ask of a chunk the asker holds was never answered.
+    let mut world = World::new(Catalog::new(8, 8), 2, InterestKind::All);
+    world.rpc(1, chunk_rpc(chunk(g, 0, [0; 32])));
+    world.drain(2);
+    let mut held = Rpc::default();
+    let _ = held.haves.push(Have::holding(TYPE, g, Bitmap::singleton(0), false, false));
+    world.rpc(2, held);
+    let mut rpc = Rpc::default();
+    let _ = rpc.wants.push(Want::direct(TYPE, g, Bitmap::singleton(0)));
+    world.rpc(2, rpc);
+    assert_eq!(world.env.penalties, 1);
+    assert!(world.drain(2).iter().all(|entry| entry.chunk.is_none()));
+}
+
 /// However many chunks a peer asks for, it is served a bounded number of them a
 /// heartbeat.
 #[test]
@@ -834,7 +1088,7 @@ fn asks_are_served_within_the_heartbeat_budget() {
 /// empty they are not kept, and a pair that goes gives its block back.
 #[test]
 fn a_pair_keeps_wide_bitmaps_while_the_pool_has_room() {
-    let mut pairs = seacast_core::Pairs::with_capacity(4, 1);
+    let mut pairs = seacast_core::Pairs::with_capacity(4, 1, 4, 64);
     let (first, second) = ((1, group(1)), (2, group(1)));
     let wide = Bitmap::from_indices([3, 127, 128, 1000]);
     pairs.set_offered(first, Bitmap::singleton(5));
@@ -856,69 +1110,26 @@ fn a_pair_keeps_wide_bitmaps_while_the_pool_has_room() {
     assert_eq!(pairs.sent_to(&second), Some(all_but));
 }
 
-/// A host with a send path of its own: it is handed what to send, told when a
-/// chunk waiting to be sent is no longer needed, and turns an item into its
-/// frame as it writes it.
+/// A chunk that waits in a peer's queue is not written once the peer says it
+/// holds it (`protocol.md` §7.2 `filter_entry`).
 #[test]
-fn a_host_without_the_reference_queue_is_handed_its_sends() {
-    #[derive(Default)]
-    struct Host {
-        outbox: Vec<(PeerId, seacast_core::Queued)>,
-        cancelled: Vec<(PeerId, GroupId, u32)>,
-    }
-    impl RuntimeEnv<Vec<u8>> for Host {
-        fn now(&self) -> Timestamp {
-            1.0
-        }
-        fn schedule_after(&mut self, _delay: f64, _event: TimerEvent) {}
-        fn send(&mut self, peer: PeerId, item: seacast_core::Queued, _urgent: bool) -> bool {
-            self.outbox.push((peer, item));
-            true
-        }
-        fn cancel_chunk(&mut self, peer: PeerId, group: GroupId, index: u32) {
-            self.cancelled.push((peer, group, index));
-        }
-        fn start_decode(&mut self, _group: GroupId) {}
-        fn deliver(&mut self, _group: GroupId, _object: Vec<u8>) {}
-        fn penalise(&mut self, _peer: PeerId, _reason: PenaltyReason) {}
-    }
-
-    let mut node = Node::new(NodeConfig::default());
-    let (mut host, mut catalog) = (Host::default(), Catalog::new(8, 8));
-    let (mut rng, mut store) = (SplitMix64::new(7), BoundedDeferredStore::default());
+fn a_queued_chunk_is_not_written_to_a_peer_that_holds_it() {
+    let mut world = World::new(Catalog::new(8, 8), 2, InterestKind::All);
     let g = group(1);
-    for peer in [1, 2] {
-        node.connect_peer(peer, true, &mut host, &catalog);
-        let mut rpc = Rpc::default();
-        let _ = rpc.joins.push(peer_join(InterestKind::All));
-        node.on_rpc(peer, rpc, &mut host, &mut catalog, &mut rng, &mut store);
-    }
-    let rpc = chunk_rpc(chunk(g, 0, [0; 32]));
-    node.on_rpc(1, rpc, &mut host, &mut catalog, &mut rng, &mut store);
-    host.outbox.clear();
-
-    // Peer 2 asks for the chunk: the host is handed the answer, by reference.
+    world.rpc(1, chunk_rpc(chunk(g, 0, [0; 32])));
     let mut rpc = Rpc::default();
     let _ = rpc.wants.push(Want::pull_ask(TYPE, Ask { group: g, index: 0 }));
-    node.on_rpc(2, rpc, &mut host, &mut catalog, &mut rng, &mut store);
-    let answer = host
-        .outbox
-        .iter()
-        .find(|(peer, item)| *peer == 2 && item.is_chunk())
-        .map(|&(_, item)| item)
-        .expect("the answer is handed to the host");
+    world.rpc(2, rpc);
+    let queued = |world: &World| {
+        world.node.sends.queue.get(2).is_some_and(|q| q.normal.iter().any(|item| item.is_chunk()))
+    };
+    assert!(queued(&world));
 
-    // It then says it holds the chunk: the host is told, and the item is no longer
-    // written.
     let mut rpc = Rpc::default();
     let _ = rpc.haves.push(Have::holding(TYPE, g, Bitmap::singleton(0), false, false));
-    node.on_rpc(2, rpc, &mut host, &mut catalog, &mut rng, &mut store);
-    assert_eq!(host.cancelled, vec![(2, g, 0)]);
-    assert!(node.on_write(2, answer, &mut host, &catalog).is_none());
-
-    // To a peer that does not hold it, the same item is the chunk's frame.
-    let frame = node.on_write(1, answer, &mut host, &catalog);
-    assert!(frame.is_some_and(|entry| entry.chunk.is_some()));
+    world.rpc(2, rpc);
+    assert!(world.drain(2).iter().all(|entry| entry.chunk.is_none()));
+    assert!(!queued(&world));
 }
 
 /// A holding, offer or ask names its group's type: one of a type not joined on
@@ -947,27 +1158,510 @@ fn a_group_is_of_the_type_it_is_named_with() {
     assert_eq!(world.node.type_of(&named, &world.catalog), TYPE);
 }
 
-/// A host that writes elsewhere reports each write: a chunk is recorded as
-/// sent, and an ask's promise runs from the time of the write, unless the
-/// chunk arrived before the report.
+/// A symmetric type keeps one relation both ways: grafted and answered as one,
+/// ended both ways by a PRUNE, made whole where it is held one way, and pruned
+/// at the cap (`protocol-v2.md` §4.1).
 #[test]
-fn a_reported_write_has_the_effects_of_a_write() {
-    let mut world = World::new(Catalog::new(8, 8), 2, InterestKind::All);
+fn a_symmetric_relation_is_one_both_ways() {
+    let grafts = |world: &mut World, peer| -> Vec<Graft> {
+        world.drain(peer).iter().flat_map(|e| e.grafts.iter().copied()).collect()
+    };
+    let graft = |answer| {
+        let mut rpc = Rpc::default();
+        let direction = Direction::Both;
+        let _ =
+            rpc.grafts.push(Graft { object_type: TYPE, family: 0, colour: 0, direction, answer });
+        rpc
+    };
+    let relation = (1, TYPE, 0, 0);
+    let mut catalog = Catalog::new(8, 8);
+    catalog.params.symmetric = true;
+    let mut world = World::new(catalog, 2, InterestKind::All);
+    world.heartbeat();
+    let ours = grafts(&mut world, 1);
+    assert!(ours.len() == 1 && ours[0].direction == Direction::Both && !ours[0].answer);
+    assert!(!world.node.push_in.contains(&relation) && !world.node.push_out.contains(&relation));
+
+    // The yes enters both directions and is not answered.
+    world.rpc(1, graft(true));
+    assert!(world.node.push_in.contains(&relation) && world.node.push_out.contains(&relation));
+    assert!(grafts(&mut world, 1).is_empty());
+
+    // A PRUNE naming one direction ends both.
+    let mut rpc = Rpc::default();
+    let direction = Direction::Out;
+    let _ =
+        rpc.prunes.push(seacast_core::Prune { object_type: TYPE, family: 0, colour: 0, direction });
+    world.rpc(1, rpc);
+    assert!(!world.node.push_in.contains(&relation) && !world.node.push_out.contains(&relation));
+
+    // The peer's own GRAFT is decided as one and answered with one.
+    world.rpc(1, graft(false));
+    assert!(world.node.push_in.contains(&relation) && world.node.push_out.contains(&relation));
+    let yes = grafts(&mut world, 1);
+    assert!(yes.len() == 1 && yes[0].direction == Direction::Both && yes[0].answer);
+
+    // Held one way only, it is grafted again whatever the count.
+    world.rpc(2, graft(true));
+    world.drain(2);
+    world.node.push_out.remove(&relation);
+    world.heartbeat();
+    let again = grafts(&mut world, 1);
+    assert!(again.len() == 1 && again[0].direction == Direction::Both && !again[0].answer);
+    world.rpc(1, graft(true));
+    assert!(world.node.push_out.contains(&relation));
+
+    // At the cap the relation is pruned down to the target.
+    world.catalog.params.f_lo = 1;
+    world.catalog.params.f_hi = 2;
+    world.catalog.params.d_out = 1;
+    world.heartbeat();
+    assert_eq!((world.node.push_in.len(), world.node.push_out.len()), (1, 1));
+    let pruned: usize =
+        (1..=2).map(|p| world.drain(p).iter().map(|e| e.prunes.len()).sum::<usize>()).sum();
+    assert_eq!(pruned, 1);
+}
+
+/// A relation is grafted only on a link whose peer's interest holds the family,
+/// and the links a floor is short of are reported, a peer of high custody
+/// counting for `COVER_HIGH` families of a floor that asks for diversity
+/// (`protocol-v2.md` §1.3, §4.1 `candidates`, `keep_floor`, `keep_coverage`).
+#[test]
+fn links_count_where_interest_holds_the_family() {
+    let mut catalog = Catalog::new(8, 8);
+    catalog.covering = Some(vec![1, 2]);
+    let mut world = World::new(catalog, 3, InterestKind::Derived);
+    world.heartbeat();
+    assert!(world.drain(1).iter().any(|e| !e.grafts.is_empty()));
+    assert!(world.drain(2).iter().any(|e| !e.grafts.is_empty()));
+    assert!(world.drain(3).iter().all(|e| e.grafts.is_empty()));
+
+    let deficits = |world: &World| {
+        let mut short = Vec::new();
+        world.node.link_deficits(TYPE, &world.catalog, |family, links| short.push((family, links)));
+        short
+    };
+    // The relation floor: `F_LO` links, two held.
+    let f_lo = world.catalog.params.f_lo;
+    assert_eq!(deficits(&world), vec![(0, f_lo - 2)]);
+    world.catalog.params.f_lo = 2;
+    assert!(deficits(&world).is_empty());
+
+    // A floor of the policy's: every covering link counts.
+    world.catalog.floors = vec![LinkFloor { family: 4, links: 3, diverse: false }];
+    assert_eq!(deficits(&world), vec![(4, 1)]);
+
+    // A peer with interest `ALL` is of high custody: it counts for one family of a
+    // floor that asks for diversity, and for every family of one that does not.
+    let mut rpc = Rpc::default();
+    let _ = rpc.joins.push(peer_join(InterestKind::All));
+    world.rpc(3, rpc);
+    let floor = |family, diverse| LinkFloor { family, links: 3, diverse };
+    world.catalog.floors = vec![floor(4, true), floor(5, true)];
+    assert_eq!(deficits(&world), vec![(5, 1)]);
+    world.catalog.floors = vec![floor(4, false), floor(5, false)];
+    assert!(deficits(&world).is_empty());
+}
+
+/// A sampler asks one peer for each sample and no peer for two: a link of
+/// ordinary custody first, a routed request where none is left, a peer of high
+/// custody only after the first wait. Its later asks are bounded in flight, and
+/// nothing of them is left behind (`protocol-v2.md` §4.10).
+#[test]
+fn a_sampler_asks_one_peer_for_each_sample() {
+    let wants = |world: &mut World, peer| -> Vec<Want> {
+        world.drain(peer).iter().flat_map(|e| e.wants.iter().copied()).collect()
+    };
+    let mut catalog = Catalog::new(8, 8);
+    catalog.interest = Bitmap::new();
+    catalog.declared = true;
+    catalog.params.sample_outstanding = 1;
+    let mut world = World::new(catalog, 4, InterestKind::Derived);
+    // Peer 3 has no interest of its own and forwards; peer 4 is of high custody.
+    for (peer, interest) in [(3, InterestKind::Declared), (4, InterestKind::All)] {
+        let mut rpc = Rpc::default();
+        let _ = rpc.joins.push(peer_join(interest));
+        world.rpc(peer, rpc);
+    }
+    let g = group(1);
+    let mut bits = Bitmap::new();
+    for i in [2, 5, 6, 7] {
+        bits.set(i);
+    }
+    world.node.sample(g, bits, &mut world.env, &world.catalog, &mut world.rng);
+    let hops = world.catalog.params.route_hops;
+    let (direct_1, direct_2) = (wants(&mut world, 1), wants(&mut world, 2));
+    let (via, high) = (wants(&mut world, 3), wants(&mut world, 4));
+    for w in [&direct_1, &direct_2] {
+        assert!(w.len() == 1 && w[0].standing && w[0].hops == 0 && w[0].bits.iter().count() == 1);
+    }
+    assert!(via.len() == 1 && via[0].standing && via[0].hops == hops);
+    // The fourth sample has nobody but the peer of high custody: it waits.
+    assert!(high.is_empty());
+    assert_eq!(world.node.sampled_from.len(), 3);
+    assert!(world.node.samples_in_flight.is_empty());
+
+    // The first wait runs out on two samples: one goes to the peer of high custody,
+    // the other is held back by the limit in flight.
+    let asked: Vec<u32> =
+        bits.iter().filter(|&i| direct_1[0].bits.has(i) || direct_2[0].bits.has(i)).collect();
+    let fire = |world: &mut World, index, peer: Option<PeerId>, first| {
+        let peer = peer.map(|p| world.node.slots.stamp(p));
+        let event = TimerEvent::Resample { group: g, index, peer, first };
+        world.node.on_timer(
+            event,
+            &mut world.env,
+            &mut world.catalog,
+            &mut world.rng,
+            &mut world.store,
+        );
+    };
+    let first_peer = |i| if direct_1[0].bits.has(i) { 1 } else { 2 };
+    fire(&mut world, asked[0], Some(first_peer(asked[0])), true);
+    let second = wants(&mut world, 4);
+    assert!(second.len() == 1 && second[0].bits.has(asked[0]) && second[0].hops == 0);
+    fire(&mut world, asked[1], Some(first_peer(asked[1])), true);
+    assert_eq!((world.node.samples_in_flight.len(), world.node.held_samples.len()), (1, 1));
+
+    // Its wait over, the held one is taken: nobody is left to ask, and nothing
+    // stays.
+    fire(&mut world, asked[0], Some(4), false);
+    assert!(world.node.samples_in_flight.is_empty() && world.node.held_samples.is_empty());
+    for peer in 1..=4 {
+        assert!(wants(&mut world, peer).is_empty());
+    }
+    world.env.now += world.node.config.group_ttl + 1.0;
+    world.heartbeat();
+    assert!(world.node.sampled_from.is_empty());
+}
+
+/// A node with duty passes a routed sample request it cannot answer one step
+/// on, to a link that serves the index, a bounded number of times per asking
+/// peer until the host starts a new period, and answers the asker when the
+/// chunk arrives. The same ask without `hops` is a violation
+/// (`protocol-v2.md` §4.5 `route_want`, X6).
+#[test]
+fn a_routed_request_is_passed_on_within_the_limit() {
+    let mut catalog = Catalog::new(8, 8);
+    catalog.interest = Bitmap::new();
+    catalog.derived = true;
+    let mut world = World::new(catalog, 2, InterestKind::Derived);
+    let mut rpc = Rpc::default();
+    let _ = rpc.joins.push(peer_join(InterestKind::Declared));
+    world.rpc(1, rpc);
+    let g = group(1);
+    let ask = |world: &mut World, index, hops| {
+        let mut rpc = Rpc::default();
+        let want = Want { hops, ..Want::standing(TYPE, g, Bitmap::singleton(index)) };
+        let _ = rpc.wants.push(want);
+        world.rpc(1, rpc);
+        world.drain(2).iter().flat_map(|e| e.wants.iter().copied()).collect::<Vec<Want>>()
+    };
+    let passed = ask(&mut world, 3, 1);
+    assert!(passed.len() == 1 && passed[0].standing && passed[0].hops == 0);
+    assert!(passed[0].bits == Bitmap::singleton(3));
+    assert_eq!(world.node.forwarded.get(&world.catalog.node_id(1)), Some(&1));
+    // At the limit: kept standing, not passed on, not penalised.
+    assert!(ask(&mut world, 4, 1).is_empty());
+    assert!(world.node.standing.contains_key(&(g, 4)));
+    assert_eq!(world.env.penalties, 0);
+    world.node.reset_period();
+    assert_eq!(ask(&mut world, 5, 1).len(), 1);
+
+    // The chunk comes back the way the request went.
+    world.rpc(2, chunk_rpc(chunk(g, 3, [0; 32])));
+    let answers: Vec<u32> =
+        world.drain(1).iter().filter_map(|e| e.chunk.as_ref()).map(|c| c.index).collect();
+    assert_eq!(answers, vec![3]);
+
+    // Without `hops`, an index this node neither holds nor wants was never invited.
+    assert!(ask(&mut world, 6, 0).is_empty());
+    assert_eq!(world.env.penalties, 1);
+    // The count outlives the connection: connecting again does not reset it.
+    world.node.disconnect_peer(1, &mut world.env, &mut world.store);
+    assert_eq!(world.node.forwarded.get(&world.catalog.node_id(1)), Some(&1));
+    // The node's next connection, under another peer id, is still at the limit.
+    let again = 1 + NODES;
+    world.node.connect_peer(again, true, &mut world.env, &world.catalog);
+    let mut rpc = Rpc::default();
+    let _ = rpc.joins.push(peer_join(InterestKind::Declared));
+    world.rpc(again, rpc);
+    world.drain(2);
+    let ask = |world: &mut World, index| {
+        let mut rpc = Rpc::default();
+        let want = Want { hops: 1, ..Want::standing(TYPE, g, Bitmap::singleton(index)) };
+        let _ = rpc.wants.push(want);
+        world.rpc(again, rpc);
+        world.drain(2).iter().map(|e| e.wants.len()).sum::<usize>()
+    };
+    assert_eq!(ask(&mut world, 6), 0);
+    world.node.reset_period();
+    assert_eq!(ask(&mut world, 7), 1);
+}
+
+/// A tie on a group the domain never tells of goes once its sender has stopped
+/// naming the group (`protocol.md` §4.2 `drop_stale_waits`).
+#[test]
+fn a_tie_on_a_group_never_told_of_expires() {
+    let mut catalog = Catalog::new(8, 8);
+    catalog.installed = Some([9; 32]);
+    let mut world = World::new(catalog, 1, InterestKind::All);
+    let g = group(1);
+    world.rpc(1, chunk_rpc(chunk(g, 0, [5; 32])));
+    assert!(world.node.tied_to_root(1, Ask { group: g, index: 0 }));
+    assert!(world.node.groups.get(&g).is_none());
+    let heartbeats = (world.node.config.group_ttl / world.node.config.heartbeat) as usize + 2;
+    for _ in 0..heartbeats {
+        world.env.now += world.node.config.heartbeat;
+        world.heartbeat();
+    }
+    assert!(world.node.tied.is_empty());
+    assert!(!world.node.tied_to_root(1, Ask { group: g, index: 0 }));
+}
+
+/// A park is the node's, not the connection's: it returns on the node's next
+/// connection until its end, and the table that keeps it is bounded
+/// (`protocol.md` §8.1).
+#[test]
+fn a_park_outlives_its_connection() {
+    let mut config = NodeConfig::default();
+    config.capacities.max_kept_parks = 2;
+    let mut world = World::with_config(config, Catalog::new(8, 8), 2, InterestKind::All);
+    let until = world.env.now + world.node.config.park_ttl;
+    for tag in 1..=3 {
+        world.node.pairs.set_park((1, group(tag)), until);
+    }
+    world.node.disconnect_peer(1, &mut world.env, &mut world.store);
+    assert_eq!(world.node.kept_parks.len(), 2);
+
+    // The node's next connection has another peer id.
+    let again = 1 + NODES;
+    world.node.connect_peer(again, true, &mut world.env, &world.catalog);
+    let now = world.env.now;
+    let parked = (1..=3).filter(|&tag| world.node.parked(again, &group(tag), now)).count();
+    assert_eq!(parked, 2);
+    assert!(world.node.kept_parks.is_empty());
+    // Another node's connection takes none of them.
+    assert!((1..=3).all(|tag| !world.node.parked(2, &group(tag), now)));
+
+    // Past its end a kept park does not return.
+    world.node.disconnect_peer(again, &mut world.env, &mut world.store);
+    assert_eq!(world.node.kept_parks.len(), 2);
+    world.env.now = until;
+    world.node.connect_peer(1, true, &mut world.env, &world.catalog);
+    assert!((1..=3).all(|tag| !world.node.parked(1, &group(tag), until)));
+    assert!(world.node.kept_parks.is_empty());
+}
+
+/// A connection's record is reset when it closes: the next connection with its
+/// peer id starts with nothing of the last one's.
+#[test]
+fn a_closed_connection_leaves_nothing_to_the_next_with_its_id() {
+    let mut world = World::new(Catalog::new(8, 8), 1, InterestKind::All);
+    let mut rpc = Rpc::default();
+    let _ = rpc.haves.push(Have::offer(TYPE, group(1), Bitmap::singleton(0)));
+    world.rpc(1, rpc);
+    let slot = world.node.slots.get(1).expect("connected");
+    assert!(slot.listed_count == 1 && slot.ihave_rpcs == 1 && slot.join_recv.len() == 1);
+
+    world.node.disconnect_peer(1, &mut world.env, &mut world.store);
+    assert!(world.node.slots.get(1).is_none() && world.node.sends.queue.get(1).is_none());
+    world.node.connect_peer(1, false, &mut world.env, &world.catalog);
+    let slot = world.node.slots.get(1).expect("connected");
+    assert!(slot.listed_count == 0 && slot.ihave_rpcs == 0);
+    assert!(slot.join_recv.is_empty() && slot.join_sent.is_empty());
+    assert!(world.node.sends.queue.get(1).is_some_and(|q| q.is_empty()));
+}
+
+/// The host keeps peer ids below `max_peers`.
+#[test]
+#[should_panic]
+fn a_peer_id_out_of_range_panics() {
+    let mut world = World::new(Catalog::new(8, 8), 1, InterestKind::All);
+    let peer = world.node.config.capacities.max_peers as PeerId;
+    world.node.connect_peer(peer, false, &mut world.env, &world.catalog);
+}
+
+/// What the node gave out for a connection is not taken back for the next
+/// connection with its peer id: a verdict on a chunk of the closed one is
+/// dropped, and a sampler's wait on it parks nobody.
+#[test]
+fn a_result_for_a_closed_connection_is_not_the_next_ones() {
+    let mut catalog = Catalog::new(8, 8);
+    catalog.deferred_proof = true;
+    let mut world = World::new(catalog, 1, InterestKind::All);
     let g = group(1);
     world.rpc(1, chunk_rpc(chunk(g, 0, [0; 32])));
+    let (from, first) = world.node.pop_unverified().expect("the chunk");
+    let stale = world.node.slots.stamp(1);
+    assert_eq!(from, stale);
 
-    let pushed = seacast_core::Queued::Chunk { group: g, index: 0, solicited: false };
-    world.node.on_written(2, &pushed, world.env.now(), &mut world.env, &world.catalog);
-    assert!(world.node.pairs.sent_to(&(2, g)).is_some_and(|sent| sent.has(0)));
+    world.node.disconnect_peer(1, &mut world.env, &mut world.store);
+    world.node.connect_peer(1, false, &mut world.env, &world.catalog);
+    assert_ne!(world.node.slots.stamp(1), stale);
+    assert_eq!(world.node.slots.resolve(stale), None);
 
-    let written_at = world.env.now() - 0.1;
-    let ask =
-        |index| seacast_core::Queued::from_want(Want::pull_ask(TYPE, Ask { group: g, index }));
-    world.node.on_written(2, &ask(3), written_at, &mut world.env, &world.catalog);
-    assert_eq!(world.node.promises.len(), 1);
-    assert!(world.node.promises.contains(Ask { group: g, index: 3 }, 2));
+    let (env, catalog, rng, store) =
+        (&mut world.env, &mut world.catalog, &mut world.rng, &mut world.store);
+    world.node.on_validated(from, first, ValidationResult::Reject, env, catalog, rng, store);
+    assert_eq!(world.env.penalties, 0);
+    assert!(world.node.verifying.is_empty() && world.node.seen_ids.is_empty());
 
-    // Index 0 is held: its ask starts no promise.
-    world.node.on_written(2, &ask(0), written_at, &mut world.env, &world.catalog);
-    assert_eq!(world.node.promises.len(), 1);
+    let event = TimerEvent::Resample { group: g, index: 3, peer: Some(stale), first: false };
+    let (env, catalog, rng, store) =
+        (&mut world.env, &mut world.catalog, &mut world.rng, &mut world.store);
+    world.node.on_timer(event, env, catalog, rng, store);
+    assert!(!world.node.parked(1, &g, world.env.now));
+}
+
+/// The pair table finds the peers that offer or hold a group without a walk
+/// over the peers, for peer ids past one word of the bitmask; with no row
+/// left for a new group, an offer is not kept.
+#[test]
+fn a_pair_is_found_by_its_group() {
+    let mut pairs = seacast_core::Pairs::with_capacity(16, 0, 2, 200);
+    let (g, other) = (group(1), group(2));
+    for peer in [3, 70, 199] {
+        pairs.set_offered((peer, g), Bitmap::from_indices([1, 2]));
+    }
+    let holding = seacast_core::HaveEntry {
+        bits: Bitmap::singleton(4),
+        ttl: 1,
+        claim_all: false,
+        complete: false,
+    };
+    pairs.set_peer_has((70, g), holding);
+    pairs.set_offered((5, other), Bitmap::singleton(1));
+    assert_eq!(pairs.offering(&g).collect::<Vec<_>>(), vec![3, 70, 199]);
+    assert_eq!(pairs.having(&g).collect::<Vec<_>>(), vec![70]);
+
+    pairs.clear_offered(&g, 1);
+    for peer in [3, 70, 199] {
+        assert_eq!(pairs.offered(&(peer, g)), Some(Bitmap::singleton(2)));
+    }
+    assert_eq!(pairs.offered(&(5, other)), Some(Bitmap::singleton(1)));
+
+    pairs.take_offered(&(3, g));
+    pairs.retain(|&(peer, _)| peer != 199);
+    assert_eq!(pairs.offering(&g).collect::<Vec<_>>(), vec![70]);
+    // The holding expires at the heartbeat.
+    pairs.heartbeat(0.0, |_, _, _| {});
+    assert_eq!(pairs.having(&g).count(), 0);
+
+    // Both rows are taken: a third group has none.
+    pairs.set_offered((9, group(3)), Bitmap::singleton(0));
+    assert_eq!(pairs.offered(&(9, group(3))), None);
+}
+
+/// A direction of the push relations answers by type, family and colour, and
+/// loses a peer's relations in one pass.
+#[test]
+fn relations_are_read_by_family_and_colour() {
+    let mut set = seacast_core::Relations::with_capacity(8, 200);
+    assert!(set.insert((3, TYPE, 7, 0)) && set.insert((130, TYPE, 7, 0)));
+    assert!(set.insert((130, TYPE, 7, 1)) && !set.insert((130, TYPE, 7, 1)));
+    assert_eq!(set.len(), 3);
+    assert_eq!((set.word(TYPE, 7, 0, 0), set.word(TYPE, 7, 0, 2)), (1 << 3, 1 << 2));
+    assert!(set.any_colour(130, TYPE, 7, 2) && !set.any_colour(3, TYPE, 8, 2));
+    assert_eq!(set.family_word(TYPE, 7, 2, 2), 1 << 2);
+    assert!(set.related(3) && !set.related(4));
+
+    set.remove_peer(130);
+    assert_eq!((set.len(), set.count(TYPE, 7, 1)), (1, 0));
+    assert!(set.remove(&(3, TYPE, 7, 0)) && set.is_empty());
+}
+
+/// A peer counts as a link of a type once both JOINs have crossed, and no
+/// longer once its connection closes.
+#[test]
+fn links_follow_the_joins() {
+    let mut world = World::new(Catalog::new(8, 8), 2, InterestKind::All);
+    assert_eq!(world.node.peers_of(world.node.links(TYPE)).collect::<Vec<_>>(), vec![1, 2]);
+    world.node.connect_peer(3, true, &mut world.env, &world.catalog);
+    assert_eq!(world.node.peers_of(world.node.links(TYPE)).collect::<Vec<_>>(), vec![1, 2]);
+    world.node.disconnect_peer(1, &mut world.env, &mut world.store);
+    assert_eq!(world.node.peers_of(world.node.links(TYPE)).collect::<Vec<_>>(), vec![2]);
+}
+
+/// A list of peers is not cut at a fixed length: with more links than one
+/// word of the bitmask holds, every peer that pushes a family is told of a
+/// chunk held.
+#[test]
+fn every_peer_of_a_relation_is_told() {
+    let mut config = NodeConfig::default();
+    config.capacities.max_peers = 200;
+    let peers = 150;
+    let mut world = World::with_config(config, Catalog::new(8, 8), peers, InterestKind::All);
+    assert_eq!(world.node.count(world.node.links(TYPE)), peers as usize);
+    let g = group(1);
+    for peer in 2..=peers {
+        world.node.push_in.insert((peer, TYPE, world.catalog.family(TYPE, &g), 0));
+    }
+    let scope = world.node.suppression_scope(&g, &world.catalog);
+    assert_eq!(world.node.count(scope), peers as usize - 1);
+
+    world.rpc(1, chunk_rpc(chunk(g, 0, [0; 32])));
+    let told = (1..=peers)
+        .filter(|&peer| {
+            world.drain(peer).iter().any(|e| e.haves.iter().any(|h| !h.offer && h.bits.has(0)))
+        })
+        .count();
+    assert_eq!(told, peers as usize);
+}
+
+/// No set of peers is cut at a length. With more peers than one word of a
+/// bitmask holds: a chunk goes, as a push or an offer, to every peer of its
+/// relation; every standing request for it is served; and the heartbeat's
+/// gossip is drawn from all the peers outside the relations.
+#[test]
+fn sets_of_peers_are_not_cut_at_a_length() {
+    let mut config = NodeConfig::default();
+    config.capacities.max_peers = 200;
+    config.paced_gossip = false;
+    let peers: u64 = 150;
+    let got = |world: &mut World, index: u32| {
+        let (mut chunks, mut offers) = (0, 0);
+        for peer in 2..=peers {
+            let sent = world.drain(peer);
+            chunks +=
+                sent.iter().any(|e| e.chunk.as_ref().is_some_and(|c| c.index == index)) as usize;
+            offers +=
+                sent.iter().any(|e| e.haves.iter().any(|h| h.offer && h.bits.has(index))) as usize;
+        }
+        (chunks, offers)
+    };
+
+    // A relation of every peer: the chunk is pushed to some and offered to the
+    // rest.
+    let mut world =
+        World::with_config(config.clone(), Catalog::new(8, 8), peers, InterestKind::All);
+    let g = group(1);
+    let fam = world.catalog.family(TYPE, &g);
+    for peer in 1..=peers {
+        world.node.push_out.insert((peer, TYPE, fam, 0));
+    }
+    world.rpc(1, chunk_rpc(chunk(g, 0, [0; 32])));
+    let (chunks, offers) = got(&mut world, 0);
+    assert!(chunks <= world.node.config.r_node());
+    assert_eq!(chunks + offers, peers as usize - 1);
+
+    // A standing request of every peer for a chunk not held yet.
+    for peer in 2..=peers {
+        let mut rpc = Rpc::default();
+        let _ = rpc.wants.push(Want::standing(TYPE, g, Bitmap::singleton(1)));
+        world.rpc(peer, rpc);
+    }
+    assert_eq!(world.node.count(seacast_core::PeerSet::Standing(g, 1)), peers as usize - 1);
+    world.rpc(1, chunk_rpc(chunk(g, 1, [0; 32])));
+    assert_eq!(got(&mut world, 1).0, peers as usize - 1);
+    assert!(world.node.standing.is_empty());
+
+    // No relation: the gossip of a heartbeat goes to its share of all the peers.
+    let mut world = World::with_config(config, Catalog::new(8, 8), peers, InterestKind::All);
+    world.rpc(1, chunk_rpc(chunk(g, 0, [0; 32])));
+    got(&mut world, 0);
+    world.heartbeat();
+    let share = (world.node.config.gossip_factor * peers as f64) as usize;
+    let (_, offers) = got(&mut world, 0);
+    assert!(offers + 1 >= share && offers <= share, "{offers} of {share}");
 }

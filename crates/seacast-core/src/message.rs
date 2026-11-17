@@ -24,6 +24,9 @@ pub struct Graft {
     pub family: FamilyId,
     pub colour: Colour,
     pub direction: Direction,
+    /// The yes to the receiver's GRAFT: not answered where the relation is
+    /// held (`protocol-v2.md` §4.1).
+    pub answer: bool,
 }
 
 /// `Prune`: relation teardown per family and colour (`protocol-v2.md` §2).
@@ -76,10 +79,15 @@ pub struct Want {
     pub object_type: TypeId,
     pub group: GroupId,
     pub bits: Bitmap,
-    /// Distinguishes an offer-driven pull ask (which starts a `PROMISE` timer
-    /// when written, `protocol.md` §7.2) from a standing/probe/custodian
-    /// `Want` (which starts no `PROMISE` timer at write time,
-    /// `protocol-v2.md` §4.5, §4.6, §4.10).
+    /// Also when the chunks arrive, not only if held now (§4.10, `[D12]`).
+    pub standing: bool,
+    /// Forwarding steps the request may still take (§4.10, `[D12]`).
+    pub hops: u8,
+    /// The probe of a claim: answered whatever the sender holds (§4.6, R5).
+    pub probe: bool,
+    /// Ours only, not sent: an offer-driven pull ask, whose `PROMISE` starts
+    /// when it is written (`protocol.md` §7.2). A standing, probe or custodian
+    /// ask starts none there (`protocol-v2.md` §4.5, §4.6, §4.10).
     pub track_promise: bool,
 }
 
@@ -92,15 +100,37 @@ impl Want {
             object_type,
             group: ask.group,
             bits: Bitmap::singleton(ask.index),
+            standing: false,
+            hops: 0,
+            probe: false,
             track_promise: true,
         }
     }
 
-    /// Creates a standing / direct `Want` (e.g. for samplers, probes, or repair
-    /// custodian asks).
+    /// An ask answered only if held now: a repair's ask of a custodian (§4.6).
+    #[inline]
+    pub const fn direct(object_type: TypeId, group: GroupId, bits: Bitmap) -> Self {
+        Self {
+            object_type,
+            group,
+            bits,
+            standing: false,
+            hops: 0,
+            probe: false,
+            track_promise: false,
+        }
+    }
+
+    /// A standing request: a sampler's (§4.10).
     #[inline]
     pub const fn standing(object_type: TypeId, group: GroupId, bits: Bitmap) -> Self {
-        Self { object_type, group, bits, track_promise: false }
+        Self { standing: true, ..Self::direct(object_type, group, bits) }
+    }
+
+    /// The probe of a claim (§4.6 `defer_on_claim`).
+    #[inline]
+    pub const fn probe(object_type: TypeId, group: GroupId, bits: Bitmap) -> Self {
+        Self { probe: true, ..Self::direct(object_type, group, bits) }
     }
 }
 

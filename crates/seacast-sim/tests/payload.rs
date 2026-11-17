@@ -10,9 +10,9 @@ use seacast_codec::{
     merkle_proof_from_layers, split_frame,
 };
 use seacast_core::{
-    BoundedDeferredStore, Bytes32, ChunkMsg, Duty, GroupId, GroupState, InterestKind, Join,
-    NodeConfig, NodeId, PeerId, PenaltyReason, Rpc, RuntimeEnv, SeacastNode, SplitMix64,
-    TimerEvent, Timestamp, TypeParams, ValidationResult,
+    Bitmap, BoundedDeferredStore, Bytes32, ChunkMsg, Duty, GroupId, GroupState, InterestKind, Join,
+    NodeConfig, NodeId, PeerId, PenaltyReason, PreallocVec, Rpc, RuntimeEnv, SeacastNode, Shape,
+    SplitMix64, TimerEvent, Timestamp, TypeCodec, TypeId, TypeParams, ValidationResult,
 };
 use seacast_sim::{
     PAYLOAD,
@@ -74,9 +74,14 @@ impl PayloadHost for Blocks {
     }
 }
 
+/// A decode job: group, type, shape, the indices given and their chunks.
+type Job = (GroupId, TypeId, Shape, Bitmap, Vec<ChunkMsg<Vec<u8>>>);
+
 #[derive(Default)]
 struct Env {
-    to_decode: Vec<GroupId>,
+    /// The decode jobs handed over, copied out as a host with a decode thread
+    /// does.
+    to_decode: Vec<Job>,
     delivered: Vec<(GroupId, Vec<u8>)>,
     penalties: Vec<(PeerId, PenaltyReason)>,
 }
@@ -86,12 +91,8 @@ impl RuntimeEnv<Vec<u8>> for Env {
         1.0
     }
     fn schedule_after(&mut self, _delay: f64, _event: TimerEvent) {}
-    // Nothing is written in these tests: what the node sends is taken and dropped.
-    fn send(&mut self, _peer: PeerId, _item: seacast_core::Queued, _urgent: bool) -> bool {
-        true
-    }
-    fn start_decode(&mut self, group: GroupId) {
-        self.to_decode.push(group);
+    fn start_decode(&mut self, group: GroupId, job: seacast_core::DecodeJob<'_, Vec<u8>>) {
+        self.to_decode.push((group, job.t, *job.shape, job.given, job.chunks.to_vec()));
     }
     fn deliver(&mut self, group: GroupId, payload: Vec<u8>) {
         self.delivered.push((group, payload));
@@ -188,8 +189,19 @@ impl World {
             );
             verified += 1;
         }
-        for group in std::mem::take(&mut self.env.to_decode) {
-            self.node.decode_group(group, &mut self.env, &mut self.catalog, &mut self.rng);
+        // Level 2 away from the node: only the result goes back to it.
+        for (group, t, shape, given, chunks) in std::mem::take(&mut self.env.to_decode) {
+            let mut rebuilt = PreallocVec::with_capacity(shape.n as usize);
+            let object = self.catalog.decode(t, &group, &chunks, &shape, &mut rebuilt);
+            self.node.on_decoded(
+                group,
+                given,
+                object,
+                rebuilt.as_slice(),
+                &mut self.env,
+                &mut self.catalog,
+                &mut self.rng,
+            );
         }
         verified
     }

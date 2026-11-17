@@ -4,37 +4,35 @@ Working notes for whoever picks this up next. Nothing here is decided unless it 
 
 ## Integration into Silver (network and control tiles)
 
-The intended split, discussed but not designed in detail and not checked against Silver's code:
+The node runs in the network tile, with its send queues. Decided; not checked against Silver's code.
 
-- **Control tile:** `SeacastNode` and the catalog's `Domain` and `Policy`.
-- **Network tile:** the per-peer send queues (the state `SendQueues` holds: lanes, owed offers and answers, the byte window), next to the existing per-peer outbound gossip queues. Received chunks are written to tcache there, and the stateless part of level 1 runs inline, so the network tile links `seacast-codec`.
+- **Network tile:** `SeacastNode` (with `SendQueues`), the catalog, and the writer that calls `next_to_send`. Received chunks are written to tcache there, so the tile links `seacast-codec`.
+- **Other threads:** level 2 (`start_decode` hands the job, `on_decoded` takes the result) and the domain's verdict (`Domain::authenticate` answers `Defer` on a cache miss, the host calls `on_groups_authenticated` when the verdict is cached).
 
-What this needs from seacast-rs:
+What the host must hold to:
 
-- **`on_write` is split for such a host: `on_written`.** `on_write` filters the item (drop a chunk the peer now holds, drop asks now held or gated) and applies the effects of the write (start an ask's promise, record a chunk as sent, update the source's paced holding). Across tiles these are two one-way flows:
-  - control to network: the cancel callbacks that exist (`cancel_chunk`, `cancel_asks`, `cancel_group`), so the network tile needs only an index of its queued items by (peer, group, index), not a copy of the peer's holdings;
-  - network to control: a "written" event per item with the write's timestamp, which the host passes to `SeacastNode::on_written`, so a promise starts from the real write time.
-  A cancel that loses the race with a write costs one redundant chunk. Not done on this path: projection (`[c12]`), since it reads the peer's holdings at the moment of the write. Whether control should apply it when it hands the item over is open.
-- **Level 1 in the network tile is two of its three steps:** the codec check and the Merkle proof need only the chunk and static per-type configuration; the domain step needs consensus state and stays in control. This runs the proof before the domain step, the reverse of the specification's cost order. Judged acceptable (the proof is cheap and bounded by bytes received; a forged group still fails at the domain step), not measured under attack traffic. The control tile's catalog then answers `true` and `Accept` for the codec steps, and the `Pending` path is unused.
-- **Receive-side deduplication in the network tile: not at first.** It needs the seen-id set, and a duplicate must still reach control because its sender is owed a HAVE. A small seen cache that turns a duplicate into an event without payload is a possible later step.
+- **`B` must be `Send`, and a chunk's bytes must stay valid until `on_decoded`.** The decode job carries buffer handles to another thread. The core checks neither.
+- **`Domain` is a cache in the network tile.** `authenticate`, `authenticable`, `deadline` and `sample_scope` are called on the node's thread. `on_groups_authenticated` calls `authenticate` again, so the verdict must be cached before that call.
+- **Chunks of a group wait while its verdict is pending**, bounded by the `DeferredStore` and by `max_pending_groups` a peer. A slow verdict therefore drops chunks. Not measured.
+- **A decode works on the chunks held when it was started.** Chunks that arrive during the decode are stored and not decoded from. `on_decoded` after the group has expired is ignored. A second `on_decoded` for one group is not guarded against.
+- **`start_decode` clones the handles of the chunks held into the node's scratch**, and a host that decodes on the node's thread through `decode_group` collects them a second time.
 - **The byte window is node-wide.** It works as is only if one network tile owns all peers. With peers spread over several tiles it must be split or shared.
 
-Questions that need Silver's code read (the outbound queue of the network tile, and tcache):
+Questions that need Silver's code read (tcache):
 
 - **Chunk lifetime in tcache.** The node keeps a handle for the group's whole life, to serve late asks and to decode from any K chunks. If tcache can overwrite an entry before the group ends, the handle dangles. Either tcache is sized for the worst case over a group's lifetime, or accepted chunks are copied into a per-group slot store, which the codec's in-place functions (`complete_in_place`, `body_into`) already support.
-- **Where decode runs.** It takes milliseconds a group and belongs in neither tile's hot loop. `RuntimeEnv::start_decode` is the hook for handing it to a worker.
 
 ## Open design questions in the core
 
 - **A group that is not open has the type its first namer gave it.** HAVE and WANT carry their group's type, and the node keeps it (`Group::named_t`) until a chunk opens the group. It is not authenticated: a peer that names a group with a wrong type first makes the node treat the group with that type's parameters, and ignore other peers' messages for it, until a chunk arrives or the record expires. `Policy::type_of_group` remains for a group the node keeps nothing of, and for the groups a chunk projects onto.
 - **One catalog object implements all three traits.** `PayloadCatalog` therefore forwards every `TypeCodec` method to its `SegmentedCodec`. Passing codec, domain and policy to the node as separate arguments would remove the forwarding and change every entry point's signature.
 - **No catalog composes several types.** `SegmentedCodec` and `StandaloneCodec` are each one type's `TypeCodec`; a host with several types dispatches on `ChunkMsg::type_id` itself. A node joins at most `MAX_JOINED_TYPES`.
-- **Cost with many types is not measured.** A host with a type per subnet joins up to about 200. `maintain_relations` and the heartbeat's gossip walk every joined type, `joined_types()` returns `MAX_JOINED_TYPES` ids by value, and the per (peer, type) tables are sized `max_peers * max_types`.
+- **Cost with many types is not measured.** A host with a type per subnet joins up to about 200. `maintain_relations` and the heartbeat's gossip walk every joined type, `joined_types()` returns `MAX_JOINED_TYPES` ids by value, and each connection's record holds three maps sized `max_types`.
 - **A chunk's context is in every chunk.** A type whose context is long (a column's commitments) pays it N times. `protocol-v2.md` sends a header once a group and link; not done here.
-- **A cancelled push leaves an offer owed** through `owe_offer`. Whether the node should send that offer itself was left open.
+- **A cancelled push leaves an offer owed** through `SendQueues::owe`. Whether the node should send that offer itself was left open.
 - **A popped chunk must get a verdict.** A host that takes a chunk from `pop_unverified` and never calls `on_validated` leaves its id in `verifying` until the group ends, and other copies are refused meanwhile. There is no timeout.
 - **A deadline is fixed when first asked**, and a group known only from offers has none until its first chunk.
-- **Memory.** The per (peer, group) table is the largest. Ideas not tried: peer lists held inline, a dense index for pairs. Memory has not been measured again since the core became domain-agnostic.
+- **Memory.** The per (peer, group) table is the largest. Ideas not tried: peer lists held inline, a dense index for pairs. `cargo run --release -p seacast-core --example node_size` prints the heap a node holds after `new`. Most of it is the send queues: three lanes of `max_queue_entries_per_peer` entries and two maps of `max_groups` bitmaps for every peer id, allocated whether the peer is connected or not. An entry is as wide as a control message with its bitmap, also when it stands for a chunk.
 
 ## `data_only_root`
 
@@ -61,6 +59,58 @@ An experiment behind a cargo feature of `seacast-codec` (README, "Where this dif
 - **Recovery is still by matrix.** Its cost grows with the chunks lost; a transform-based erasure decode would bound it. Not tried.
 - **`gfni::row` is `#[inline]`** because adding the FFT module stopped it being inlined into `combine`, which slowed recovery. The other kernels' `row` were already out of line and are unchanged.
 
+## The specification's v0.10 changes
+
+`informed-diffusion-spec` moved from v0.8 to v0.10.1 (2026-11-15). The README's first departure lists what is applied and what is not. Open on what is applied:
+
+- **The asker's side of the marked probe has no test of its own.** The claimant's side has one in `crates/seacast-core/tests/limits.rs`; the asker's verdict, its kept promise and its probe held in the queue are exercised only by the simulator's row setting, whose summary they left unchanged.
+- **`probe_answers` shares `max_groups` as its capacity** and has no limit test of its own: an asker can add one entry per group it probes, which the per-peer limit on groups bounds.
+- **The simulator's row setting now starts its asks after one second** (`START_DELAY`, decided in §6.3), so its latencies are a second longer than in earlier summaries.
+
+- **The relation upkeep is not run by the simulator**, which writes its relations into the sets at setup. The answered GRAFT, the backoff and the owed messages are covered by one test in `crates/seacast-core/tests/limits.rs`, with one peer; two nodes grafting each other have not been run against each other.
+- **`SendQueues` owes at most `max_queue_entries_per_peer` relation messages a peer**, and drops the newest beyond that.
+- **`PRUNE_BACKOFF` defaults to 12 seconds.** The draft gives it no value, only bounds.
+- **`plan_refused` holds a source's refused pushes** until their group expires, sized by `max_stored_chunks`. Full, a refused push is offered a second time at its acknowledgement.
+
+Open on the floors, the sampler and the rest of §4.1:
+
+- **`link_deficits` is called by nothing here.** The simulator opens no links. It is covered by one test in `crates/seacast-core/tests/limits.rs`. Silver's host is to poll it and to subtract the links it has opened that are not joined yet.
+- **`reset_period` is called by nothing here.** The simulator runs one block. Silver's host is to call it at the slot boundary.
+- **`NodeConfig::order_key` defaults to zero.** The host must draw it. The hash under it is `fxhash`, which is not cryptographic: a peer that learned many of the node's choices could recover the key. Nothing on the wire carries them.
+- **The keyed order of the announcers has no test.**
+- **The symmetric relation is covered by one test with scripted peers.** No simulator setting uses a symmetric type.
+- **The sampler's second phase, its peer of high custody and its limit in flight are covered by one test.** The simulator's sampling setting reaches the first phase and routed requests of one step; `ROUTE_HOPS` above one has not been run.
+- **The simulator's sampling setting scopes "one sample per peer" by block** (`Domain::sample_scope`), and its interest check now counts pushes only: an answer to a forwarder's own WANT is outside its interest by design (§4.5).
+- **`sampled_from` and `held_samples` share `max_asks` as their capacity, `samples_in_flight` shares `max_groups`, `forwarded` `max_peers`.** They hold the node's own asks, except `forwarded`, which a peer fills with one entry. Full, a sample is reported unreachable.
+- **A set of peers is named, not copied.** `PeerSet` says how a set is read from the node's bitmasks (`links`, `in_pushers`, `out_pushees`, `suppression_scope`, `source_pool`, a chunk's standing requests, a group's claimants). `SeacastNode::walk` and `for_each` read it a word at a time and hand the node to a closure for each peer; `peers_of`, `count` and `in_set` read it without one. A change the closure makes to the set it walks counts for the words not yet read: no loop body does that today.
+- **Where a set is ordered or sampled it is written to a scratch list in the node**, with room for every peer (`peer_scratch`, `shuffle_scratch`, `push_scratch`): `choose_push`, the heartbeat's gossip sample, the repair shuffles, and the pruning of a symmetric relation. The list is taken out of the node while in use and must be put back: a path that returns without it leaves the scratch empty, and the next use then keeps no peer.
+- **One peer is picked by two passes**, a count and a walk to the peer drawn (`choose_one`): the same draw as `RngSource::choice` over the list, which is not made. The announcer to ask is picked in one pass by its rank (`pick_announcer`).
+- **Lists of a fixed length that remain:**
+  - `Policy::repair_to` returns a list of 64: a host's own choice of repair targets is cut there.
+  - A source's plan keeps `MAX_PLAN_TARGETS` (8) targets a chunk, and an ask's offer list `max_offers_per_ask`: both bound by design, not by the peers.
+- **`choose_push` orders its candidates with an unstable sort over a total key**, where it sorted twice with a stable sort. The stable sort allocates past a short length, which the allocation test did not reach.
+- **A claimant to probe is drawn in peer id order**, not in the order the claims came. The simulator's summary did not move.
+- **Peer lists are now in peer id order**, not the order of connection. The simulator connects in id order, so its summary did not move; a host that connects in another order draws its targets from lists in another order.
+- **Walks over the peers that remain**, none on the chunk path: `maintain_relations` (the relations held one way), `repair_candidates`, the heartbeat's choice of gossip targets, `disconnect_peer` (a pass over each table) and group expiry.
+- **`max_relations` now bounds the keys (type, family, colour) with a relation, a direction, not the relations.** Each key holds a bitmask of `max_peers` bits. The relations of one link are still bounded by `max_relations_per_link`.
+- **A group's offers and holdings need a row in the pair table's index**, sized `max_groups + max_peers * max_pending_groups` rows and at most `max_pairs`. Past that an offer or a holding of a new group is not kept, as with a full pair table.
+- **The writer still scans its own queue**: `choose_normal_index` reads the normal lane up to three times a write, with a `holders` lookup a chunk.
+- **`family_word` reads a row a colour**: a type of many colours costs that many lookups a word of the bitmask, a chunk. Not measured.
+- **The slab holds the state keyed by the peer alone or by peer and type** (`Peer`), and the send queue has a slab of its own in `SendQueues`. The tables keyed by peer and something unbounded per peer are still global maps: the relations (`push_*`, `grafted_*`, `backoff`), `pairs`, `tied`, `named`, `serve_count`, `unwanted`, `probe_answers`, `plan_refused`, `sampled_from`, `rsample_asked`, `sends.sent`. Moving them into the slot changes their capacity from one shared budget to the worst case of every peer, and makes the reads across peers (`forward` over a family's relations) a walk over the slots. Not measured either way.
+- **A connection past `max_peers` is no longer refused by the node.** A peer id out of range panics; the host admits connections.
+- **`forwarded` is keyed by `NodeId` with capacity `max_peers`.** Nodes that connect, route one request and leave fill it within a period; routed requests of a node without a count are then refused until `reset_period`.
+- **`tried` and `promises` (`AskPeers`) are one flat map each, by ask and peer,** with a bitmask of peers an ask so that an arriving chunk closes its records without a scan. Each is bounded twice: `max_ask_peers` records in the node and `max_asks_per_peer` for one peer. Open points:
+  - **The bound per peer delays a pull from one announcer.** An offer of more chunks than the bound makes that many asks; the rest wait for the heartbeat, which retries them while the peer's records are still open. The default bound is one group's indices (`MAX_BITMAP_BITS`), so a pull of one whole group from one announcer is not cut; asks of several groups open at one peer can be. The specification's own limit, `MAX_IHAVE_LENGTH`, counts asks per heartbeat and is above the default bound. The simulator's settings do not reach either bound, so this delay is not measured.
+  - **A retry does not pass over a full peer.** `pick_announcer` can pick an announcer whose records are full; the ask is then held to the next heartbeat although another announcer may have room.
+  - **A probe that cannot record its promise is not sent** and the decode is not deferred.
+  - **Closing a connection scans the two maps** if the peer has a record. A group's end scans them always.
+  - **A refused record is not logged or counted.** The core has no log.
+- **`kept_parks` is bounded by `max_kept_parks`.** Full, a park is not kept and the node's next connection starts without it. Entries past their end go at the next connect or disconnect, and with their group.
+- **A chunk whose verdict comes after its connection closed is dropped unseen**, also when the verdict is `Accept`: the proof check is spent and the chunk must come again. Chunks of a closed connection still in `unverified` are handed to the host all the same. Both could be avoided by taking the chunk with no sender.
+- **`PromiseDue` and `WindowTimeout` carry a plain `PeerId`.** Their `at_bits` is the guard: a closed connection's entry is gone, and the next connection's has another time. Two connections of one peer id that make the same ask at the same clock reading are not told apart.
+- **A forwarder's WANT for a routed request starts no timer.** If the next hop never answers, the standing request it kept for the asker goes with the group.
+- **`TimerEvent::Resample` changed shape**: one index, an optional peer and the phase. A host only passes it back.
+
 ## Level 2 hashing
 
 - **Four leaves at a time on SHA-NI matched the 16-lane AVX-512 kernel on full batches** on the one machine tried (Zen 5), so `sha256/x16.rs` could go there. Not measured on an Intel core, where the SHA-NI rounds may not overlap as well; the 16-lane kernel stays until it is.
@@ -74,7 +124,7 @@ An experiment behind a cargo feature of `seacast-codec` (README, "Where this dif
 - `projected`, `valid_have`, `tie_room` and `interest_satisfied` keep an unused `_catalog` parameter.
 - `tied` and `tied_bits` appear to hold the same thing since ties became keyed by group; check and merge.
 - `tied_to_root` keeps the specification's name though the core has no root.
-- The doc comment on `RuntimeEnv::owe_offer` says "an offer the host refused"; it is also called for a refused chunk push and a cancelled push.
+- `SendQueues`' methods are still `pub`, as when a host kept the queues. Only `connect`, `disconnect` and the queue's state need to be seen outside `seacast-core`, the last by the tests.
 - `build_chunks` copies each data segment into a frame with its header and proof: one extra copy of the body at the publisher. The benchmark does not cover it.
 
 ## Tests and simulator

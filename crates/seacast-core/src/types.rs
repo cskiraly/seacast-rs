@@ -15,6 +15,30 @@ pub type GroupId = Bytes32;
 /// Peer identifier in the state machine.
 pub type PeerId = u64;
 
+/// A `PeerId` with the generation of its connection in the high 32 bits. The
+/// node gives it out with what comes back to it later (a timer, a chunk to
+/// verify), and takes nothing back for a connection that has closed since,
+/// though another has its peer id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GenerationPeerId(u64);
+
+impl GenerationPeerId {
+    #[inline]
+    pub const fn new(peer: PeerId, generation: u32) -> Self {
+        Self((generation as u64) << 32 | peer & 0xffff_ffff)
+    }
+
+    #[inline]
+    pub const fn peer_id(self) -> PeerId {
+        self.0 & 0xffff_ffff
+    }
+
+    #[inline]
+    pub const fn generation(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
+}
+
 /// 32-byte cryptographic node identifier (`node_id(p)` in `protocol-v2.md`).
 pub type NodeId = Bytes32;
 
@@ -159,6 +183,18 @@ impl Ask {
     }
 }
 
+/// Links a node is to keep to peers whose interest holds `family`, beyond the
+/// relation floor: a repair, source or coverage floor (`protocol-v2.md` §1.3,
+/// §4.6, §4.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LinkFloor {
+    pub family: FamilyId,
+    pub links: usize,
+    /// A peer of high custody counts for at most `COVER_HIGH` of the type's
+    /// floors that set this (the coverage floor).
+    pub diverse: bool,
+}
+
 /// Per-object-type protocol parameters (`protocol-v2.md` §1.1 `TypeParams`,
 /// §6.3).
 #[derive(Debug, Clone)]
@@ -177,6 +213,12 @@ pub struct TypeParams {
     pub d_out_fast: usize,
     /// Maximum out-pushees accepted per family and colour (`D_OUT_MAX`).
     pub d_out_max: usize,
+    /// One relation both ways per family and colour, grafted and pruned with
+    /// `BOTH` (`SYMMETRIC`, §4.1).
+    pub symmetric: bool,
+    /// Families a peer of high custody counts for in a floor that asks for
+    /// diversity (`COVER_HIGH`, §1.3, `[D12]`).
+    pub cover_high: usize,
     /// Announce width beyond the relation (`ANNOUNCE_EXTRA`, `[D5]`).
     pub announce_extra: AnnounceWidth,
     /// Whether chunks of this type are pushed eagerly (`EAGER`; `false` for
@@ -193,9 +235,24 @@ pub struct TypeParams {
     pub start_delay: f64,
     /// Maximum chunks served per peer and group (`SERVE_LIMIT`, `R6`).
     pub serve_limit: usize,
+    /// Seconds after a PRUNE this node receives during which it does not graft
+    /// that peer again for the relation the PRUNE named (`PRUNE_BACKOFF`).
+    pub prune_backoff: f64,
     /// Seconds a sampler waits for a standing `Want` before retrying another
     /// peer (`SAMPLE_RETRY`, §4.10).
     pub sample_retry: f64,
+    /// Seconds a sampler waits on each later peer (`SAMPLE_RETRY2`, §4.10,
+    /// `[D12]`).
+    pub sample_retry2: f64,
+    /// A sampler's later asks in flight per scope (`SAMPLE_OUTSTANDING`,
+    /// §4.10, `[D12]`). At least 1.
+    pub sample_outstanding: usize,
+    /// Forwarding steps a sampler's routed request may take (`ROUTE_HOPS`,
+    /// §4.10, `[D12]`).
+    pub route_hops: u8,
+    /// Routed requests passed on per asking peer between two calls of
+    /// `SeacastNode::reset_period` (`FORWARD_LIMIT`, §4.5, X6).
+    pub forward_limit: usize,
     /// Seconds an offer's promise runs before a broken one parks the peer for
     /// the group (`PROMISE = 0.400s`, `[c5]`; per object type,
     /// `protocol-v2.md` §6.3).
@@ -223,13 +280,20 @@ impl Default for TypeParams {
             d_out: 8,
             d_out_fast: 8,
             d_out_max: 12,
+            symmetric: false,
+            cover_high: 1,
             announce_extra: AnnounceWidth::Sample,
             eager: true,
             repair_budget: false,
-            defer_window: 0.5,
+            defer_window: 1.0,
             start_delay: 0.0,
             serve_limit: usize::MAX,
+            prune_backoff: 12.0,
             sample_retry: 2.0,
+            sample_retry2: 0.5,
+            sample_outstanding: 4,
+            route_hops: 1,
+            forward_limit: 1,
             promise: 0.400,
             repair_sample: None,
             sample_wait: 0.0,
@@ -285,6 +349,9 @@ pub struct NodeConfig {
     pub window_timeout: f64,
     /// Heartbeat period in seconds (`HEARTBEAT = 0.700s`).
     pub heartbeat: f64,
+    /// Secret of this node's order of the announcers beyond an ask's list,
+    /// drawn by the host at start and never sent (`protocol.md` §6.1).
+    pub order_key: u64,
     /// Minimum non-related gossip peers (`D_LAZY = 6`).
     pub d_lazy: usize,
     /// Fraction of non-related eligible peers sampled for gossip
@@ -318,6 +385,9 @@ pub struct NodeConfig {
     /// Maximum pending (unauthenticated) groups tracked per peer
     /// (`MAX_PENDING_GROUPS`, §8.2).
     pub max_pending_groups: usize,
+    /// Maximum asks with a tried record, and with an open promise, per peer
+    /// (one group's indices). Not in the specification.
+    pub max_asks_per_peer: usize,
     /// Maximum announcers in the ordered offer list per ask (`16`, §6.1, §8.2).
     pub max_offers_per_ask: usize,
     /// Maximum ordered offer lists a single peer may appear in (`256`, §6.1,
@@ -358,7 +428,8 @@ pub struct NodeConfig {
 /// protocol execution performs no heap allocation.
 #[derive(Debug, Clone, Copy)]
 pub struct CapacityConfig {
-    /// Maximum connected peers (`64`).
+    /// Maximum connected peers (`64`). Every `PeerId` is below it: the
+    /// per-connection records are indexed by peer id.
     pub max_peers: usize,
     /// Maximum object types (`8`).
     pub max_types: usize,
@@ -382,6 +453,11 @@ pub struct CapacityConfig {
     pub max_deferred_chunks: usize,
     /// Maximum queue entries per peer lane (`512`).
     pub max_queue_entries_per_peer: usize,
+    /// Maximum parks kept of nodes not connected (`1024`).
+    pub max_kept_parks: usize,
+    /// Maximum (ask, peer) records in each of the tried and promise tables
+    /// (`4096`).
+    pub max_ask_peers: usize,
 }
 
 impl Default for CapacityConfig {
@@ -398,6 +474,8 @@ impl Default for CapacityConfig {
             max_seen_ids: 8192,
             max_deferred_chunks: 1024,
             max_queue_entries_per_peer: 512,
+            max_kept_parks: 1024,
+            max_ask_peers: 4096,
         }
     }
 }
@@ -423,6 +501,7 @@ impl Default for NodeConfig {
             chunk_bytes: 12_000,
             window_timeout: 0.500,
             heartbeat: 0.700,
+            order_key: 0,
             d_lazy: 6,
             gossip_factor: 0.25,
             gossip_retransmission: 3,
@@ -435,6 +514,7 @@ impl Default for NodeConfig {
             tombstone_ttl: 30.0,
             max_relations_per_link: 256,
             max_pending_groups: 64,
+            max_asks_per_peer: crate::bitmap::MAX_BITMAP_BITS,
             max_offers_per_ask: 16,
             max_listed_per_peer: 256,
             cancel_enabled: true,

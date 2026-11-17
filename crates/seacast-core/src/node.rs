@@ -1,19 +1,22 @@
 use crate::{
     bitmap::{Bitmap, MAX_BITMAP_BITS},
     collections::{
-        InlineVec, MAX_ENTRY_CONTROL, MAX_INLINE_OFFERS, MAX_INLINE_PEERS, PreallocDeque,
+        InlineVec, MAX_ENTRY_CONTROL, MAX_INLINE_OFFERS, PeerSets, PeerSlab, PreallocDeque,
         PreallocMap, PreallocSet, PreallocVec,
     },
-    message::{ChunkMsg, Join, Prune, Queued, Rpc, Want},
-    state::{AskPeers, GossipHistory, Groups, MAX_GOSSIP_GROUPS, Pairs},
+    message::{ChunkMsg, Control, Join, Queued, Rpc, Want},
+    queue::SendQueues,
+    state::{AskPeers, GossipHistory, Groups, MAX_GOSSIP_GROUPS, Pairs, Peer, PushCand, Relations},
     traits::{ChunkBuffer, DeferredStore, ObjectCatalog, RngSource, RuntimeEnv, TimerEvent},
     types::{
-        Ask, ChunkId, Colour, FamilyId, GroupId, GroupState, NodeConfig, PeerId, Timestamp, TypeId,
+        Ask, ChunkId, Colour, FamilyId, GenerationPeerId, GroupId, GroupState, NodeConfig, NodeId,
+        PeerId, Timestamp, TypeId,
     },
 };
 
 /// A paced gossip send: the peer, the groups and indices, and when it is due.
-pub type PacedGossip = (PeerId, InlineVec<(GroupId, Bitmap), MAX_GOSSIP_GROUPS>, Timestamp);
+pub type PacedGossip =
+    (GenerationPeerId, InlineVec<(GroupId, Bitmap), MAX_GOSSIP_GROUPS>, Timestamp);
 
 /// Standalone `sans-io` state machine for a SEACAST v2 node (`protocol-v2.md` +
 /// `protocol.md` v0.8).
@@ -25,17 +28,32 @@ pub type PacedGossip = (PeerId, InlineVec<(GroupId, Bitmap), MAX_GOSSIP_GROUPS>,
 pub struct SeacastNode<B> {
     pub config: NodeConfig,
 
+    /// The per-peer send queues and the byte window (`protocol-v2.md` §4.11,
+    /// §4.12).
+    pub sends: SendQueues,
+
     // Connected peers in deterministic registration order
     pub peers: PreallocVec<PeerId>,
+    /// A record a connection, indexed by `PeerId`: the host keeps peer ids
+    /// below `max_peers`.
+    pub slots: PeerSlab<Peer>,
+    /// The parks of a node whose connection closed, until their end: a
+    /// `PeerId` is a connection's, and a park outlives it (`protocol.md`
+    /// §8.1).
+    pub kept_parks: PreallocMap<(NodeId, GroupId), Timestamp>,
 
     // Per link and object type (`protocol-v2.md` §3)
-    pub join_recv: PreallocMap<(PeerId, TypeId), Join>,
-    pub join_sent: PreallocMap<(PeerId, TypeId), Join>,
-    pub push_out: PreallocSet<(PeerId, TypeId, FamilyId, Colour)>,
-    pub push_in: PreallocSet<(PeerId, TypeId, FamilyId, Colour)>,
-    /// The relations of each link in `push_in` and in `push_out`, for the
-    /// per-link limit.
-    pub(crate) relation_count: PreallocMap<(PeerId, TypeId), (usize, usize)>,
+    pub push_out: Relations,
+    pub push_in: Relations,
+    /// The peers linked for each type: both JOINs have crossed (`links(T)`).
+    pub(crate) linked: PeerSets<TypeId>,
+    /// Our GRAFTs not yet answered: "push me" and "I will push you". They count
+    /// for nothing until the peer's yes (`protocol-v2.md` §4.1).
+    pub grafted_in: PreallocSet<(PeerId, TypeId, FamilyId, Colour)>,
+    pub grafted_out: PreallocSet<(PeerId, TypeId, FamilyId, Colour)>,
+    /// Until when a relation a peer's PRUNE ended is not grafted again; `true`
+    /// for our "push me" (`backoff`).
+    pub backoff: PreallocMap<(PeerId, TypeId, FamilyId, Colour, bool), Timestamp>,
 
     // Per group state (`protocol-v2.md` §3, `protocol.md` §8.1)
     /// Per group state (`protocol-v2.md` §3, `protocol.md` §8.1), a record a
@@ -50,24 +68,22 @@ pub struct SeacastNode<B> {
     /// `peer_has`, `pushed`, `sent_to`, `served`, `want_p`, `offered` and
     /// `park`, a record a pair.
     pub pairs: Pairs,
-    pub holders: PreallocMap<(GroupId, u32), InlineVec<PeerId, MAX_INLINE_PEERS>>,
+    /// The peers known to hold each chunk.
+    pub holders: PeerSets<(GroupId, u32)>,
     pub serve_count: PreallocMap<(PeerId, ChunkId), usize>,
     pub unwanted: PreallocSet<(PeerId, ChunkId)>,
-    pub standing: PreallocMap<(GroupId, u32), InlineVec<PeerId, MAX_INLINE_PEERS>>,
+    pub standing: PeerSets<(GroupId, u32)>,
+    /// The peers that claim each group whole (`claims`).
+    pub claims: PeerSets<GroupId>,
 
     // Pull discipline, offer ledger, promises, and parking (`protocol.md` §6.1, §8.1)
     pub offers: PreallocMap<Ask, InlineVec<PeerId, MAX_INLINE_OFFERS>>,
-    pub listed_count: PreallocMap<PeerId, usize>,
     pub tried: AskPeers<Timestamp>,
     pub asked_at: PreallocMap<Ask, Timestamp>,
     pub promises: AskPeers<u64>,
-    pub asked_parked: PreallocMap<(GroupId, u32), InlineVec<PeerId, MAX_INLINE_PEERS>>,
+    pub asked_parked: PeerSets<(GroupId, u32)>,
     pub last_resort_armed: PreallocSet<(GroupId, u32)>,
     pub retry_armed: PreallocSet<Ask>,
-    pub ihave_rpcs: PreallocMap<PeerId, usize>,
-    pub ihave_asked: PreallocMap<PeerId, usize>,
-    /// Chunks served to each peer's asks this heartbeat.
-    pub(crate) served_now: PreallocMap<PeerId, usize>,
     pub held_back: PreallocMap<(GroupId, u32), Ask>,
     /// Groups with offers taken in over the IHAVE limits: their asks are the
     /// next heartbeat's.
@@ -78,6 +94,25 @@ pub struct SeacastNode<B> {
 
     // Claims, deferral, probe, and IncrementalDAS repair sampling (`protocol-v2.md` §3, §4.6)
     pub probe_asks: PreallocSet<Ask>,
+    /// As a claimant: answers to probes, by the chunk's own group and index,
+    /// until they are written (`protocol-v2.md` §4.6 `probe_answers`).
+    pub probe_answers: PreallocSet<(PeerId, GroupId, u32)>,
+    /// The peers asked for a sample, by the sample's scope, one each, until
+    /// the time kept (`protocol-v2.md` §4.10 `sampled_from`, I6).
+    pub sampled_from: PreallocMap<(GroupId, PeerId), Timestamp>,
+    /// Second-phase sample asks waiting, by scope (`samples_in_flight`).
+    pub samples_in_flight: PreallocMap<GroupId, usize>,
+    /// Samples held back by `SAMPLE_OUTSTANDING`: scope, group, index
+    /// (`held_samples`).
+    pub held_samples: PreallocDeque<(GroupId, GroupId, u32)>,
+    /// Routed requests of a node passed on since `reset_period`
+    /// (`protocol-v2.md` §4.5 `forwarded`, X6). By node, so that connecting
+    /// again does not reset the count.
+    pub forwarded: PreallocMap<NodeId, usize>,
+    /// As a source: the pushes planned at `publish` that were not made, and so
+    /// are owed. With the pushes made, the plan (`protocol-v2.md` §4.7
+    /// `planned`): whom a chunk is not offered at its acknowledgement.
+    pub plan_refused: PreallocSet<(PeerId, GroupId, u32)>,
     pub rsample_asked: PreallocSet<(GroupId, u32, PeerId)>,
 
     // Gate deferral & equivocation ties (`protocol.md` §4.2)
@@ -89,22 +124,30 @@ pub struct SeacastNode<B> {
     /// Chunks that passed the inline checks, for the host to verify, and their
     /// ids until the verdict is in: a second copy meanwhile is not verified
     /// again.
-    pub(crate) unverified: PreallocDeque<(PeerId, ChunkMsg<B>)>,
+    pub(crate) unverified: PreallocDeque<(GenerationPeerId, ChunkMsg<B>)>,
     pub verifying: PreallocSet<ChunkId>,
     pub tied: PreallocMap<(PeerId, GroupId), Bitmap>,
     /// `tied` by peer and group, over every root, and the number of ties of
     /// each peer: what the per-index and per-chunk checks read.
     pub(crate) tied_bits: PreallocMap<(PeerId, GroupId), Bitmap>,
-    pub(crate) tie_count: PreallocMap<PeerId, usize>,
     /// Groups without a header that a peer has named, with the heartbeats each
     /// has left, and their number per peer (`MAX_PENDING_GROUPS`,
     /// `protocol.md` §8.2).
     pub(crate) named: PreallocMap<(PeerId, GroupId), u32>,
-    pub(crate) named_count: PreallocMap<PeerId, usize>,
 
     pub gossip_history: GossipHistory,
     pub pace_queue: PreallocDeque<PacedGossip>,
     pub pace_timer_active: bool,
+
+    /// Scratch for a set of peers that is ordered or sampled: room for every
+    /// peer. Taken out of the node while in use.
+    pub(crate) peer_scratch: PreallocVec<PeerId>,
+    /// A second such scratch, for an order made anew from the first.
+    pub(crate) shuffle_scratch: PreallocVec<PeerId>,
+    /// The mark of the pass in progress over peers (`Peer::mark`).
+    pub(crate) mark: u64,
+    /// Scratch for the candidates of a push while they are ordered.
+    pub(crate) push_scratch: PreallocVec<PushCand>,
 
     // Preallocated scratch buffers for Level 2 decode (`decode_group`)
     pub(crate) decode_in_scratch: PreallocVec<ChunkMsg<B>>,
@@ -116,40 +159,58 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     /// fixed-capacity state tables.
     pub fn new(config: NodeConfig) -> Self {
         let cap = &config.capacities;
-        let peer_types = cap.max_peers * cap.max_types;
         let peer_asks = cap.max_peers * 64;
 
         Self {
             peers: PreallocVec::with_capacity(cap.max_peers),
-            join_recv: PreallocMap::with_capacity(peer_types),
-            join_sent: PreallocMap::with_capacity(peer_types),
-            push_out: PreallocSet::with_capacity(cap.max_relations),
-            push_in: PreallocSet::with_capacity(cap.max_relations),
-            relation_count: PreallocMap::with_capacity(peer_types),
+            slots: PeerSlab::with_capacity(cap.max_peers, || Peer::with_capacity(cap.max_types)),
+            kept_parks: PreallocMap::with_capacity(cap.max_kept_parks),
+            push_out: Relations::with_capacity(cap.max_relations, cap.max_peers),
+            push_in: Relations::with_capacity(cap.max_relations, cap.max_peers),
+            linked: PeerSets::with_capacity(cap.max_types, cap.max_peers),
+            grafted_in: PreallocSet::with_capacity(cap.max_relations),
+            grafted_out: PreallocSet::with_capacity(cap.max_relations),
+            backoff: PreallocMap::with_capacity(cap.max_relations),
             groups: Groups::with_capacity(cap.max_groups),
             chunks: PreallocMap::with_capacity(cap.max_stored_chunks),
             known_id: PreallocMap::with_capacity(cap.max_stored_chunks),
             tombstones: PreallocMap::with_capacity(cap.max_groups),
-            pairs: Pairs::with_capacity(cap.max_pairs, cap.max_wide_pairs),
-            holders: PreallocMap::with_capacity(cap.max_stored_chunks),
+            pairs: Pairs::with_capacity(
+                cap.max_pairs,
+                cap.max_wide_pairs,
+                cap.max_pairs.min(cap.max_groups + cap.max_peers * config.max_pending_groups),
+                cap.max_peers,
+            ),
+            holders: PeerSets::with_capacity(cap.max_stored_chunks, cap.max_peers),
             serve_count: PreallocMap::with_capacity(cap.max_seen_ids),
             unwanted: PreallocSet::with_capacity(cap.max_seen_ids),
-            standing: PreallocMap::with_capacity(cap.max_asks),
+            standing: PeerSets::with_capacity(cap.max_asks, cap.max_peers),
+            claims: PeerSets::with_capacity(cap.max_groups, cap.max_peers),
             offers: PreallocMap::with_capacity(cap.max_asks),
-            listed_count: PreallocMap::with_capacity(cap.max_peers),
-            tried: AskPeers::with_capacity(cap.max_asks),
+            tried: AskPeers::with_capacity(
+                cap.max_ask_peers,
+                config.max_asks_per_peer,
+                cap.max_peers,
+            ),
             asked_at: PreallocMap::with_capacity(cap.max_asks),
-            promises: AskPeers::with_capacity(cap.max_asks),
-            asked_parked: PreallocMap::with_capacity(cap.max_asks),
+            promises: AskPeers::with_capacity(
+                cap.max_ask_peers,
+                config.max_asks_per_peer,
+                cap.max_peers,
+            ),
+            asked_parked: PeerSets::with_capacity(cap.max_asks, cap.max_peers),
             last_resort_armed: PreallocSet::with_capacity(cap.max_asks),
             retry_armed: PreallocSet::with_capacity(cap.max_asks),
-            ihave_rpcs: PreallocMap::with_capacity(cap.max_peers),
-            ihave_asked: PreallocMap::with_capacity(cap.max_peers),
-            served_now: PreallocMap::with_capacity(cap.max_peers),
             held_back: PreallocMap::with_capacity(cap.max_asks),
             held_groups: PreallocSet::with_capacity(2 * cap.max_groups),
             expiring: PreallocSet::with_capacity(2 * cap.max_groups),
             probe_asks: PreallocSet::with_capacity(cap.max_groups),
+            probe_answers: PreallocSet::with_capacity(cap.max_groups),
+            sampled_from: PreallocMap::with_capacity(cap.max_asks),
+            samples_in_flight: PreallocMap::with_capacity(cap.max_groups),
+            held_samples: PreallocDeque::with_capacity(cap.max_asks),
+            forwarded: PreallocMap::with_capacity(cap.max_peers),
+            plan_refused: PreallocSet::with_capacity(cap.max_stored_chunks),
             rsample_asked: PreallocSet::with_capacity(peer_asks),
             seen_ids: PreallocSet::with_capacity(cap.max_seen_ids),
             pending: PreallocVec::with_capacity(cap.max_deferred_chunks),
@@ -158,14 +219,17 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             verifying: PreallocSet::with_capacity(cap.max_deferred_chunks),
             tied: PreallocMap::with_capacity(cap.max_deferred_chunks),
             tied_bits: PreallocMap::with_capacity(cap.max_deferred_chunks),
-            tie_count: PreallocMap::with_capacity(cap.max_peers),
             named: PreallocMap::with_capacity(cap.max_peers * config.max_pending_groups),
-            named_count: PreallocMap::with_capacity(cap.max_peers),
             gossip_history: GossipHistory::with_capacity(6, 3, cap.max_groups),
             pace_queue: PreallocDeque::with_capacity(cap.max_peers * 4),
             pace_timer_active: false,
+            peer_scratch: PreallocVec::with_capacity(cap.max_peers),
+            shuffle_scratch: PreallocVec::with_capacity(cap.max_peers),
+            mark: 0,
+            push_scratch: PreallocVec::with_capacity(cap.max_peers),
             decode_in_scratch: PreallocVec::with_capacity(MAX_BITMAP_BITS),
             decode_out_scratch: PreallocVec::with_capacity(MAX_BITMAP_BITS),
+            sends: SendQueues::new(config.clone()),
             config,
         }
     }
@@ -181,67 +245,85 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         E: RuntimeEnv<B>,
         C: ObjectCatalog<B>,
     {
-        // Past `max_peers` a connection gets no state: nothing is sent to it or kept of
-        // it.
-        if !self.peers.contains(&peer) && !self.peers.push(peer) {
-            return;
+        if self.slots.open(peer) {
+            let _ = self.peers.push(peer);
         }
+        self.sends.connect(peer);
+        // The node's parks return to its new connection; those past their end go.
+        let (id, now) = (catalog.node_id(peer), env.now());
+        if let Some(slot) = self.slots.get_mut(peer) {
+            slot.node_id = id;
+        }
+        let pairs = &mut self.pairs;
+        self.kept_parks.retain(|&(of, group), &mut until| {
+            if of == id && now < until {
+                pairs.set_park((peer, group), until);
+            }
+            of != id && now < until
+        });
         if send_joins {
             for t in catalog.joined_types() {
+                // Once a link and type; owed if the queue is full (§4.1 `send_join`).
                 let j = catalog.our_join(t);
-                // Recorded only once queued: a JOIN a full queue refused is sent with the
-                // peer's.
-                if self.enqueue(peer, Queued::from_join(j), true, env) {
-                    self.join_sent.insert((peer, t), j);
+                if let Some(slot) = self.slots.get_mut(peer) {
+                    slot.join_sent.insert(t, j);
                 }
+                self.relink(peer, t);
+                self.sends.send_relation(peer, Control::Join(j), env);
             }
         }
     }
 
     /// Cleans up all per-connection state when a peer disconnects
-    /// (`protocol.md` §8.1). Note: `park` is kept across reconnections as
-    /// scores are (`protocol.md` §8.1).
-    pub fn disconnect_peer<E, D>(&mut self, peer: PeerId, _env: &mut E, deferred_store: &mut D)
+    /// (`protocol.md` §8.1). Its parks are kept by node, for its next
+    /// connection.
+    pub fn disconnect_peer<E, D>(&mut self, peer: PeerId, env: &mut E, deferred_store: &mut D)
     where
         E: RuntimeEnv<B>,
         D: DeferredStore<B>,
     {
         self.peers.retain(|&q| q != peer);
-        self.join_recv.retain(|&(q, _), _| q != peer);
-        self.join_sent.retain(|&(q, _), _| q != peer);
-        self.push_out.retain(|&(q, _, _, _)| q != peer);
-        self.push_in.retain(|&(q, _, _, _)| q != peer);
-        self.relation_count.retain(|&(q, _), _| q != peer);
+        self.push_out.remove_peer(peer);
+        self.push_in.remove_peer(peer);
+        self.linked.remove_peer(peer);
+        self.grafted_in.retain(|&(q, _, _, _)| q != peer);
+        self.grafted_out.retain(|&(q, _, _, _)| q != peer);
+        self.backoff.retain(|&(q, _, _, _, _), _| q != peer);
+
+        let id = self.slots.close(peer).map(|slot| {
+            let id = slot.node_id;
+            slot.reset();
+            id
+        });
+        if let Some(id) = id {
+            let now = env.now();
+            self.kept_parks.retain(|_, &mut until| now < until);
+            for (&(q, group), until) in self.pairs.parks() {
+                if q == peer && now < until {
+                    self.kept_parks.insert((id, group), until);
+                }
+            }
+        }
 
         // Remove peer from live holders when its `peer_has` goes
         self.pairs.retain(|&(q, _)| q != peer);
-        for (_, set) in self.holders.iter_mut() {
-            set.remove_item(&peer);
-        }
+        self.holders.remove_peer(peer);
 
         self.serve_count.retain(|&(q, _), _| q != peer);
         self.unwanted.retain(|&(q, _)| q != peer);
-        self.ihave_rpcs.remove(&peer);
-        self.ihave_asked.remove(&peer);
-        self.served_now.remove(&peer);
 
-        for (_, peers) in self.standing.iter_mut() {
-            peers.remove_item(&peer);
-        }
+        self.standing.remove_peer(peer);
 
-        // Remove peer from ordered offer lists and decrement listed_count
-        self.listed_count.remove(&peer);
+        // Remove peer from ordered offer lists
         self.offers.retain(|_, list| {
             list.remove_item(&peer);
             !list.is_empty()
         });
 
         // Close promises and tried records for this peer
-        self.tried.retain(|_, q, _| q != peer);
-        self.promises.retain(|_, q, _| q != peer);
-        for (_, set) in self.asked_parked.iter_mut() {
-            set.remove_item(&peer);
-        }
+        self.tried.remove_peer(peer);
+        self.promises.remove_peer(peer);
+        self.asked_parked.remove_peer(peer);
 
         // Release deferred chunks and ties from this peer
         let mut i = 0;
@@ -257,21 +339,27 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.tied.retain(|&(q, _), _| q != peer);
         self.reindex_ties();
         self.named.retain(|&(q, _), _| q != peer);
-        self.named_count.remove(&peer);
 
         // A claim is a connection's: a gone claimant is neither probed nor counted.
+        self.claims.remove_peer(peer);
         for (_, rec) in self.groups.iter_mut() {
-            if let Some(claimants) = &mut rec.claims {
-                claimants.remove_item(&peer);
-                if claimants.is_empty() {
-                    rec.claims = None;
-                }
-            }
             if rec.probed == Some(peer) {
                 rec.probed = None;
             }
         }
         self.rsample_asked.retain(|&(_, _, q)| q != peer);
+        self.probe_answers.retain(|&(q, _, _)| q != peer);
+        self.plan_refused.retain(|&(q, _, _)| q != peer);
+        self.sampled_from.retain(|&(_, q), _| q != peer);
+        self.sends.disconnect(peer, env);
+    }
+
+    /// Starts a new period of the limits the specification counts per slot:
+    /// the routed requests passed on per peer (`FORWARD_LIMIT`,
+    /// `protocol-v2.md` §4.5). The host calls it at its slot boundary, or on
+    /// a period of its own where it has no slots.
+    pub fn reset_period(&mut self) {
+        self.forwarded.clear();
     }
 
     // =========================================================================
@@ -322,7 +410,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             if h.offer && self.linked_for(peer, h.object_type, &h.group, catalog) {
                 if !offered && !h.bits.is_empty() {
                     offered = true;
-                    *self.ihave_rpcs.entry_or_default(peer) += 1;
+                    if let Some(slot) = self.slots.get_mut(peer) {
+                        slot.ihave_rpcs += 1;
+                    }
                 }
                 for a in self.on_offer(peer, h, env, catalog, rng) {
                     match asks.iter_mut().find(|w| w.group == a.group) {
@@ -341,20 +431,20 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             }
         }
         let answers = self.on_want(peer, &wants, env, catalog);
-        let mut prunes: InlineVec<Prune, MAX_ENTRY_CONTROL> = InlineVec::new();
+        // A GRAFT's answer goes on its own, in the order of the link's relation
+        // messages (§4.1).
         for gr in rpc.grafts {
-            let batch = self.on_graft(peer, gr, env, catalog);
-            prunes.extend_from_slice(&batch);
+            self.on_graft(peer, gr, env, catalog);
         }
         for pr in rpc.prunes {
-            self.on_prune(peer, pr);
+            self.on_prune(peer, pr, env, catalog);
         }
         for h in rpc.haves {
             if !h.offer && self.linked_for(peer, h.object_type, &h.group, catalog) {
                 self.on_holding(peer, h, env, catalog, rng);
             }
         }
-        self.respond(peer, &asks, &answers, &prunes, env);
+        self.respond(peer, &asks, &answers, env);
     }
 
     /// Whether a message that names `group` as of type `t` is taken from
@@ -400,7 +490,6 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         peer: PeerId,
         asks: &[Want],
         answers: &[(GroupId, u32)],
-        prunes: &[Prune],
         env: &mut E,
     ) where
         E: RuntimeEnv<B>,
@@ -410,16 +499,13 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         for &want in asks {
             self.enqueue(peer, Queued::from_want(want), false, env);
         }
-        for &prune in prunes {
-            self.enqueue(peer, Queued::from_prune(prune), false, env);
-        }
         for &(group, index) in answers {
             if self.resolve_chunk(&group, index).is_none() {
                 continue;
             }
             let entry = Queued::Chunk { group, index, solicited: true };
             if !self.enqueue(peer, entry, false, env) {
-                env.owe_answer(peer, group, index);
+                self.sends.owe_answer(peer, group, index);
             }
         }
     }
@@ -450,14 +536,19 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 self.ask_parked(ask, env, catalog);
             }
             TimerEvent::WindowTimeout { peer, group, index, at_bits } => {
-                // The send path's: a host with one gives it this event.
-                let _ = (peer, group, index, at_bits);
+                self.sends.window_timeout((peer, group, index), at_bits, env);
+                // No holding came in time for a chunk this node published, which
+                // is acknowledged anyway (`protocol-v2.md` §4.11
+                // `window_timeout`). After a holding it is acknowledged already.
+                if self.groups.get(&group).is_some_and(|r| r.origin.is_some()) {
+                    self.origin_acked(group, index, env, catalog);
+                }
             }
             TimerEvent::Reconsider { group, at_bits } => {
                 self.reconsider(group, at_bits, env, catalog, rng);
             }
-            TimerEvent::Resample { group, bits, peer } => {
-                self.resample(group, bits, peer, env, catalog, rng);
+            TimerEvent::Resample { group, index, peer, first } => {
+                self.resample(group, index, peer, first, env, catalog, rng);
             }
             TimerEvent::PaceTick => {
                 self.on_pace_tick(env, catalog);
@@ -478,9 +569,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             self.chunks.contains_key(&(*group, index))
     }
 
-    /// The next chunk whose level 1 check the host is to finish, with the peer
-    /// it came from. The verdict goes to [`Self::on_validated`].
-    pub fn pop_unverified(&mut self) -> Option<(PeerId, ChunkMsg<B>)> {
+    /// The next chunk whose level 1 check the host is to finish, with the
+    /// connection it came from. The verdict goes to [`Self::on_validated`].
+    pub fn pop_unverified(&mut self) -> Option<(GenerationPeerId, ChunkMsg<B>)> {
         self.unverified.pop_front()
     }
 
@@ -522,7 +613,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
 
     #[inline]
     pub fn holder_count(&self, group: &GroupId, index: u32) -> usize {
-        self.holders.get(&(*group, index)).map(|s| s.len()).unwrap_or(0)
+        self.holders.count(&(*group, index))
     }
 
     /// Every `(group, index)` a chunk fills (`T.project(f)`), but for an index
@@ -544,17 +635,45 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     /// A relation the host wrote into the sets directly was never counted,
     /// so the count saturates.
     pub(crate) fn uncount_relation(&mut self, peer: PeerId, t: TypeId, out: bool) {
-        if let Some(count) = self.relation_count.get_mut(&(peer, t)) {
+        if let Some(count) = self.slots.get_mut(peer).and_then(|s| s.relation_count.get_mut(&t)) {
             let side = if out { &mut count.1 } else { &mut count.0 };
             *side = side.saturating_sub(1);
         }
     }
 
+    /// Adds one relation of `peer`'s link to its count; `out` for `push_out`.
+    pub(crate) fn count_relation(&mut self, peer: PeerId, t: TypeId, out: bool) {
+        if let Some(slot) = self.slots.get_mut(peer) {
+            let count = slot.relation_count.entry_or_default(t);
+            *(if out { &mut count.1 } else { &mut count.0 }) += 1;
+        }
+    }
+
+    /// Counts `peer` as linked for `t` once both JOINs are recorded. A host
+    /// that writes a link's JOINs into its record calls it after.
+    pub fn relink(&mut self, peer: PeerId, t: TypeId) {
+        if self.is_linked(peer, t) {
+            self.linked.insert(t, peer);
+        }
+    }
+
+    /// The JOIN `peer` sent for `t`, and ours to it.
+    #[inline]
+    pub fn join_recv(&self, peer: PeerId, t: TypeId) -> Option<&Join> {
+        self.slots.get(peer)?.join_recv.get(&t)
+    }
+
+    #[inline]
+    pub fn join_sent(&self, peer: PeerId, t: TypeId) -> Option<&Join> {
+        self.slots.get(peer)?.join_sent.get(&t)
+    }
+
     #[inline]
     pub fn over_ihave_limits(&self, peer: PeerId) -> bool {
-        let rpcs = self.ihave_rpcs.get(&peer).copied().unwrap_or(0);
-        let asked = self.ihave_asked.get(&peer).copied().unwrap_or(0);
-        rpcs > self.config.max_ihave_messages || asked >= self.config.max_ihave_length
+        self.slots.get(peer).is_some_and(|s| {
+            s.ihave_rpcs > self.config.max_ihave_messages ||
+                s.ihave_asked >= self.config.max_ihave_length
+        })
     }
 
     pub fn valid_have<C>(&self, h: &crate::message::Have, _catalog: &C) -> bool
@@ -587,12 +706,14 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             *left = heartbeats;
             return true;
         }
-        let count = self.named_count.get(&peer).copied().unwrap_or(0);
-        if count >= self.config.max_pending_groups || self.named.is_full() {
+        let Some(slot) = self.slots.get_mut(peer) else {
+            return false;
+        };
+        if slot.named_count >= self.config.max_pending_groups || self.named.is_full() {
             return false;
         }
         self.named.insert((peer, *group), heartbeats);
-        self.named_count.insert(peer, count + 1);
+        slot.named_count += 1;
         true
     }
 
@@ -609,16 +730,20 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return false;
         }
         self.tied.contains_key(&(peer, chunk.group)) ||
-            self.tie_count.get(&peer).copied().unwrap_or(0) < self.config.max_pending_groups
+            self.slots.get(peer).is_some_and(|s| s.tie_count < self.config.max_pending_groups)
     }
 
     /// Rebuilds the per-peer views of `tied` after ties were removed.
     pub(crate) fn reindex_ties(&mut self) {
         self.tied_bits.clear();
-        self.tie_count.clear();
+        for slot in self.slots.iter_mut() {
+            slot.tie_count = 0;
+        }
         for (&(peer, group), bits) in self.tied.iter() {
             *self.tied_bits.entry_or_default((peer, group)) |= bits;
-            *self.tie_count.entry_or_default(peer) += 1;
+            if let Some(slot) = self.slots.get_mut(peer) {
+                slot.tie_count += 1;
+            }
         }
     }
 
