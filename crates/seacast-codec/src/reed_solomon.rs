@@ -7,6 +7,10 @@
 //! output is the kernel, chosen per target: [`gfni`], [`avx2`], [`neon`] or
 //! [`portable`]. The parity of a `(K, 2K)` code with `K` a power of two has a
 //! second path, [`fft`], which gives the same bytes.
+//!
+//! A code of more than [`MAX_NARROW_CHUNKS`] chunks is over `GF(2^16)`
+//! ([`gf16`]), with segments of whole blocks of [`WIDE_BLOCK`] bytes: every
+//! function here takes either.
 
 use std::sync::OnceLock;
 
@@ -17,6 +21,7 @@ use std::sync::OnceLock;
 ))]
 mod avx2;
 mod fft;
+mod gf16;
 #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"))]
 mod gfni;
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
@@ -46,6 +51,16 @@ use neon as kernel;
 use portable as kernel;
 
 const POLY: u16 = 0x11d;
+
+/// The most chunks of a code over `GF(2^8)`: its points. A longer code is over
+/// `GF(2^16)`.
+pub const MAX_NARROW_CHUNKS: usize = 256;
+
+/// The most chunks of a code.
+pub const MAX_WIDE_CHUNKS: usize = gf16::MAX_CHUNKS;
+
+/// A segment of a code over `GF(2^16)` is whole blocks of this many bytes.
+pub const WIDE_BLOCK: usize = gf16::BLOCK;
 
 /// Lookup tables for `GF(2^8)` multiplication and inversion.
 pub struct Gf256Tables {
@@ -142,6 +157,19 @@ static MUL: [[u8; 256]; 256] = {
 fn nibble_tables(c: u8) -> [u8; 32] {
     let products = &MUL[c as usize];
     std::array::from_fn(|i| if i < 16 { products[i] } else { products[(i - 16) << 4] })
+}
+
+/// [`nibble_tables`] of the map linear over `GF(2)` that takes bit `j` of a
+/// byte to `images[j]`.
+#[allow(dead_code)]
+fn linear_tables(images: [u8; 8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for x in 1..16usize {
+        let (rest, bit) = (x & (x - 1), x.trailing_zeros() as usize);
+        out[x] = out[rest] ^ images[bit];
+        out[16 + x] = out[16 + rest] ^ images[4 + bit];
+    }
+    out
 }
 
 /// `dst[i] = sum_j coeffs[j] * srcs[j][at + i]`, a byte at a time: the
@@ -402,9 +430,11 @@ pub fn invert_matrix(mat: &[Vec<u8>]) -> Vec<Vec<u8>> {
 /// segment is the same length.
 pub fn rs_parity_rows(srcs: &[&[u8]], n: usize, rows: &[usize], dsts: &mut [&mut [u8]]) {
     let k = srcs.len();
-    assert!(
-        k >= 1 && n <= 256 && rows.len() == dsts.len() && rows.iter().all(|r| (k..n).contains(r))
-    );
+    assert!(k >= 1 && rows.len() == dsts.len() && rows.iter().all(|r| (k..n).contains(r)));
+    if n > MAX_NARROW_CHUNKS {
+        assert!(gf16::takes(k, n, srcs[0].len()));
+        return gf16::parity(srcs, rows, dsts);
+    }
     // The transform costs the same whatever the rows asked for, the matrix a
     // pass over the data for each: the transform from a number of rows that
     // grows with its depth.
@@ -426,7 +456,7 @@ pub fn rs_parity_rows(srcs: &[&[u8]], n: usize, rows: &[usize], dsts: &mut [&mut
 /// `protocol.md` §1 `[c6]`).
 pub fn rs_parity(padded_data_segs: &[Vec<u8>], parity_count: usize) -> Vec<Vec<u8>> {
     let k = padded_data_segs.len();
-    assert!(k >= 1 && k + parity_count <= 256);
+    assert!(k >= 1 && k + parity_count <= MAX_WIDE_CHUNKS);
     let srcs: Vec<&[u8]> = padded_data_segs.iter().map(Vec::as_slice).collect();
     let rows: Vec<usize> = (k..k + parity_count).collect();
     let mut parity = vec![vec![0u8; srcs[0].len()]; parity_count];
@@ -502,6 +532,9 @@ pub fn rs_reconstruct_into(
     if chunks.iter().any(|chunk| chunk.len() != size) {
         return None;
     }
+    if n > MAX_NARROW_CHUNKS {
+        return reconstruct_wide(k, n, indices, chunks, data);
+    }
     let (missing, solve) = solve_missing(k, n, indices)?;
     let mut dsts = Vec::with_capacity(missing.len());
     for (c, segment) in data.chunks_exact_mut(size.max(1)).enumerate() {
@@ -514,6 +547,37 @@ pub fn rs_reconstruct_into(
         combine(&solve, chunks, &mut dsts);
     }
     Some(())
+}
+
+/// [`rs_reconstruct_into`] over `GF(2^16)`.
+fn reconstruct_wide(
+    k: usize,
+    n: usize,
+    indices: &[u32],
+    chunks: &[&[u8]],
+    data: &mut [u8],
+) -> Option<()> {
+    let size = data.len() / k;
+    if !gf16::takes(k, n, size) || indices.iter().any(|&index| index as usize >= n) {
+        return None;
+    }
+    let known: Vec<(usize, &[u8])> =
+        indices.iter().map(|&index| index as usize).zip(chunks.iter().copied()).collect();
+    let mut place = vec![usize::MAX; k];
+    for (at, &(index, _)) in known.iter().enumerate() {
+        if let Some(place) = place.get_mut(index) {
+            *place = at;
+        }
+    }
+    let wanted: Vec<usize> = (0..k).filter(|&c| place[c] == usize::MAX).collect();
+    let mut dsts = Vec::with_capacity(wanted.len());
+    for (c, segment) in data.chunks_exact_mut(size.max(1)).enumerate() {
+        match place[c] {
+            usize::MAX => dsts.push(segment),
+            at => segment.copy_from_slice(chunks[at]),
+        }
+    }
+    gf16::restore(k, size, &known, &wanted, &mut dsts)
 }
 
 /// Fills in every chunk of the `(k, n)` code that is missing, where the chunks
@@ -558,11 +622,14 @@ pub fn rs_complete_data_in_place(
     parity: &[u8],
     have: impl Fn(usize) -> bool,
 ) -> Option<()> {
-    if k == 0 || k > n || n > 256 || !data.len().is_multiple_of(k) {
+    if k == 0 || k > n || n > MAX_WIDE_CHUNKS || !data.len().is_multiple_of(k) {
         return None;
     }
     let size = data.len() / k;
     if parity.len() != (n - k) * size {
+        return None;
+    }
+    if n > MAX_NARROW_CHUNKS && !gf16::takes(k, n, size) {
         return None;
     }
     let missing_data = (0..k).filter(|&c| !have(c)).count();
@@ -575,6 +642,22 @@ pub fn rs_complete_data_in_place(
     }
     let indices: Vec<u32> =
         (0..k).filter(|&c| have(c)).chain(parity_used).map(|i| i as u32).collect();
+    if n > MAX_NARROW_CHUNKS {
+        let (mut known, mut dsts) = (Vec::with_capacity(k), Vec::with_capacity(missing_data));
+        for (c, segment) in data.chunks_exact_mut(size).enumerate() {
+            if have(c) {
+                known.push((c, &*segment));
+            } else {
+                dsts.push(segment);
+            }
+        }
+        let wanted: Vec<usize> = (0..k).filter(|&c| !have(c)).collect();
+        known.extend(indices[known.len()..].iter().map(|&r| {
+            let r = r as usize;
+            (r, &parity[(r - k) * size..][..size])
+        }));
+        return gf16::restore(k, size, &known, &wanted, &mut dsts);
+    }
     let (_, solve) = solve_missing(k, n, &indices)?;
     let (mut srcs, mut dsts) = (Vec::with_capacity(k), Vec::with_capacity(missing_data));
     for (c, segment) in data.chunks_exact_mut(size).enumerate() {
@@ -597,7 +680,7 @@ pub fn rs_reconstruct_data(
     segment_size: usize,
     available: &[(u32, Vec<u8>)],
 ) -> Option<Vec<Vec<u8>>> {
-    if available.len() < k || k == 0 || n > 256 {
+    if available.len() < k || k == 0 || n > MAX_WIDE_CHUNKS {
         return None;
     }
     let indices: Vec<u32> = available[..k].iter().map(|(index, _)| *index).collect();

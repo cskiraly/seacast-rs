@@ -46,6 +46,22 @@ pub(super) fn coeff(c: u8) -> Coeff {
     MATRIX[c as usize]
 }
 
+/// The map linear over `GF(2)` that takes bit `j` of a byte to `images[j]`, in
+/// place of a product.
+#[inline]
+pub(super) fn linear(images: [u8; 8]) -> Coeff {
+    // Bit `i` of byte `j` goes to bit `j` of byte `7 - i`: the transpose of the 8
+    // by 8 bits, its bytes reversed.
+    let mut x = u64::from_le_bytes(images);
+    let mut t = (x ^ (x >> 7)) & 0x00aa_00aa_00aa_00aa;
+    x ^= t ^ (t << 7);
+    t = (x ^ (x >> 14)) & 0x0000_cccc_0000_cccc;
+    x ^= t ^ (t << 14);
+    t = (x ^ (x >> 28)) & 0x0000_0000_f0f0_f0f0;
+    x ^= t ^ (t << 28);
+    x.swap_bytes()
+}
+
 /// `dst[i] = sum_j coeffs[j] * srcs[j][at + i]` over the whole vectors of
 /// `dst`. Returns the bytes written, the caller's to finish.
 #[inline]
@@ -127,6 +143,84 @@ pub(super) fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
             _mm512_storeu_si512(hp.cast(), y);
             let x = _mm512_xor_si512(x, _mm512_gf2p8affine_epi64_epi8::<0>(y, m));
             _mm512_storeu_si512(gp.cast(), x);
+        }
+    }
+    whole
+}
+
+/// [`butterfly`] over the two planes of `GF(2^16)` symbols, whose product by a
+/// constant is `(c[0] h0 + c[1] h1, c[2] h0 + c[3] h1)`, each `c` a [`linear`]
+/// map. Returns the
+/// bytes done of each plane.
+pub(super) fn butterfly2(
+    c: &[Coeff; 4],
+    g0: &mut [u8],
+    g1: &mut [u8],
+    h0: &mut [u8],
+    h1: &mut [u8],
+) -> usize {
+    let whole = g0.len() / WIDTH * WIDTH;
+    assert!(g1.len() >= whole && h0.len() >= whole && h1.len() >= whole);
+    // SAFETY: the module is compiled only with `gfni` and `avx512f` enabled. Every
+    // load and store is below `whole` of a plane, checked above.
+    unsafe {
+        let m = c.map(|c| _mm512_set1_epi64(c as i64));
+        for off in (0..whole).step_by(WIDTH) {
+            let (g0, g1) = (g0.as_mut_ptr().add(off), g1.as_mut_ptr().add(off));
+            let (h0, h1) = (h0.as_mut_ptr().add(off), h1.as_mut_ptr().add(off));
+            let (y0, y1) = (_mm512_loadu_si512(h0.cast()), _mm512_loadu_si512(h1.cast()));
+            let x0 = _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_loadu_si512(g0.cast()),
+                _mm512_gf2p8affine_epi64_epi8::<0>(y0, m[0]),
+                _mm512_gf2p8affine_epi64_epi8::<0>(y1, m[1]),
+            );
+            let x1 = _mm512_ternarylogic_epi64::<0x96>(
+                _mm512_loadu_si512(g1.cast()),
+                _mm512_gf2p8affine_epi64_epi8::<0>(y0, m[2]),
+                _mm512_gf2p8affine_epi64_epi8::<0>(y1, m[3]),
+            );
+            _mm512_storeu_si512(g0.cast(), x0);
+            _mm512_storeu_si512(g1.cast(), x1);
+            _mm512_storeu_si512(h0.cast(), _mm512_xor_si512(x0, y0));
+            _mm512_storeu_si512(h1.cast(), _mm512_xor_si512(x1, y1));
+        }
+    }
+    whole
+}
+
+/// The reverse of [`butterfly2`].
+pub(super) fn butterfly2_back(
+    c: &[Coeff; 4],
+    g0: &mut [u8],
+    g1: &mut [u8],
+    h0: &mut [u8],
+    h1: &mut [u8],
+) -> usize {
+    let whole = g0.len() / WIDTH * WIDTH;
+    assert!(g1.len() >= whole && h0.len() >= whole && h1.len() >= whole);
+    // SAFETY: as in `butterfly2`.
+    unsafe {
+        let m = c.map(|c| _mm512_set1_epi64(c as i64));
+        for off in (0..whole).step_by(WIDTH) {
+            let (g0, g1) = (g0.as_mut_ptr().add(off), g1.as_mut_ptr().add(off));
+            let (h0, h1) = (h0.as_mut_ptr().add(off), h1.as_mut_ptr().add(off));
+            let (x0, x1) = (_mm512_loadu_si512(g0.cast()), _mm512_loadu_si512(g1.cast()));
+            let y0 = _mm512_xor_si512(x0, _mm512_loadu_si512(h0.cast()));
+            let y1 = _mm512_xor_si512(x1, _mm512_loadu_si512(h1.cast()));
+            _mm512_storeu_si512(h0.cast(), y0);
+            _mm512_storeu_si512(h1.cast(), y1);
+            let x0 = _mm512_ternarylogic_epi64::<0x96>(
+                x0,
+                _mm512_gf2p8affine_epi64_epi8::<0>(y0, m[0]),
+                _mm512_gf2p8affine_epi64_epi8::<0>(y1, m[1]),
+            );
+            let x1 = _mm512_ternarylogic_epi64::<0x96>(
+                x1,
+                _mm512_gf2p8affine_epi64_epi8::<0>(y0, m[2]),
+                _mm512_gf2p8affine_epi64_epi8::<0>(y1, m[3]),
+            );
+            _mm512_storeu_si512(g0.cast(), x0);
+            _mm512_storeu_si512(g1.cast(), x1);
         }
     }
     whole
