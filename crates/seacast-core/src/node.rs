@@ -718,18 +718,15 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     }
 
     #[inline]
-    pub fn tie_room<C>(&self, peer: PeerId, chunk: &ChunkMsg<B>, _catalog: &C) -> bool
-    where
-        C: ObjectCatalog<B>,
-    {
-        if (chunk.index as usize) >= crate::bitmap::MAX_BITMAP_BITS {
+    pub fn tie_room(&self, peer: PeerId, group: &GroupId, index: u32) -> bool {
+        if (index as usize) >= crate::bitmap::MAX_BITMAP_BITS {
             return false;
         }
-        let shape = self.groups.get(&chunk.group).and_then(|r| r.hdr.as_ref());
-        if shape.is_some_and(|shape| chunk.index >= shape.n) {
+        let shape = self.groups.get(group).and_then(|r| r.hdr.as_ref());
+        if shape.is_some_and(|shape| index >= shape.n) {
             return false;
         }
-        self.tied.contains_key(&(peer, chunk.group)) ||
+        self.tied.contains_key(&(peer, *group)) ||
             self.slots.get(peer).is_some_and(|s| s.tie_count < self.config.max_pending_groups)
     }
 
