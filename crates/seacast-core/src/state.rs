@@ -1,8 +1,11 @@
 use crate::{
     bitmap::{BITMAP_WORDS, Bitmap, MAX_BITMAP_BITS},
-    collections::{InlineVec, MAX_INLINE_PEERS, PreallocDeque, PreallocMap, PreallocVec},
-    message::{ChunkMsg, QueueEntry, Queued},
-    types::{Ask, GroupId, GroupState, HaveEntry, PeerId, PushEntry, Shape, Timestamp, TypeId},
+    collections::{InlineVec, PeerSets, PreallocDeque, PreallocMap, PreallocVec, word_bits},
+    message::{ChunkMsg, Control, Join, QueueEntry, Queued},
+    types::{
+        Ask, Colour, FamilyId, GroupId, GroupState, HaveEntry, NodeId, PeerId, PushEntry, Shape,
+        Timestamp, TypeId,
+    },
 };
 
 /// Maximum groups in a single heartbeat gossip emission batch.
@@ -38,6 +41,9 @@ pub struct PeerQueue {
     /// Answers a full queue refused, by group: queued again as it empties
     /// (`owed_answers`).
     pub owed_answers: PreallocMap<GroupId, Bitmap>,
+    /// JOINs, GRAFTs and PRUNEs a full queue refused, and those handed over
+    /// since, in order (`owed_relations`).
+    pub owed_relations: PreallocDeque<Control>,
 }
 
 impl PeerQueue {
@@ -50,6 +56,7 @@ impl PeerQueue {
             max_entries,
             owed: PreallocMap::with_capacity(max_groups),
             owed_answers: PreallocMap::with_capacity(max_groups),
+            owed_relations: PreallocDeque::with_capacity(max_entries),
         }
     }
 
@@ -59,6 +66,7 @@ impl PeerQueue {
         self.normal.clear();
         self.owed.clear();
         self.owed_answers.clear();
+        self.owed_relations.clear();
     }
 
     #[inline]
@@ -82,12 +90,190 @@ impl PeerQueue {
     }
 }
 
+/// Everything kept of one connection by the peer alone, or by peer and type
+/// (`protocol-v2.md` §3). Reset when the connection closes.
+#[derive(Debug, Clone)]
+pub struct Peer {
+    /// The connection's node, taken at `connect_peer`.
+    pub node_id: NodeId,
+    pub join_recv: PreallocMap<TypeId, Join>,
+    pub join_sent: PreallocMap<TypeId, Join>,
+    /// The link's relations in `push_in` and in `push_out`, for the per-link
+    /// limit.
+    pub(crate) relation_count: PreallocMap<TypeId, (usize, usize)>,
+    /// Chunks the peer is listed for across `offers`.
+    pub listed_count: usize,
+    // This heartbeat: offers taken, asks made of them, chunks served.
+    pub ihave_rpcs: usize,
+    pub ihave_asked: usize,
+    pub(crate) served_now: usize,
+    /// Groups the peer has ties on, and groups it has named.
+    pub(crate) tie_count: usize,
+    pub(crate) named_count: usize,
+    /// The last pass over peers that took this one (`SeacastNode::mark`): a
+    /// set of peers for one pass, without a list.
+    pub(crate) mark: u64,
+}
+
+impl Peer {
+    pub fn with_capacity(max_types: usize) -> Self {
+        Self {
+            node_id: [0; 32],
+            join_recv: PreallocMap::with_capacity(max_types),
+            join_sent: PreallocMap::with_capacity(max_types),
+            relation_count: PreallocMap::with_capacity(max_types),
+            listed_count: 0,
+            ihave_rpcs: 0,
+            ihave_asked: 0,
+            served_now: 0,
+            tie_count: 0,
+            named_count: 0,
+            mark: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.node_id = [0; 32];
+        self.join_recv.clear();
+        self.join_sent.clear();
+        self.relation_count.clear();
+        self.listed_count = 0;
+        self.ihave_rpcs = 0;
+        self.ihave_asked = 0;
+        self.served_now = 0;
+        self.tie_count = 0;
+        self.named_count = 0;
+        self.mark = 0;
+    }
+}
+
+/// A set of peers, named by how it is read from the node's bitmasks. It is
+/// read a word at a time where it is used (`SeacastNode::walk`): nothing is
+/// copied out of the node, and the set has no length to be cut at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerSet {
+    /// The links of a type (`links(T)`).
+    Links(TypeId),
+    /// The peers that push us a type, family and colour (`in_pushers`).
+    In(TypeId, FamilyId, Colour),
+    /// The peers we push a type, family and colour (`out_pushees`).
+    Out(TypeId, FamilyId, Colour),
+    /// The peers in one direction only of a type, family and colour.
+    OneWay(TypeId, FamilyId, Colour),
+    /// The links that push us a family in any of the type's colours
+    /// (`suppression_scope`); the last field is the number of colours.
+    Scope(TypeId, FamilyId, Colour),
+    /// The links in no relation of a family, in any of the type's colours.
+    Unrelated(TypeId, FamilyId, Colour),
+    /// The peers with a standing request for a chunk.
+    Standing(GroupId, u32),
+    /// The peers that claim a whole group.
+    Claims(GroupId),
+}
+
+/// A candidate of a push, with what `choose_push` orders it by.
+#[derive(Debug, Clone, Copy)]
+pub struct PushCand {
+    pub unproven: bool,
+    pub known: u32,
+    pub tie: (u64, NodeId),
+    pub peer: PeerId,
+}
+
+/// A push relation: peer, type, family, colour.
+pub type RelationKey = (PeerId, TypeId, FamilyId, Colour);
+
+/// One direction of the push relations (`push_in` or `push_out`,
+/// `protocol-v2.md` §3): the peers of each type, family and colour as a
+/// bitmask, so that a chunk's targets are read without a walk over the peers.
+#[derive(Debug, Clone)]
+pub struct Relations {
+    sets: PeerSets<(TypeId, FamilyId, Colour)>,
+    len: usize,
+}
+
+impl Relations {
+    pub fn with_capacity(keys: usize, max_peers: usize) -> Self {
+        Self { sets: PeerSets::with_capacity(keys, max_peers), len: 0 }
+    }
+
+    /// The relations held.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[inline]
+    pub fn contains(&self, &(peer, t, fam, c): &RelationKey) -> bool {
+        self.sets.contains(&(t, fam, c), peer)
+    }
+
+    /// Returns whether the relation was added.
+    pub fn insert(&mut self, (peer, t, fam, c): RelationKey) -> bool {
+        let added = !self.sets.contains(&(t, fam, c), peer) && self.sets.insert((t, fam, c), peer);
+        self.len += added as usize;
+        added
+    }
+
+    /// Returns whether the relation was held.
+    pub fn remove(&mut self, &(peer, t, fam, c): &RelationKey) -> bool {
+        let held = self.sets.remove(&(t, fam, c), peer);
+        self.len -= held as usize;
+        held
+    }
+
+    pub fn remove_peer(&mut self, peer: PeerId) {
+        self.len -= self.sets.keys().filter(|key| self.sets.contains(key, peer)).count();
+        self.sets.remove_peer(peer);
+    }
+
+    /// Word `w` of the peers of a type, family and colour.
+    #[inline]
+    pub fn word(&self, t: TypeId, fam: FamilyId, c: Colour, w: usize) -> u64 {
+        self.sets.word(&(t, fam, c), w)
+    }
+
+    /// Word `w` of the peers of a type and family in any of its `m` colours.
+    pub fn family_word(&self, t: TypeId, fam: FamilyId, m: Colour, w: usize) -> u64 {
+        (0..m).fold(0, |word, c| word | self.sets.word(&(t, fam, c), w))
+    }
+
+    pub fn count(&self, t: TypeId, fam: FamilyId, c: Colour) -> usize {
+        self.sets.count(&(t, fam, c))
+    }
+
+    /// Whether `peer` is in the relation of a type and family in any of its
+    /// `m` colours.
+    pub fn any_colour(&self, peer: PeerId, t: TypeId, fam: FamilyId, m: Colour) -> bool {
+        (0..m).any(|c| self.sets.contains(&(t, fam, c), peer))
+    }
+
+    /// Whether `peer` is in any relation.
+    pub fn related(&self, peer: PeerId) -> bool {
+        self.sets.keys().any(|key| self.sets.contains(key, peer))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = RelationKey> + '_ {
+        self.sets.keys().flat_map(|&(t, fam, c)| {
+            self.sets.iter(&(t, fam, c)).map(move |peer| (peer, t, fam, c))
+        })
+    }
+}
+
 /// Everything kept of one group. A field is `None` until it is first written,
 /// as its entry was absent when each field was a map of its own.
 #[derive(Debug, Clone, Default)]
 pub struct Group {
     /// The group's object type: set when the group is opened.
     pub t_of: Option<TypeId>,
+    /// The type a peer's holding, offer or ask gave the group before it was
+    /// opened.
+    pub named_t: Option<TypeId>,
     /// The group's index count and threshold, from its header.
     pub hdr: Option<Shape>,
     /// Whether the domain has authenticated the group: asked once, not once a
@@ -108,12 +294,13 @@ pub struct Group {
     pub known_at: Option<Timestamp>,
     pub last_activity: Option<Timestamp>,
     // Claims, deferral, probe and repair sampling (`protocol-v2.md` §3, §4.6)
-    pub claims: Option<InlineVec<PeerId, MAX_INLINE_PEERS>>,
     pub reconsider_at: Option<u64>,
     pub deferred: Option<bool>,
     pub waited: Option<bool>,
     pub probe: Option<u32>,
     pub probed: Option<PeerId>,
+    /// The probe's verdict, once: whether the claimant's own copy came.
+    pub probe_ok: Option<bool>,
     pub rsample: Option<InlineVec<u32, MAX_BITMAP_BITS>>,
     pub rsample_step: Option<usize>,
     pub rsample_final: Option<bool>,
@@ -220,66 +407,104 @@ impl Groups {
     }
 }
 
-/// A value per ask and peer, kept by ask: what an arriving chunk closes is one
-/// entry of the map, however many peers were asked or tried for it.
+/// A value per ask and peer. `peers` holds who has a value for an ask, so an
+/// arriving chunk closes its records without a scan. Bounded twice: the
+/// records of the node, and those of one peer. A record over either bound is
+/// refused.
 #[derive(Debug, Clone)]
 pub struct AskPeers<V: Copy> {
-    by_ask: PreallocMap<Ask, InlineVec<(PeerId, V), MAX_INLINE_PEERS>>,
+    values: PreallocMap<(Ask, PeerId), V>,
+    peers: PeerSets<Ask>,
+    per_peer: Box<[u32]>,
+    max_per_peer: u32,
 }
 
 impl<V: Copy> AskPeers<V> {
-    pub fn with_capacity(asks: usize) -> Self {
-        Self { by_ask: PreallocMap::with_capacity(asks) }
+    pub fn with_capacity(records: usize, max_per_peer: usize, max_peers: usize) -> Self {
+        Self {
+            values: PreallocMap::with_capacity(records),
+            peers: PeerSets::with_capacity(records, max_peers),
+            per_peer: vec![0; max_peers].into_boxed_slice(),
+            max_per_peer: max_per_peer as u32,
+        }
     }
 
     pub fn get(&self, ask: Ask, peer: PeerId) -> Option<V> {
-        let peers = self.by_ask.get(&ask)?;
-        peers.iter().find(|&&(p, _)| p == peer).map(|&(_, v)| v)
+        self.values.get(&(ask, peer)).copied()
     }
 
     pub fn contains(&self, ask: Ask, peer: PeerId) -> bool {
-        self.get(ask, peer).is_some()
+        self.values.contains_key(&(ask, peer))
     }
 
-    pub fn insert(&mut self, ask: Ask, peer: PeerId, value: V) {
-        let peers = self.by_ask.entry_or_default(ask);
-        match peers.iter_mut().find(|(p, _)| *p == peer) {
-            Some(entry) => entry.1 = value,
-            None => {
-                let _ = peers.push((peer, value));
-            }
+    /// Whether `insert` would take a value for `ask` and `peer`.
+    pub fn has_room(&self, ask: Ask, peer: PeerId) -> bool {
+        self.contains(ask, peer) ||
+            (!self.values.is_full() && self.per_peer[peer as usize] < self.max_per_peer)
+    }
+
+    /// Returns `false` if the record is new and over a bound.
+    pub fn insert(&mut self, ask: Ask, peer: PeerId, value: V) -> bool {
+        if let Some(held) = self.values.get_mut(&(ask, peer)) {
+            *held = value;
+            return true;
         }
+        if !self.has_room(ask, peer) {
+            return false;
+        }
+        self.values.insert((ask, peer), value);
+        self.peers.insert(ask, peer);
+        self.per_peer[peer as usize] += 1;
+        true
     }
 
     pub fn remove(&mut self, ask: Ask, peer: PeerId) -> Option<V> {
-        let peers = self.by_ask.get_mut(&ask)?;
-        let at = peers.iter().position(|&(p, _)| p == peer)?;
-        let (_, value) = peers.remove(at);
-        if peers.is_empty() {
-            self.by_ask.remove(&ask);
-        }
+        let value = self.values.remove(&(ask, peer))?;
+        self.peers.remove(&ask, peer);
+        self.per_peer[peer as usize] -= 1;
         Some(value)
     }
 
     /// Drops every peer's value for `ask`.
     pub fn remove_ask(&mut self, ask: Ask) {
-        self.by_ask.remove(&ask);
+        for peer in self.peers.iter(&ask) {
+            self.values.remove(&(ask, peer));
+            self.per_peer[peer as usize] -= 1;
+        }
+        self.peers.remove_key(&ask);
+    }
+
+    /// Drops every value of `peer`.
+    pub fn remove_peer(&mut self, peer: PeerId) {
+        if self.per_peer[peer as usize] != 0 {
+            self.retain(|_, q, _| q != peer);
+        }
     }
 
     pub fn retain(&mut self, mut keep: impl FnMut(Ask, PeerId, V) -> bool) {
-        self.by_ask.retain(|&ask, peers| {
-            peers.retain(|&(peer, value)| keep(ask, peer, value));
-            !peers.is_empty()
+        let (peers, per_peer) = (&mut self.peers, &mut self.per_peer);
+        self.values.retain(|&(ask, peer), value| {
+            if keep(ask, peer, *value) {
+                return true;
+            }
+            peers.remove(&ask, peer);
+            per_peer[peer as usize] -= 1;
+            false
         });
     }
 
     /// The number of (ask, peer) pairs.
     pub fn len(&self) -> usize {
-        self.by_ask.iter().map(|(_, peers)| peers.len()).sum()
+        self.values.len()
+    }
+
+    /// The number of asks `peer` has a value for.
+    pub fn count_of(&self, peer: PeerId) -> usize {
+        self.per_peer[peer as usize] as usize
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_ask.is_empty()
+        self.values.is_empty()
     }
 }
 
@@ -373,6 +598,8 @@ const COMPLETE: u8 = 1 << 1;
 const FIRST_PUSH: u8 = 1 << 2;
 const OFFER_AT: u8 = 1 << 3;
 const PARK: u8 = 1 << 4;
+/// As a claimant: the peer's probe of the group has been answered.
+const PROBE_SERVED: u8 = 1 << 5;
 
 #[derive(Debug, Clone, Copy)]
 struct Pair {
@@ -415,7 +642,7 @@ impl Pair {
     }
 
     fn is_empty(&self) -> bool {
-        self.present == 0 && self.served == 0 && self.flags & (OFFER_AT | PARK) == 0
+        self.present == 0 && self.served == 0 && self.flags & (OFFER_AT | PARK | PROBE_SERVED) == 0
     }
 }
 
@@ -433,14 +660,47 @@ pub struct Pairs {
     recs: PreallocMap<PairKey, Pair>,
     wide: Vec<[[u64; BITMAP_WORDS]; PAIR_BITMAPS]>,
     free: Vec<u32>,
+    /// The peers with offers of a group, and those with a holding of it: a
+    /// pair is found by its group without a walk over the peers.
+    offering: PeerSets<GroupId>,
+    having: PeerSets<GroupId>,
 }
 
 impl Pairs {
-    pub fn with_capacity(pairs: usize, wide_pairs: usize) -> Self {
+    /// `groups`: the groups that may have pairs at one time.
+    pub fn with_capacity(pairs: usize, wide_pairs: usize, groups: usize, max_peers: usize) -> Self {
         Self {
             recs: PreallocMap::with_capacity(pairs),
             wide: vec![[[0; BITMAP_WORDS]; PAIR_BITMAPS]; wide_pairs],
             free: (0..wide_pairs as u32).rev().collect(),
+            offering: PeerSets::with_capacity(groups, max_peers),
+            having: PeerSets::with_capacity(groups, max_peers),
+        }
+    }
+
+    /// The peers with offers of `group`, in peer id order.
+    pub fn offering<'a>(&'a self, group: &GroupId) -> impl Iterator<Item = PeerId> + use<'a> {
+        self.offering.iter(group)
+    }
+
+    /// The peers with a holding of `group`, in peer id order.
+    pub fn having<'a>(&'a self, group: &GroupId) -> impl Iterator<Item = PeerId> + use<'a> {
+        self.having.iter(group)
+    }
+
+    /// Takes `index` out of every peer's offers of `group`.
+    pub fn clear_offered(&mut self, group: &GroupId, index: u32) {
+        for w in 0..self.offering.width() {
+            let Some(word) = self.offering.row(group).map(|row| row[w]) else {
+                return;
+            };
+            for peer in word_bits(w, word) {
+                let key = (peer, *group);
+                if let Some(mut bits) = self.offered(&key) {
+                    bits.clear(index);
+                    self.set_offered(key, bits);
+                }
+            }
         }
     }
 
@@ -487,6 +747,18 @@ impl Pairs {
         let at = field as usize;
         let (inverted, words) = bits.raw();
         let is_wide = words[NARROW_WORDS..].iter().any(|&word| word != 0);
+        if !self.recs.contains_key(&key) && self.recs.is_full() {
+            return None;
+        }
+        // Not kept where the index has no room: a pair the index lacks is not found.
+        let indexed = match field {
+            PairBits::Offered => self.offering.insert(key.1, key.0),
+            PairBits::Has => self.having.insert(key.1, key.0),
+            _ => true,
+        };
+        if !indexed {
+            return None;
+        }
         let (wide, free) = (&mut self.wide, &mut self.free);
         let pair = if self.recs.contains_key(&key) || !self.recs.is_full() {
             self.recs.get_or_insert_with(key, || Pair::EMPTY)
@@ -597,6 +869,7 @@ impl Pairs {
         if let Some(pair) = self.recs.get_mut(key) {
             pair.drop_bits(PairBits::Offered);
             pair.flags &= !OFFER_AT;
+            self.offering.remove(&key.1, key.0);
         }
         bits
     }
@@ -638,19 +911,43 @@ impl Pairs {
         }
     }
 
+    /// The pairs with a park, and its end.
+    pub fn parks(&self) -> impl Iterator<Item = (&PairKey, Timestamp)> {
+        self.recs
+            .iter()
+            .filter(|(_, pair)| pair.flags & PARK != 0)
+            .map(|(key, pair)| (key, pair.park))
+    }
+
     pub fn clear_park(&mut self, key: &PairKey) {
         if let Some(pair) = self.recs.get_mut(key) {
             pair.flags &= !PARK;
         }
     }
 
+    /// As a claimant: whether the peer's probe of the group was answered
+    /// (`protocol-v2.md` §4.6 `probe_served`).
+    pub fn probe_served(&self, key: &PairKey) -> bool {
+        self.recs.get(key).is_some_and(|pair| pair.flags & PROBE_SERVED != 0)
+    }
+
+    pub fn set_probe_served(&mut self, key: PairKey) {
+        if let Some(pair) = self.rec(key) {
+            pair.flags |= PROBE_SERVED;
+        }
+    }
+
     /// Keeps the pairs `keep` accepts.
     pub fn retain(&mut self, mut keep: impl FnMut(&PairKey) -> bool) {
-        let free = &mut self.free;
+        let (free, offering, having) = (&mut self.free, &mut self.offering, &mut self.having);
         self.recs.retain(|key, pair| {
             let kept = keep(key);
-            if !kept && pair.wide != NO_WIDE {
-                free.push(pair.wide);
+            if !kept {
+                offering.remove(&key.1, key.0);
+                having.remove(&key.1, key.0);
+                if pair.wide != NO_WIDE {
+                    free.push(pair.wide);
+                }
             }
             kept
         });
@@ -661,7 +958,7 @@ impl Pairs {
     /// peer, and is given to `expired`. A pair left with nothing is
     /// removed.
     pub fn heartbeat(&mut self, now: Timestamp, mut expired: impl FnMut(PeerId, GroupId, Bitmap)) {
-        let (wide, free) = (&self.wide, &mut self.free);
+        let (wide, free, having) = (&self.wide, &mut self.free, &mut self.having);
         self.recs.retain(|&(peer, group), pair| {
             if pair.has(PairBits::Has) {
                 if pair.have_ttl > 1 {
@@ -676,6 +973,7 @@ impl Pairs {
                     let inverted = pair.inverted & (1 << PairBits::Has as u8) != 0;
                     expired(peer, group, Bitmap::from_raw(inverted, words));
                     pair.drop_bits(PairBits::Has);
+                    having.remove(&group, peer);
                     pair.drop_bits(PairBits::SentTo);
                     pair.flags &= !(CLAIM_ALL | COMPLETE);
                 }

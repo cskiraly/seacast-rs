@@ -9,8 +9,8 @@ use crate::reed_solomon::rs_complete_in_place;
 use crate::{
     buffer::{BufferPool, ChunkBytes},
     merkle::{
-        MerkleProof, MerkleTree, build_merkle_layers, merkle_proof_from_layers, proven_leaf_hash,
-        tree_width,
+        MerkleProof, MerkleTree, build_merkle_layers, leaf_hash, merkle_proof_from_layers,
+        proven_leaf_hash, tree_width,
     },
     reed_solomon::{rs_parity_rows, rs_reconstruct_into},
     sha256::{Sha256, sha256_prefixed_many},
@@ -178,7 +178,7 @@ impl SegmentDescriptor {
 
     /// The digests in the proof of any chunk of the group. A coded group's two
     /// trees have `K` leaves each.
-    fn proof_len(&self) -> usize {
+    pub fn proof_len(&self) -> usize {
         proof_len(self.tree_of(0).2)
     }
 
@@ -289,32 +289,16 @@ pub fn build_frame(
     frame
 }
 
-/// `MESSAGE_DOMAIN_VALID_SNAPPY` of the Altair networking rules.
-const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [1, 0, 0, 0];
-
-/// The 56-byte id of a chunk (`message_id(f)` in `protocol.md` §2): its group,
-/// its index, and its 20-byte content id, which is the message id of the Altair
-/// networking rules over `topic` and the chunk as it is sent: `uint16_le(type)
-/// | group | uint32_le(index) | frame`. The topic is the domain's, one a type.
-pub fn chunk_id(
-    topic: &[u8],
-    type_id: TypeId,
-    group: &GroupId,
-    index: u32,
-    frame: &[u8],
-) -> ChunkId {
-    let mut h = Sha256::new();
-    h.update(&MESSAGE_DOMAIN_VALID_SNAPPY);
-    h.update(&(topic.len() as u64).to_le_bytes());
-    h.update(topic);
-    h.update(&type_id.0.to_le_bytes());
-    h.update(group);
-    h.update(&index.to_le_bytes());
-    h.update(frame);
+/// The 56-byte id of a chunk: its group, its index, and the first 20 bytes of
+/// its `content`, which is the digest of its leaf for a segmented chunk and
+/// its group id for a standalone one. Level 1 binds either to the group, so a
+/// chunk that passed has no other id; one that did not has the id of the
+/// bytes it came with.
+pub fn chunk_id(group: &GroupId, index: u32, content: &Bytes32) -> ChunkId {
     let mut out = [0u8; 56];
     out[0..32].copy_from_slice(group);
     out[32..36].copy_from_slice(&index.to_le_bytes());
-    out[36..56].copy_from_slice(&h.finalize()[..20]);
+    out[36..56].copy_from_slice(&content[..20]);
     out
 }
 
@@ -432,7 +416,6 @@ pub fn frame_leaf_hash(index: u32, frame: &[u8], context_len: usize) -> Option<B
 /// the node.
 pub fn build_chunks<B, Pool>(
     type_id: TypeId,
-    topic: &[u8],
     context: &[u8],
     descriptor: &SegmentDescriptor,
     shards: &[Shard<B>],
@@ -447,13 +430,14 @@ where
         .iter()
         .map(|shard| {
             let frame = build_frame(descriptor, context, &shard.proof, shard.data.as_bytes());
+            let leaf = leaf_hash(shard.data.as_bytes());
             ChunkMsg {
                 type_id,
                 group,
                 index: shard.index,
-                cached_id: chunk_id(topic, type_id, &group, shard.index, &frame),
+                cached_id: chunk_id(&group, shard.index, &leaf),
                 frame: pool.alloc_from_slice(&frame),
-                memo: [0; 32],
+                memo: leaf,
             }
         })
         .collect()
@@ -565,7 +549,6 @@ pub fn decode_and_reencode<B, Pool, Comp>(
     pool: &mut Pool,
     compressor: &Comp,
     out_rebuilt: &mut PreallocVec<ChunkMsg<B>>,
-    topic: &[u8],
 ) -> Option<B>
 where
     B: ChunkBytes,
@@ -700,7 +683,7 @@ where
                 type_id,
                 group,
                 index: idx,
-                cached_id: chunk_id(topic, type_id, &group, idx, &frame),
+                cached_id: chunk_id(&group, idx, &tree.leaf(i)),
                 frame: pool.alloc_from_slice(&frame),
                 memo: tree.leaf(i),
             };
@@ -719,7 +702,6 @@ mod tests {
     use super::*;
     use crate::buffer::VecBufferPool;
 
-    const TOPIC: &[u8] = b"topic";
     /// What a domain would put there: these tests only carry it.
     const CONTEXT: [u8; 40] = [3; 40];
     /// Level 2 computes no parity: it gives the data chunks and the parity
@@ -750,9 +732,8 @@ mod tests {
         assert!(subset.iter().all(valid));
 
         let mut rebuilt = PreallocVec::with_capacity(16);
-        let recovered =
-            decode_and_reencode(&subset, CONTEXT.len(), &mut pool, &comp, &mut rebuilt, TOPIC)
-                .expect("level 2 decode");
+        let recovered = decode_and_reencode(&subset, CONTEXT.len(), &mut pool, &comp, &mut rebuilt)
+            .expect("level 2 decode");
         assert_eq!(rebuilt.len(), if DATA_ONLY { 8 } else { 10 });
         assert_eq!(recovered, body);
         for ch in rebuilt.iter() {
@@ -774,8 +755,7 @@ mod tests {
             ch.memo = frame_leaf_hash(ch.index, &ch.frame, CONTEXT.len()).expect("valid");
         }
         let mut rebuilt = PreallocVec::with_capacity(16);
-        let recovered =
-            decode_and_reencode(&subset, CONTEXT.len(), &mut pool, &comp, &mut rebuilt, TOPIC);
+        let recovered = decode_and_reencode(&subset, CONTEXT.len(), &mut pool, &comp, &mut rebuilt);
         assert_eq!(recovered.as_deref(), Some(&body[..]));
         for ch in rebuilt.iter() {
             assert!(valid(ch));
@@ -783,8 +763,7 @@ mod tests {
         }
         subset[0].memo[0] ^= 1;
         assert!(
-            decode_and_reencode(&subset, CONTEXT.len(), &mut pool, &comp, &mut rebuilt, TOPIC)
-                .is_none()
+            decode_and_reencode(&subset, CONTEXT.len(), &mut pool, &comp, &mut rebuilt).is_none()
         );
     }
 
@@ -793,7 +772,7 @@ mod tests {
         shards: &[Shard<Vec<u8>>],
         indices: impl Iterator<Item = usize>,
     ) -> Vec<ChunkMsg<Vec<u8>>> {
-        let all = build_chunks(TypeId(0), TOPIC, &CONTEXT, desc, shards, &mut VecBufferPool);
+        let all = build_chunks(TypeId(0), &CONTEXT, desc, shards, &mut VecBufferPool);
         indices.map(|i| all[i].clone()).collect()
     }
 
@@ -833,7 +812,6 @@ mod tests {
                         &mut pool,
                         &comp,
                         &mut rebuilt,
-                        TOPIC,
                     );
                     assert_eq!(decoded.as_ref(), Some(&body), "{len} bytes from {subset:?}");
                     // The indices of the chunks decoding gives, lowest first.
@@ -862,14 +840,7 @@ mod tests {
         let k = desc.k() as usize;
         let mut rebuilt = PreallocVec::with_capacity(2 * k);
         let mut decode = |available: &[ChunkMsg<Vec<u8>>]| {
-            decode_and_reencode(
-                available,
-                CONTEXT.len(),
-                &mut VecBufferPool,
-                &comp,
-                &mut rebuilt,
-                TOPIC,
-            )
+            decode_and_reencode(available, CONTEXT.len(), &mut VecBufferPool, &comp, &mut rebuilt)
         };
         let good = chunks_of(&desc, &shards, 1..k + 1);
         assert_eq!(decode(&good), Some(body.clone()));
@@ -1020,33 +991,31 @@ mod tests {
 
         let mut rebuilt = PreallocVec::with_capacity(2 * k);
         let mut decode = |available: &[ChunkMsg<Vec<u8>>]| {
-            decode_and_reencode(available, CONTEXT.len(), &mut pool, &comp, &mut rebuilt, TOPIC)
+            decode_and_reencode(available, CONTEXT.len(), &mut pool, &comp, &mut rebuilt)
         };
         assert_eq!(decode(&chunks_of(&desc, &shards, 0..k)), Some(body));
         assert_eq!(decode(&chunks_of(&desc, &shards, 1..k + 1)), None);
     }
 
-    /// The content id is the Altair message id over the topic and the chunk as
-    /// it is sent: its type, group and index, then its frame.
+    /// A chunk's id is its group, its index and its leaf's digest, which a
+    /// publisher's chunks carry.
     #[test]
-    fn test_chunk_id_is_the_altair_message_id() {
-        let (group, frame) = ([2u8; 32], [5u8, 6, 7, 8, 9]);
-        let mut message = vec![1, 0, 0, 0];
-        message.extend_from_slice(&(TOPIC.len() as u64).to_le_bytes());
-        message.extend_from_slice(TOPIC);
-        message.extend_from_slice(&TypeId(1).0.to_le_bytes());
-        message.extend_from_slice(&group);
-        message.extend_from_slice(&1u32.to_le_bytes());
-        message.extend_from_slice(&frame);
-        let id = chunk_id(TOPIC, TypeId(1), &group, 1, &frame);
-        assert_eq!(id[..32], group);
-        assert_eq!(id[32..36], 1u32.to_le_bytes());
-        assert_eq!(id[36..], crate::sha256::sha256(&message)[..20]);
-        // Another frame for the same index is another chunk, as is another topic's or
-        // type's.
-        assert_ne!(id, chunk_id(TOPIC, TypeId(1), &group, 1, &frame[..4]));
-        assert_ne!(id, chunk_id(b"other", TypeId(1), &group, 1, &frame));
-        assert_ne!(id, chunk_id(TOPIC, TypeId(0), &group, 1, &frame));
+    fn test_chunk_id() {
+        let (desc, shards) = build_group::<Vec<u8>, _, _>(
+            &[7u8; 40_000],
+            &mut VecBufferPool,
+            &SnappyBlockCompressor,
+        );
+        let chunks = build_chunks(TypeId(1), &CONTEXT, &desc, &shards, &mut VecBufferPool);
+        let chunk = &chunks[1];
+        let frame = split_frame(&chunk.frame, CONTEXT.len()).unwrap();
+        let leaf = leaf_hash(frame.data);
+        assert_eq!(frame_leaf_hash(1, &chunk.frame, CONTEXT.len()), Some(leaf));
+        assert_eq!(chunk.memo, leaf);
+        assert_eq!(chunk.cached_id[..32], chunk.group);
+        assert_eq!(chunk.cached_id[32..36], 1u32.to_le_bytes());
+        assert_eq!(chunk.cached_id[36..], leaf[..20]);
+        assert_eq!(chunk.cached_id, chunk_id(&chunk.group, 1, &leaf));
     }
 
     /// A body of 10 MiB is a plain group of 640 chunks: more
@@ -1062,7 +1031,7 @@ mod tests {
         assert!(available.iter().all(valid));
         let mut rebuilt = PreallocVec::with_capacity(640);
         let decoded =
-            decode_and_reencode(&available, CONTEXT.len(), &mut pool, &comp, &mut rebuilt, TOPIC);
+            decode_and_reencode(&available, CONTEXT.len(), &mut pool, &comp, &mut rebuilt);
         assert!(decoded.as_ref() == Some(&body));
     }
 
@@ -1077,19 +1046,12 @@ mod tests {
         let available = chunks_of(&desc, &shards, (0..130).rev());
         let mut rebuilt = PreallocVec::with_capacity(130);
         assert_eq!(
-            decode_and_reencode(&available, CONTEXT.len(), &mut pool, &comp, &mut rebuilt, TOPIC),
+            decode_and_reencode(&available, CONTEXT.len(), &mut pool, &comp, &mut rebuilt),
             Some(body)
         );
         assert_eq!(rebuilt.len(), 130);
         assert_eq!(
-            decode_and_reencode(
-                &available[1..],
-                CONTEXT.len(),
-                &mut pool,
-                &comp,
-                &mut rebuilt,
-                TOPIC
-            ),
+            decode_and_reencode(&available[1..], CONTEXT.len(), &mut pool, &comp, &mut rebuilt,),
             None
         );
     }

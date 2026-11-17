@@ -1,12 +1,16 @@
 use crate::{
     bitmap::{Bitmap, MAX_BITMAP_BITS, MAX_CHUNKS},
-    collections::{InlineVec, MAX_INLINE_PEERS},
+    collections::{InlineVec, PreallocVec},
     message::ChunkMsg,
     node::SeacastNode,
     traits::{
-        ChunkBuffer, DeferredStore, ObjectCatalog, PenaltyReason, RngSource, RuntimeEnv, TimerEvent,
+        ChunkBuffer, DecodeJob, DeferredStore, ObjectCatalog, PenaltyReason, RngSource, RuntimeEnv,
+        TimerEvent,
     },
-    types::{Ask, Duty, GroupId, GroupState, PeerId, Timestamp, ValidationResult},
+    types::{
+        Ask, Duty, GenerationPeerId, GroupId, GroupState, PeerId, Shape, Timestamp,
+        ValidationResult,
+    },
 };
 
 impl<B: ChunkBuffer> SeacastNode<B> {
@@ -34,6 +38,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let known = self.seen_ids.contains(&mid) || self.pending_ids.contains(&mid);
         if known || self.verifying.contains(&mid) {
             if self.accepted_id(&mid, &chunk.group, chunk.index) {
+                // The claimant's copy passes its probe, a duplicate too (§4.6, R5).
+                let t = self.type_of(&chunk.group, catalog);
+                for (g, i) in catalog.project(t, &chunk) {
+                    self.probe_answer(g, i, peer);
+                }
                 self.send_have(peer, chunk.group, env, catalog);
             } else if self.pending_ids.contains(&mid) {
                 self.tie(peer, &chunk, catalog);
@@ -97,6 +106,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         R: RngSource,
         D: DeferredStore<B>,
     {
+        let peer = self.slots.stamp(peer);
         if result != ValidationResult::Pending {
             return self.on_validated(peer, chunk, result, env, catalog, rng, deferred_store);
         }
@@ -112,7 +122,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     #[allow(clippy::too_many_arguments)]
     pub fn on_validated<E, C, R, D>(
         &mut self,
-        peer: PeerId,
+        peer: GenerationPeerId,
         chunk: ChunkMsg<B>,
         result: ValidationResult,
         env: &mut E,
@@ -126,6 +136,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         D: DeferredStore<B>,
     {
         self.verifying.remove(&chunk.cached_id);
+        // Its connection closed meanwhile: the chunk is dropped unseen, as one that
+        // never came. Another connection may have the peer id.
+        let Some(peer) = self.slots.resolve(peer) else {
+            return;
+        };
         if self.expired(&chunk.group) {
             return;
         }
@@ -148,12 +163,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             self.fill(g, i, &chunk, Some(peer), env, catalog);
         }
         if projected.iter().any(|&(g, _)| {
-            let tg = self
-                .groups
-                .get(&g)
-                .and_then(|r| r.t_of.as_ref())
-                .copied()
-                .unwrap_or_else(|| catalog.type_of_group(&g));
+            let tg = self.type_of(&g, catalog);
             catalog.duty_for(tg, &g) == Duty::Forward
         }) {
             self.forward(&chunk, peer, env, catalog, rng);
@@ -206,6 +216,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 .unwrap_or(false);
         if already_held {
             if let Some(p) = sender {
+                self.probe_answer(group, index, p);
                 self.send_have(p, group, env, catalog);
             }
             return;
@@ -216,7 +227,16 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         } else {
             self.groups.rec(group).rebuilt.get_or_insert_with(Default::default).set(index);
         }
+        // Only the claimant's own copy passes its probe; another peer's leaves
+        // the probe's promise open (§4.6, R5).
+        if let Some(p) = sender {
+            self.probe_answer(group, index, p);
+        }
+        let kept = self.probe_promise(group, index);
         self.close_promises(group, index, None);
+        if let Some((claimant, at_bits)) = kept {
+            self.promises.insert(Ask::new(group, index), claimant, at_bits);
+        }
         self.serve_standing(group, index, env, catalog);
 
         let mine_entry = self.groups.rec(group).mine.get_or_insert_with(Default::default);
@@ -224,17 +244,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if claim {
             mine_entry.set(index);
         }
-        let mut recipients: InlineVec<PeerId, MAX_INLINE_PEERS> = InlineVec::new();
+        let scope = self.suppression_scope(&group, catalog);
         if claim {
-            for q in self.suppression_scope(&group, catalog) {
-                recipients.insert_unique(q);
-            }
+            self.for_each(scope, |node, q| node.send_have(q, group, env, catalog));
         }
-        if let Some(p) = sender {
-            recipients.insert_unique(p);
-        }
-        for q in recipients {
-            self.send_have(q, group, env, catalog);
+        if let Some(p) = sender.filter(|&p| !claim || !self.in_set(scope, p)) {
+            self.send_have(p, group, env, catalog);
         }
     }
 
@@ -272,15 +287,15 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         rec.known_at.get_or_insert(now);
         rec.last_activity = Some(now);
         // Holdings that arrived before the group opened count from now on.
-        for &p in self.peers.iter() {
+        for p in self.pairs.having(&group) {
             let Some(entry) = self.pairs.peer_has(&(p, group)) else {
                 continue;
             };
             for i in entry.bits.iter() {
-                self.holders.entry_or_default((group, i)).insert_unique(p);
+                self.holders.insert((group, i), p);
             }
             if entry.claim_all {
-                self.groups.rec(group).claims.get_or_insert_with(Default::default).insert_unique(p);
+                self.claims.insert(group, p);
             }
         }
     }
@@ -341,7 +356,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return;
         }
         if !self.tied.contains_key(&key) {
-            *self.tie_count.entry_or_default(peer) += 1;
+            if let Some(slot) = self.slots.get_mut(peer) {
+                slot.tie_count += 1;
+            }
         }
         self.tied.entry_or_default(key).set(chunk.index);
         self.tied_bits.entry_or_default((peer, chunk.group)).set(chunk.index);
@@ -424,21 +441,16 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 if self.expired(&g) {
                     continue;
                 }
-                let t = self
-                    .groups
-                    .get(&g)
-                    .and_then(|r| r.t_of.as_ref())
-                    .copied()
-                    .unwrap_or_else(|| catalog.type_of_group(&g));
+                let t = self.type_of(&g, catalog);
                 if !catalog.authenticable(t, &g) {
                     self.drop_tie(p, g, &bits, env, catalog);
                     continue;
                 }
                 self.pairs.clear_park(&(p, g));
-                for i in bits.iter() {
-                    if let Some(set) = self.asked_parked.get_mut(&(g, i)) {
-                        set.remove_item(&p);
-                    }
+                // An index the group does not have is dropped (`protocol.md` §4.2).
+                let count = self.groups.get(&g).and_then(|r| r.hdr.as_ref()).map(|h| h.n);
+                for i in bits.iter().filter(|&i| count.is_none_or(|n| i < n)) {
+                    self.asked_parked.remove(&(g, i), p);
                     let held = self
                         .groups
                         .get(&g)
@@ -466,15 +478,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         E: RuntimeEnv<B>,
         C: ObjectCatalog<B>,
     {
-        let t = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&group));
+        let t = self.type_of(&group, catalog);
         let auth = catalog.authenticable(t, &group);
         for i in bits.iter() {
-            self.drop_offer(group, i, peer, env);
+            self.drop_offer(group, i, peer);
             if auth {
                 self.retry_offer(Ask::new(group, i), env, catalog);
             }
@@ -504,12 +511,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return;
         }
         self.groups.rec(group).stop_pull.replace(true);
-        let t = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&group));
+        let t = self.type_of(&group, catalog);
         if catalog.decode_at_k(t, &group) {
             self.groups.rec(group).state.replace(GroupState::Decoding);
             if let Some(h) = self.groups.get(&group).and_then(|r| r.hdr.as_ref()).copied() {
@@ -529,12 +531,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 self.arm(group, known_at + later, env);
             }
         }
-        for q in self.suppression_scope(&group, catalog) {
-            self.send_have(q, group, env, catalog);
-        }
+        self.for_each(self.suppression_scope(&group, catalog), |node, q| {
+            node.send_have(q, group, env, catalog);
+        });
         self.close_promises_of_group(&group);
         if self.groups.get(&group).and_then(|r| r.state.as_ref()) == Some(&GroupState::Decoding) {
-            env.start_decode(group);
+            self.start_decode(group, env, catalog);
         }
     }
 
@@ -568,12 +570,81 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         env.schedule_after(delay, TimerEvent::Reconsider { group, at_bits });
     }
 
-    /// Executes Level 2 group decoding, cross-group filling, repair pushes, and
-    /// Level 3 delivery (`protocol-v2.md` §4.6 `decode_group`) using
-    /// preallocated scratch buffers (zero heap allocation).
+    /// Collects the chunks held of `group` into `decode_in_scratch`, in index
+    /// order: its shape and their indices. `None` if there is nothing to
+    /// decode.
+    fn decode_inputs(&mut self, group: &GroupId) -> Option<(Shape, Bitmap)> {
+        if self.expired(group) {
+            return None;
+        }
+        let rec = self.groups.get(group)?;
+        let h = rec.hdr.as_ref().cloned()?;
+        let held = rec.mine.as_ref().copied().unwrap_or(Bitmap::EMPTY);
+        self.decode_in_scratch.clear();
+        let mut given = Bitmap::EMPTY;
+        // One lookup an index, not a pass over every group's chunks.
+        for i in held.iter() {
+            if let Some(ch) = self.chunks.get(&(*group, i)) {
+                let _ = self.decode_in_scratch.push(ch.clone());
+                given.set(i);
+            }
+        }
+        (!self.decode_in_scratch.is_empty()).then_some((h, given))
+    }
+
+    /// Hands the host the level 2 of `group` (`RuntimeEnv::start_decode`).
+    pub(crate) fn start_decode<E, C>(&mut self, group: GroupId, env: &mut E, catalog: &C)
+    where
+        E: RuntimeEnv<B>,
+        C: ObjectCatalog<B>,
+    {
+        let Some((h, given)) = self.decode_inputs(&group) else {
+            return;
+        };
+        let t = self.type_of(&group, catalog);
+        let chunks = self.decode_in_scratch.as_slice();
+        env.start_decode(group, DecodeJob { t, shape: &h, given, chunks });
+    }
+
+    /// Level 2 and what follows it, on this thread (`protocol-v2.md` §4.6
+    /// `decode_group`): for a host that does not decode elsewhere. Uses the
+    /// node's scratch buffers.
     pub fn decode_group<E, C, R>(
         &mut self,
         group: GroupId,
+        env: &mut E,
+        catalog: &mut C,
+        rng: &mut R,
+    ) where
+        E: RuntimeEnv<B>,
+        C: ObjectCatalog<B>,
+        R: RngSource,
+    {
+        let Some((h, given)) = self.decode_inputs(&group) else {
+            return;
+        };
+        let t = self.type_of(&group, catalog);
+        // Taken for the call: `on_decoded` borrows the node.
+        let mut out =
+            std::mem::replace(&mut self.decode_out_scratch, PreallocVec::with_capacity(0));
+        out.clear();
+        let decoded = catalog.decode(t, &group, &self.decode_in_scratch, &h, &mut out);
+        self.on_decoded(group, given, decoded, out.as_slice(), env, catalog, rng);
+        self.decode_out_scratch = out;
+    }
+
+    /// The result of a group's level 2 (`protocol-v2.md` §4.6 `decode_group`,
+    /// from the decode on): `decoded` and `rebuilt` are what
+    /// `TypeCodec::decode` gave for the job of `RuntimeEnv::start_decode`,
+    /// `given` is that job's. Stores what was rebuilt, fills the groups it
+    /// crosses, pushes repair and delivers; `None` drops the group.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_decoded<E, C, R>(
+        &mut self,
+        group: GroupId,
+        given: Bitmap,
+        decoded: Option<B>,
+        rebuilt: &[ChunkMsg<B>],
         env: &mut E,
         catalog: &mut C,
         rng: &mut R,
@@ -588,35 +659,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let Some(h) = self.groups.get(&group).and_then(|r| r.hdr.as_ref()).cloned() else {
             return;
         };
-        self.decode_in_scratch.clear();
-        // The chunks held, in index order: one lookup an index, not a pass over every
-        // group's.
-        let held =
-            self.groups.get(&group).and_then(|r| r.mine.as_ref()).copied().unwrap_or(Bitmap::EMPTY);
-        let mut given = Bitmap::EMPTY;
-        for i in held.iter() {
-            if let Some(ch) = self.chunks.get(&(group, i)) {
-                let _ = self.decode_in_scratch.push(ch.clone());
-                given.set(i);
-            }
-        }
-        if self.decode_in_scratch.is_empty() {
-            return;
-        }
-        let t = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&group));
-        self.decode_out_scratch.clear();
-        let decoded =
-            catalog.decode(t, &group, &self.decode_in_scratch, &h, &mut self.decode_out_scratch);
-        if self.expired(&group) {
-            return;
-        }
+        let t = self.type_of(&group, catalog);
         let Some(object) = decoded else {
-            self.drop_group(group, env);
+            self.drop_group(group);
             return;
         };
         let recv = self
@@ -631,21 +676,17 @@ impl<B: ChunkBuffer> SeacastNode<B> {
 
         // A chunk's place in the group is its place in `producible`, not its own index:
         // a chunk of two groups keeps the index of its first (`R4`).
-        let mut places = catalog.producible(t, &h, &given).iter();
-        for idx in 0..self.decode_out_scratch.len() {
-            let ch = self.decode_out_scratch[idx].clone();
-            let Some(i) = places.next() else {
-                break;
-            };
+        let places = catalog.producible(t, &h, &given);
+        for (ch, i) in rebuilt.iter().zip(places.iter()) {
             if !recv.has(i) {
                 let _ = new_indices.push(i);
                 self.store_chunk(group, i, ch.clone(), now);
                 self.groups.rec(group).rebuilt.get_or_insert_with(Default::default).set(i);
-                for (g2, i2) in Self::projections(catalog, t, &ch) {
+                for (g2, i2) in Self::projections(catalog, t, ch) {
                     if g2 == group {
                         continue;
                     }
-                    self.fill(g2, i2, &ch, None, env, catalog);
+                    self.fill(g2, i2, ch, None, env, catalog);
                     filled_groups.insert_unique(g2);
                 }
             }
@@ -661,13 +702,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
 
     /// Drops a group when Level 2 or Level 3 validation fails (`protocol.md`
     /// §4.6 `drop_group`).
-    pub fn drop_group<E>(&mut self, group: GroupId, env: &mut E)
-    where
-        E: RuntimeEnv<B>,
-    {
+    pub fn drop_group(&mut self, group: GroupId) {
         self.groups.rec(group).state.replace(GroupState::Invalid);
         self.groups.rec(group).stop_pull.replace(true);
-        env.cancel_group(&group);
+        self.sends.cancel_group(&group);
         self.gossip_history.remove_group(&group);
         self.discard_paced(&group);
         self.close_promises_of_group(&group);
@@ -692,7 +730,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             }
         }
         self.expiring.insert(group);
-        self.expire_due(env.now(), env);
+        self.expire_due(env.now());
     }
 
     /// Ends the active lifetime of every group past it (`protocol.md` §8.1): a
@@ -737,7 +775,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             if self.expiring.is_empty() {
                 break;
             }
-            self.expire_due(now, env);
+            self.expire_due(now);
         }
 
         self.tombstones.retain(|_, &mut until| now <= until);
@@ -745,10 +783,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
 
     /// Removes everything kept of the groups in `expiring` but their
     /// tombstones.
-    fn expire_due<E>(&mut self, now: Timestamp, env: &mut E)
-    where
-        E: RuntimeEnv<B>,
-    {
+    fn expire_due(&mut self, now: Timestamp) {
         let dead = core::mem::replace(&mut self.expiring, crate::PreallocSet::with_capacity(0));
         for &group in dead.iter() {
             let deadline = self.groups.remove(&group).and_then(|rec| rec.deadline);
@@ -767,19 +802,21 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.unwanted.retain(|(_, id)| !gone_id(id));
 
         self.pairs.retain(|(_, of)| !gone(of));
-        self.holders.retain(|(of, _), _| !gone(of));
-        self.standing.retain(|(of, _), _| !gone(of));
+        self.kept_parks.retain(|(_, of), _| !gone(of));
+        self.holders.retain_keys(|(of, _)| !gone(of));
+        self.standing.retain_keys(|(of, _)| !gone(of));
+        self.claims.retain_keys(|of| !gone(of));
 
         // The pull state: offers with their announcers' counts, then what hangs off an
         // ask.
-        let listed_count = &mut self.listed_count;
+        let slots = &mut self.slots;
         self.offers.retain(|ask, announcers| {
             if !gone(&ask.group) {
                 return true;
             }
-            for p in announcers.iter() {
-                if let Some(count) = listed_count.get_mut(p) {
-                    *count = count.saturating_sub(1);
+            for &p in announcers.iter() {
+                if let Some(slot) = slots.get_mut(p) {
+                    slot.listed_count = slot.listed_count.saturating_sub(1);
                 }
             }
             false
@@ -787,29 +824,31 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.tried.retain(|ask, _, _| !gone(&ask.group));
         self.asked_at.retain(|ask, _| !gone(&ask.group));
         self.promises.retain(|ask, _, _| !gone(&ask.group));
-        self.asked_parked.retain(|(of, _), _| !gone(of));
+        self.asked_parked.retain_keys(|(of, _)| !gone(of));
         self.last_resort_armed.retain(|(of, _)| !gone(of));
         self.retry_armed.retain(|ask| !gone(&ask.group));
         self.held_back.retain(|(of, _), _| !gone(of));
         self.tied.retain(|(_, of), _| !gone(of));
         self.reindex_ties();
-        let named_count = &mut self.named_count;
-        self.named.retain(|(peer, of), _| {
+        let slots = &mut self.slots;
+        self.named.retain(|&(peer, ref of), _| {
             if gone(of) {
-                if let Some(count) = named_count.get_mut(peer) {
-                    *count = count.saturating_sub(1);
+                if let Some(slot) = slots.get_mut(peer) {
+                    slot.named_count = slot.named_count.saturating_sub(1);
                 }
             }
             !gone(of)
         });
 
         self.probe_asks.retain(|ask| !gone(&ask.group));
+        self.probe_answers.retain(|(_, of, _)| !gone(of));
+        self.plan_refused.retain(|(_, of, _)| !gone(of));
         self.rsample_asked.retain(|(of, _, _)| !gone(of));
 
         // Queued chunks, offers and asks of them, and what is owed; their holdings
         // still leave.
         for g in dead.iter() {
-            env.cancel_group(g);
+            self.sends.cancel_group(g);
             self.gossip_history.remove_group(g);
             self.discard_paced(g);
         }

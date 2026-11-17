@@ -36,3 +36,52 @@ pub(crate) fn compress(state: &mut [u32; 8], blocks: &[u8]) {
         vst1q_u32(state.as_mut_ptr().add(4), efgh);
     }
 }
+
+/// [`compress`] for `S` states at once, each over its own `blocks`, all the
+/// same whole number of 64-byte blocks. The rounds of one message wait on each
+/// other and those of different messages do not, so several go through in the
+/// time of one.
+pub(crate) fn compress_many<const S: usize>(states: &mut [[u32; 8]; S], blocks: [&[u8]; S]) {
+    let count = blocks[0].len() / 64;
+    assert!(blocks.iter().all(|b| b.len() == 64 * count));
+    // SAFETY: as in `compress`; every block read is inside its slice, checked
+    // above.
+    unsafe {
+        let mut abcd: [uint32x4_t; S] = core::array::from_fn(|s| vld1q_u32(states[s].as_ptr()));
+        let mut efgh: [uint32x4_t; S] =
+            core::array::from_fn(|s| vld1q_u32(states[s].as_ptr().add(4)));
+        for b in 0..count {
+            let (abcd_in, efgh_in) = (abcd, efgh);
+            let mut m: [[uint32x4_t; 4]; S] = core::array::from_fn(|s| {
+                let block = blocks[s].as_ptr().add(64 * b);
+                core::array::from_fn(|i| {
+                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.add(16 * i))))
+                })
+            });
+            for i in 0..16 {
+                let k = vld1q_u32(K.as_ptr().add(4 * i));
+                for (s, m) in m.iter_mut().enumerate() {
+                    if i >= 4 {
+                        let head = vsha256su0q_u32(m[i % 4], m[(i + 1) % 4]);
+                        m[i % 4] = vsha256su1q_u32(head, m[(i + 2) % 4], m[(i + 3) % 4]);
+                    }
+                    let wk = vaddq_u32(m[i % 4], k);
+                    let abcd_before = abcd[s];
+                    abcd[s] = vsha256hq_u32(abcd[s], efgh[s], wk);
+                    efgh[s] = vsha256h2q_u32(efgh[s], abcd_before, wk);
+                }
+            }
+            for s in 0..S {
+                abcd[s] = vaddq_u32(abcd[s], abcd_in[s]);
+                efgh[s] = vaddq_u32(efgh[s], efgh_in[s]);
+            }
+        }
+        for (s, state) in states.iter_mut().enumerate() {
+            vst1q_u32(state.as_mut_ptr(), abcd[s]);
+            vst1q_u32(state.as_mut_ptr().add(4), efgh[s]);
+        }
+    }
+}
+
+/// Messages [`compress_many`] is given at once, at most.
+pub(crate) const STREAMS: usize = 4;

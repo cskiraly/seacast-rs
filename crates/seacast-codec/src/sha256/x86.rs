@@ -52,7 +52,7 @@ pub(crate) fn compress(state: &mut [u32; 8], blocks: &[u8]) {
 /// same whole number of 64-byte blocks. The rounds of one message wait on each
 /// other and those of different messages do not, so several go through in the
 /// time of one.
-fn compress_many<const S: usize>(states: &mut [[u32; 8]; S], blocks: [&[u8]; S]) {
+pub(crate) fn compress_many<const S: usize>(states: &mut [[u32; 8]; S], blocks: [&[u8]; S]) {
     let count = blocks[0].len() / 64;
     assert!(blocks.iter().all(|b| b.len() == 64 * count));
     // SAFETY: as in `compress`; every block read is inside its slice, checked
@@ -105,49 +105,5 @@ fn compress_many<const S: usize>(states: &mut [[u32; 8]; S], blocks: [&[u8]; S])
     }
 }
 
-/// Messages [`sha256_prefixed`] takes at once, at most: more gain nothing.
+/// Messages [`compress_many`] is given at once, at most: more gain nothing.
 pub(crate) const STREAMS: usize = 4;
-
-/// The states of `sha256(prefix || data[s])` for `S` `data` of one length,
-/// before their output as digests.
-///
-/// The prefix shifts the data by a byte against the blocks: the first block and
-/// what follows the last whole one are staged, with the padding, and the blocks
-/// between are read where they lie.
-pub(crate) fn sha256_prefixed<const S: usize>(prefix: u8, data: [&[u8]; S]) -> [[u32; 8]; S] {
-    let len = data[0].len();
-    assert!(data.iter().all(|d| d.len() == len));
-    // Ends the message in `staged`, which holds its last `filled` bytes: the
-    // blocks that makes.
-    let finish = |staged: &mut [u8; 128], filled: usize| {
-        staged[filled] = 0x80;
-        let blocks = if filled + 9 <= 64 { 1 } else { 2 };
-        staged[64 * blocks - 8..64 * blocks].copy_from_slice(&((len as u64 + 1) * 8).to_be_bytes());
-        blocks
-    };
-    let mut states = [super::H0; S];
-    let mut staged = [[0u8; 128]; S];
-    let head = len.min(63);
-    let mut blocks = 1;
-    for (staged, data) in staged.iter_mut().zip(data) {
-        staged[0] = prefix;
-        staged[1..1 + head].copy_from_slice(&data[..head]);
-        if len < 63 {
-            blocks = finish(staged, 1 + len);
-        }
-    }
-    compress_many(&mut states, core::array::from_fn(|s| &staged[s][..64 * blocks]));
-    if len < 63 {
-        return states;
-    }
-    let whole = (len - 63) / 64 * 64;
-    compress_many(&mut states, core::array::from_fn(|s| &data[s][63..63 + whole]));
-    let rest = len - 63 - whole;
-    staged = [[0u8; 128]; S];
-    for (staged, data) in staged.iter_mut().zip(data) {
-        staged[..rest].copy_from_slice(&data[63 + whole..]);
-        blocks = finish(staged, rest);
-    }
-    compress_many(&mut states, core::array::from_fn(|s| &staged[s][..64 * blocks]));
-    states
-}

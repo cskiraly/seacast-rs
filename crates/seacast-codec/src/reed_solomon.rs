@@ -189,24 +189,44 @@ fn combine(m: &Matrix, srcs: &[&[u8]], dsts: &mut [&mut [u8]]) {
     assert_eq!(srcs.len(), m.cols);
     assert_eq!(dsts.len() * m.cols, m.bytes.len());
     assert!(srcs.iter().all(|src| src.len() == size) && dsts.iter().all(|dst| dst.len() == size));
+    // Segments of one buffer lie a multiple of the cache's way apart, or nearly,
+    // and a strip of each then falls in the same few sets. Read once per
+    // row, they evict each other; copied side by side first, they do not.
+    let gather = GATHER && dsts.len() > 2;
+    let mut work = vec![0u8; if gather { m.cols * STRIP } else { 0 }];
     for at in (0..size).step_by(STRIP) {
         let end = (at + STRIP).min(size);
-        let grouped = grouped_rows(m, srcs, at, end, dsts);
+        let gathered: Vec<&[u8]>;
+        let (srcs, from) = if gather {
+            let slots = work.as_chunks_mut::<STRIP>().0;
+            for (slot, src) in slots.iter_mut().zip(srcs) {
+                slot[..end - at].copy_from_slice(&src[at..end]);
+            }
+            gathered = slots.iter().map(|slot| &slot[..]).collect();
+            (&gathered[..], 0)
+        } else {
+            (srcs, at)
+        };
+        let grouped = grouped_rows(m, srcs, from, at, end, dsts);
         for (r, dst) in dsts.iter_mut().enumerate().skip(grouped) {
             let dst = &mut dst[at..end];
-            let done = kernel::row(&m.coeffs[r * m.cols..][..m.cols], srcs, at, dst);
-            scalar_row(m.row(r), srcs, at + done, &mut dst[done..]);
+            let done = kernel::row(&m.coeffs[r * m.cols..][..m.cols], srcs, from, dst);
+            scalar_row(m.row(r), srcs, from + done, &mut dst[done..]);
         }
     }
 }
 
-/// [`combine`] over `at..end` of every segment, by the kernel that takes
-/// several rows a pass: eight while there are, then four, then two. Returns the
-/// rows done: the rest are the caller's.
-#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"))]
+/// [`combine`] over `at..end` of every destination, from `from` of every
+/// source, by the kernel that takes several rows a pass: eight while there
+/// are, then four, then two. Returns the rows done: the rest are the caller's.
+#[cfg(any(
+    all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"),
+    all(target_arch = "aarch64", target_feature = "neon")
+))]
 fn grouped_rows(
     m: &Matrix,
     srcs: &[&[u8]],
+    from: usize,
     at: usize,
     end: usize,
     dsts: &mut [&mut [u8]],
@@ -217,15 +237,15 @@ fn grouped_rows(
             let group = &mut dsts[r..r + size];
             let coeffs = &m.coeffs[r * m.cols..][..size * m.cols];
             let done = match size {
-                8 => kernel::rows::<8>(coeffs, srcs, at, end - at, group),
-                4 => kernel::rows::<4>(coeffs, srcs, at, end - at, group),
-                _ => kernel::rows::<2>(coeffs, srcs, at, end - at, group),
+                8 => kernel::rows::<8>(coeffs, srcs, from, at, end - at, group),
+                4 => kernel::rows::<4>(coeffs, srcs, from, at, end - at, group),
+                _ => kernel::rows::<2>(coeffs, srcs, from, at, end - at, group),
             };
             // What is left of the strip, a row at a time.
             for (g, dst) in group.iter_mut().enumerate() {
-                let (at, dst) = (at + done, &mut dst[at + done..end]);
-                let done = kernel::row(&m.coeffs[(r + g) * m.cols..][..m.cols], srcs, at, dst);
-                scalar_row(m.row(r + g), srcs, at + done, &mut dst[done..]);
+                let (from, dst) = (from + done, &mut dst[at + done..end]);
+                let done = kernel::row(&m.coeffs[(r + g) * m.cols..][..m.cols], srcs, from, dst);
+                scalar_row(m.row(r + g), srcs, from + done, &mut dst[done..]);
             }
             r += size;
         }
@@ -233,8 +253,18 @@ fn grouped_rows(
     r
 }
 
-#[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f")))]
-fn grouped_rows(_: &Matrix, _: &[&[u8]], _: usize, _: usize, _: &mut [&mut [u8]]) -> usize {
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"),
+    all(target_arch = "aarch64", target_feature = "neon")
+)))]
+fn grouped_rows(
+    _: &Matrix,
+    _: &[&[u8]],
+    _: usize,
+    _: usize,
+    _: usize,
+    _: &mut [&mut [u8]],
+) -> usize {
     0
 }
 
@@ -243,8 +273,19 @@ fn grouped_rows(_: &Matrix, _: &[&[u8]], _: usize, _: usize, _: &mut [&mut [u8]]
 /// pass.
 #[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"))]
 const FFT_FROM_HALF_ROWS: usize = 8;
-#[cfg(not(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f")))]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+const FFT_FROM_HALF_ROWS: usize = 4;
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"),
+    all(target_arch = "aarch64", target_feature = "neon")
+)))]
 const FFT_FROM_HALF_ROWS: usize = 3;
+
+/// Whether [`combine`] copies a strip of the sources side by side before it
+/// reads them: where a row is a pass over them. The kernel that takes several
+/// rows a pass reads them too few times to gain.
+const GATHER: bool =
+    !cfg!(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"));
 
 /// Rows `k..n` of the systematic generator over the points `0..n`: row `r`
 /// holds the Lagrange basis polynomials of the points `0..k`, evaluated at `r`.

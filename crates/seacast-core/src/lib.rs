@@ -33,23 +33,28 @@ pub mod window;
 
 pub use bitmap::{BITMAP_WORDS, Bitmap, MAX_BITMAP_BITS, MAX_HAVE_BYTES};
 pub use collections::{
-    InlineVec, MAX_CHUNKS, MAX_ENTRY_CONTROL, MAX_INLINE_OFFERS, MAX_INLINE_PEERS, MAX_PROJECTED,
-    PreallocDeque, PreallocMap, PreallocSet, PreallocVec,
+    InlineVec, MAX_CHUNKS, MAX_ENTRY_CONTROL, MAX_INLINE_OFFERS, MAX_INLINE_PEERS,
+    MAX_JOINED_TYPES, MAX_PROJECTED, PeerSets, PeerSlab, PreallocDeque, PreallocMap, PreallocSet,
+    PreallocVec,
 };
 pub use message::{
     ChunkMsg, Control, Evidence, Graft, Have, Join, Prune, QueueEntry, Queued, Rpc, Want,
 };
 pub use node::SeacastNode;
-pub use queue::{QueueEnv, SendQueues, WithQueues};
-pub use state::{AskPeers, DispatchOutcome, GossipHistory, Group, Groups, Pairs, PeerQueue};
+pub use queue::SendQueues;
+pub use state::{
+    AskPeers, DispatchOutcome, GossipHistory, Group, Groups, Pairs, Peer, PeerQueue, PeerSet,
+    Relations,
+};
 pub use traits::{
-    BoundedDeferredStore, ChunkBuffer, DeferredStore, Domain, ObjectCatalog, PenaltyReason, Policy,
-    RngSource, RuntimeEnv, SplitMix64, TimerEvent, TypeCodec,
+    BoundedDeferredStore, ChunkBuffer, DecodeJob, DeferredStore, Domain, ObjectCatalog,
+    PenaltyReason, Policy, RngSource, RuntimeEnv, SplitMix64, TimerEvent, TypeCodec,
 };
 pub use types::{
     AnnounceWidth, Ask, Bytes32, CapacityConfig, ChunkId, Colour, Direction, Duty, FamilyId,
-    GroupId, GroupState, HaveEntry, InterestKind, NodeConfig, NodeId, PeerId, PushEntry,
-    RepairVerdict, Shape, Timestamp, TypeId, TypeParams, UplinkClass, ValidationResult,
+    GenerationPeerId, GroupId, GroupState, HaveEntry, InterestKind, LinkFloor, NodeConfig, NodeId,
+    PeerId, PushEntry, RepairVerdict, Shape, Timestamp, TypeId, TypeParams, UplinkClass,
+    ValidationResult,
 };
 
 #[cfg(test)]
@@ -131,10 +136,7 @@ mod tests {
             self.now
         }
         fn schedule_after(&mut self, _delay: f64, _event: TimerEvent) {}
-        fn send(&mut self, _peer: PeerId, _item: Queued, _urgent: bool) -> bool {
-            false
-        }
-        fn start_decode(&mut self, _group: GroupId) {}
+        fn start_decode(&mut self, _group: GroupId, _job: crate::DecodeJob<'_, FixedChunkBuf>) {}
         fn deliver(&mut self, group: GroupId, _object: FixedChunkBuf) {
             self.delivered_count += 1;
             self.last_delivered_group = Some(group);
@@ -227,7 +229,7 @@ mod tests {
                 colours: 0,
             }
         }
-        fn joined_types(&self) -> InlineVec<TypeId, 8> {
+        fn joined_types(&self) -> InlineVec<TypeId, MAX_JOINED_TYPES> {
             InlineVec::singleton(TYPE)
         }
         fn tiebreak(&self, chunk_id: &ChunkId, peer: PeerId) -> u64 {
@@ -244,7 +246,7 @@ mod tests {
     fn test_zero_heap_allocation_on_hot_path() {
         let cfg = NodeConfig::default();
         let mut node: SeacastNode<FixedChunkBuf> = SeacastNode::new(cfg.clone());
-        let mut env = WithQueues::new(cfg.clone(), MockEnv::new());
+        let mut env = MockEnv::new();
         let mut catalog = MockCatalog { params: TypeParams::default(), n: 4, k: 2 };
         let mut rng = SplitMix64::new(42);
         let mut defer_store = BoundedDeferredStore::default();
@@ -255,15 +257,13 @@ mod tests {
         TRACK_ALLOCS.store(true, Ordering::SeqCst);
 
         // 1. Connect peers and exchange Joins / Grafts
-        env.queues.connect(1);
-        env.queues.connect(2);
         node.connect_peer(1, true, &mut env, &catalog);
         node.connect_peer(2, true, &mut env, &catalog);
-        node.maintain_relations(TYPE, &mut env, &catalog);
+        node.maintain_relations(TYPE, &mut env, &catalog, &mut rng);
 
         // 2. Drain initial Join/Graft control messages
-        while let DispatchOutcome::Send(_) = env.next_to_send(&mut node, 1, &catalog) {}
-        while let DispatchOutcome::Send(_) = env.next_to_send(&mut node, 2, &catalog) {}
+        while let DispatchOutcome::Send(_) = node.next_to_send(1, &mut env, &catalog) {}
+        while let DispatchOutcome::Send(_) = node.next_to_send(2, &mut env, &catalog) {}
 
         // 3. Receive chunks, trigger threshold K completion, decode & rebuild N chunks,
         //    forward/announce
@@ -313,11 +313,11 @@ mod tests {
         // 4. Receive Have and Want messages and drain writer queue
         let mut rpc_have = Rpc::default();
         let _ = rpc_have.joins.push(peer_join);
-        let _ = rpc_have.haves.push(Have::holding(group, Bitmap::singleton(0), false, false));
-        let _ = rpc_have.wants.push(Want::pull_ask(Ask { group, index: 2 }));
+        let _ = rpc_have.haves.push(Have::holding(TYPE, group, Bitmap::singleton(0), false, false));
+        let _ = rpc_have.wants.push(Want::pull_ask(TYPE, Ask { group, index: 2 }));
         node.on_rpc(2, rpc_have, &mut env, &mut catalog, &mut rng, &mut defer_store);
 
-        while let DispatchOutcome::Send(_) = env.next_to_send(&mut node, 2, &catalog) {}
+        while let DispatchOutcome::Send(_) = node.next_to_send(2, &mut env, &catalog) {}
 
         // 5. Heartbeat and pace tick
         node.on_timer(TimerEvent::Heartbeat, &mut env, &mut catalog, &mut rng, &mut defer_store);

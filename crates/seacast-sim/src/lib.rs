@@ -8,9 +8,9 @@ use std::{
 use seacast_codec::sha256;
 use seacast_core::{
     AnnounceWidth, Bitmap, BoundedDeferredStore, ChunkBuffer, ChunkId, ChunkMsg, DispatchOutcome,
-    Domain, Duty, FamilyId, GroupId, InlineVec, InterestKind, Join, MAX_CHUNKS, MAX_PROJECTED,
-    NodeConfig, NodeId, PeerId, PenaltyReason, Policy, PreallocVec, QueueEntry, Queued, RngSource,
-    RuntimeEnv, SeacastNode, SendQueues, Shape, SplitMix64, TimerEvent, Timestamp, TypeCodec,
+    Domain, Duty, FamilyId, GroupId, InlineVec, InterestKind, Join, MAX_CHUNKS, MAX_JOINED_TYPES,
+    MAX_PROJECTED, NodeConfig, NodeId, PeerId, PenaltyReason, Policy, PreallocVec, QueueEntry,
+    RngSource, RuntimeEnv, SeacastNode, Shape, SplitMix64, TimerEvent, Timestamp, TypeCodec,
     TypeId, TypeParams, ValidationResult,
 };
 
@@ -239,6 +239,10 @@ impl TypeCodec<SimBlob> for SimCatalog {
 }
 
 impl Domain for SimCatalog {
+    fn sample_scope(&self, _t: TypeId, group: &GroupId) -> GroupId {
+        self.group_headers.get(group).map_or(*group, |h| h.block)
+    }
+
     fn authenticate(
         &mut self,
         t: TypeId,
@@ -396,7 +400,7 @@ impl Policy for SimCatalog {
         }
     }
 
-    fn joined_types(&self) -> InlineVec<TypeId, 8> {
+    fn joined_types(&self) -> InlineVec<TypeId, MAX_JOINED_TYPES> {
         match self.setting {
             SimSetting::Tier4 | SimSetting::VariantC => InlineVec::singleton(PAYLOAD),
             SimSetting::Custody | SimSetting::Sampling => {
@@ -407,6 +411,24 @@ impl Policy for SimCatalog {
                 }
             }
             SimSetting::Rows => InlineVec::from_slice(&[COLUMN, ROW]),
+        }
+    }
+
+    fn holds_family(
+        &self,
+        t: TypeId,
+        family: FamilyId,
+        peer: PeerId,
+        _node_id: &NodeId,
+        _join: &Join,
+    ) -> bool {
+        match t {
+            COLUMN => self.custody_map.get(&peer).is_some_and(|s| s.contains(&family)),
+            ROW => {
+                self.row_subnet_map.get(&peer).copied() == Some(family) &&
+                    !self.samplers.contains(&peer)
+            }
+            _ => true,
         }
     }
 
@@ -567,16 +589,11 @@ impl RuntimeEnv<SimBlob> for SimNodeEnv {
         self.scheduled.push((delay, event));
     }
 
-    // Every node call is given `SendQueues::env`, which takes what is sent.
-    fn send(&mut self, _peer: PeerId, _item: Queued, _urgent: bool) -> bool {
-        false
-    }
-
     fn wake_writer(&mut self, peer: PeerId) {
         self.woken_writers.insert(peer);
     }
 
-    fn start_decode(&mut self, group: GroupId) {
+    fn start_decode(&mut self, group: GroupId, _job: seacast_core::DecodeJob<'_, SimBlob>) {
         self.started_decodes.push(group);
     }
 
@@ -810,7 +827,6 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
 
     // 3. Instantiate nodes, catalogs, RNGs, and topologies
     let mut nodes: BTreeMap<PeerId, SeacastNode<SimBlob>> = BTreeMap::new();
-    let mut queues: BTreeMap<PeerId, SendQueues> = BTreeMap::new();
     let mut catalogs: BTreeMap<PeerId, SimCatalog> = BTreeMap::new();
     let mut rngs: BTreeMap<PeerId, SplitMix64> = BTreeMap::new();
     let mut deferred_stores: BTreeMap<PeerId, BoundedDeferredStore> = BTreeMap::new();
@@ -833,9 +849,11 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
         let row_params = TypeParams {
             announce_extra: AnnounceWidth::AllJoined,
             eager: false,
-            start_delay: 0.05,
+            // `protocol-v2.md` §6.3: the rows' first ask and a claim's deferral, both
+            // decided at one second.
+            start_delay: 1.0,
             serve_limit: (cfg.num_columns / 2) as usize,
-            defer_window: 0.5,
+            defer_window: 1.0,
             ..Default::default()
         };
 
@@ -863,7 +881,6 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
             installed_blocks: installed_blocks.clone(),
             keeps_rows,
         };
-        queues.insert(nid, SendQueues::new(node_cfg.clone()));
         nodes.insert(nid, SeacastNode::new(node_cfg));
         catalogs.insert(nid, cat);
         rngs.insert(nid, SplitMix64::new((cfg.seed << 20) ^ nid));
@@ -880,12 +897,12 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
             let cat_j = &catalogs[&j];
             let node_i = nodes.get_mut(&i).unwrap();
             let mut dummy_env = SimNodeEnv::new(0.0);
-            let queues_i = queues.get_mut(&i).unwrap();
-            queues_i.connect(j);
-            node_i.connect_peer(j, false, &mut queues_i.env(&mut dummy_env), cat_i);
+            node_i.connect_peer(j, false, &mut dummy_env, cat_i);
             for t in [PAYLOAD, COLUMN, ROW] {
-                let _ = node_i.join_sent.insert((j, t), cat_i.our_join(t));
-                let _ = node_i.join_recv.insert((j, t), cat_j.our_join(t));
+                let slot = node_i.slots.get_mut(j).expect("connected");
+                let _ = slot.join_sent.insert(t, cat_i.our_join(t));
+                let _ = slot.join_recv.insert(t, cat_j.our_join(t));
+                node_i.relink(j, t);
             }
         }
     }
@@ -964,19 +981,11 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
         let node1 = nodes.get_mut(&1).unwrap();
         let cat1 = catalogs.get(&1).unwrap();
         let rng1 = rngs.get_mut(&1).unwrap();
-        let queues1 = queues.get_mut(&1).unwrap();
         for &g in &published_groups {
             let hdr = group_headers[&g].clone();
             let shards: Vec<ChunkMsg<SimBlob>> = canonical_chunks[&g].values().cloned().collect();
             chunks_published += shards.len();
-            node1.publish(
-                g,
-                Shape { n: hdr.n, k: hdr.k },
-                &shards,
-                &mut queues1.env(&mut env),
-                cat1,
-                rng1,
-            );
+            node1.publish(g, Shape { n: hdr.n, k: hdr.k }, &shards, &mut env, cat1, rng1);
         }
         for (delay, ev) in env.scheduled {
             schedule(&mut heap, delay, 1, SimAction::Timer(ev));
@@ -1023,8 +1032,7 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                 let g_col = col_groups_by_block[&(block_root, col)];
                 let bits = Bitmap::singleton(0) | Bitmap::singleton(1);
                 declared_samples.insert((sid, g_col), bits);
-                let sends = queues.get_mut(&sid).unwrap();
-                node.sample(g_col, bits, &mut sends.env(&mut env), cat, rng);
+                node.sample(g_col, bits, &mut env, cat, rng);
             }
             for (delay, ev) in env.scheduled {
                 schedule(&mut heap, delay, sid, SimAction::Timer(ev));
@@ -1051,7 +1059,6 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
         let now = ev.time;
         let nid = ev.node;
         let mut env = SimNodeEnv::new(now);
-        let sends = queues.get_mut(&nid).unwrap();
 
         match ev.action {
             SimAction::Timer(timer_ev) => {
@@ -1061,9 +1068,7 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                     let cat = catalogs.get_mut(&nid).unwrap();
                     let rng = rngs.get_mut(&nid).unwrap();
                     let def_store = deferred_stores.get_mut(&nid).unwrap();
-                    if !sends.on_timer(timer_ev, &mut env) {
-                        node.on_timer(timer_ev, &mut sends.env(&mut env), cat, rng, def_store);
-                    }
+                    node.on_timer(timer_ev, &mut env, cat, rng, def_store);
                 }
                 if is_hb && now + 0.700 <= 8.0 {
                     schedule(&mut heap, now + 0.700, nid, SimAction::Timer(TimerEvent::Heartbeat));
@@ -1073,14 +1078,14 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                 let node = nodes.get_mut(&nid).unwrap();
                 let cat = catalogs.get_mut(&nid).unwrap();
                 let rng = rngs.get_mut(&nid).unwrap();
-                node.decode_group(g, &mut sends.env(&mut env), cat, rng);
+                node.decode_group(g, &mut env, cat, rng);
             }
             SimAction::WriterRun(peer) => {
                 loop {
                     let outcome = {
                         let node = nodes.get_mut(&nid).unwrap();
                         let cat = catalogs.get(&nid).unwrap();
-                        sends.next_to_send(node, peer, &mut env, cat)
+                        node.next_to_send(peer, &mut env, cat)
                     };
                     match outcome {
                         DispatchOutcome::Send(mut entry) => {
@@ -1135,7 +1140,9 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                                             .unwrap_or_else(|| rcv_cat.own_interest(t2, &g2))
                                             .has(i2)
                                     });
-                                if !wants_primary && !wants_cross {
+                                // I3 binds pushes. An answer was asked for: a forwarder's, to
+                                // its WANT for a routed request, is outside its interest (§4.5).
+                                if !entry.solicited && !wants_primary && !wants_cross {
                                     violations_i3 += 1;
                                 }
 
@@ -1181,7 +1188,7 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                 let cat = catalogs.get_mut(&nid).unwrap();
                 let rng = rngs.get_mut(&nid).unwrap();
                 let def_store = deferred_stores.get_mut(&nid).unwrap();
-                node.on_rpc(from, rpc, &mut sends.env(&mut env), cat, rng, def_store);
+                node.on_rpc(from, rpc, &mut env, cat, rng, def_store);
 
                 // Record completion timestamps when `stop_pull[g]` becomes true
                 for (g, rec) in node.groups.iter() {

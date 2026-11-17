@@ -1,10 +1,14 @@
 use crate::{
     bitmap::{Bitmap, MAX_BITMAP_BITS},
-    collections::{InlineVec, MAX_INLINE_PEERS},
+    collections::{InlineVec, PreallocVec},
     message::{ChunkMsg, Have, Queued},
     node::SeacastNode,
+    state::{PeerSet, PushCand},
     traits::{ChunkBuffer, ObjectCatalog, RngSource, RuntimeEnv},
-    types::{AnnounceWidth, Duty, GroupId, GroupState, PeerId, Shape, Timestamp},
+    types::{
+        AnnounceWidth, Colour, Duty, FamilyId, GroupId, GroupState, PeerId, Shape, Timestamp,
+        TypeId,
+    },
 };
 
 /// Peers one chunk of a published group is planned for: its budget `R`, with
@@ -14,28 +18,12 @@ const MAX_PLAN_TARGETS: usize = 8;
 impl<B: ChunkBuffer> SeacastNode<B> {
     /// Returns the suppression scope of `group`: peers that may push this
     /// family to us (`protocol-v2.md` §4.2 `suppression_scope`).
-    pub fn suppression_scope<C>(
-        &self,
-        group: &GroupId,
-        catalog: &C,
-    ) -> InlineVec<PeerId, MAX_INLINE_PEERS>
+    pub fn suppression_scope<C>(&self, group: &GroupId, catalog: &C) -> PeerSet
     where
         C: ObjectCatalog<B>,
     {
-        let t = self
-            .groups
-            .get(group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(group));
-        let fam = catalog.family(t, group);
-        let mut out = InlineVec::new();
-        for q in self.links(t) {
-            if self.has_push_in_any_colour(q, t, fam) {
-                let _ = out.push(q);
-            }
-        }
-        out
+        let t = self.type_of(group, catalog);
+        PeerSet::Scope(t, catalog.family(t, group), catalog.params(t).m.max(1))
     }
 
     /// Sends a holding (`Have` with `offer = false`) on the urgent lane
@@ -52,7 +40,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         if self.groups.get(&group).is_some_and(|r| r.origin.is_some()) &&
             self.config.merge_holdings &&
-            env.merge_holding(peer, &h)
+            self.sends.merge_waiting(peer, &h)
         {
             return;
         }
@@ -92,7 +80,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 .unwrap_or(false);
             (whole, done)
         };
-        Have::holding(group, bits, whole, done)
+        Have::holding(self.type_of(&group, catalog), group, bits, whole, done)
     }
 
     /// Returns what our holding says of `group` (`have_bits(g)` in
@@ -125,40 +113,32 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             if self.expired(&g) {
                 continue;
             }
-            let t = self
-                .groups
-                .get(&g)
-                .and_then(|r| r.t_of.as_ref())
-                .copied()
-                .unwrap_or_else(|| catalog.type_of_group(&g));
+            let t = self.type_of(&g, catalog);
             if catalog.duty_for(t, &g) != Duty::Forward {
                 continue;
             }
             let fam = catalog.family(t, &g);
             let m = catalog.params(t).m.max(1) as u32;
             let c = (i % m) as u16;
-            let pushers = self.out_pushees(t, fam, c);
-            let mut holding: InlineVec<PeerId, MAX_INLINE_PEERS> = InlineVec::new();
-            let mut cands: InlineVec<PeerId, MAX_INLINE_PEERS> = InlineVec::new();
-            for &q in &pushers {
-                let has_i = self.pairs.peer_has(&(q, g)).map(|e| e.has(i)).unwrap_or(false);
-                if has_i {
-                    let _ = holding.push(q);
-                } else if q != from_peer &&
-                    self.interest_of_peer(q, &g, catalog).has(i) &&
-                    !self.pairs.peer_has(&(q, g)).map(|e| e.complete).unwrap_or(false)
-                {
-                    let _ = cands.push(q);
-                }
-            }
+            let pushees = self.out_pushees(t, fam, c);
+            let held = |node: &Self, q: PeerId| {
+                node.pairs.peer_has(&(q, g)).map(|e| e.has(i)).unwrap_or(false)
+            };
+            let cand = |node: &Self, q: PeerId| {
+                !held(node, q) &&
+                    q != from_peer &&
+                    node.interest_of_peer(q, &g, catalog).has(i) &&
+                    !node.pairs.peer_has(&(q, g)).map(|e| e.complete).unwrap_or(false)
+            };
+            let holding = self.peers_of(pushees).filter(|&q| held(self, q)).count();
             let budget = if catalog.params(t).eager {
-                self.config.r_node().saturating_sub(holding.len())
+                self.config.r_node().saturating_sub(holding)
             } else {
                 0
             };
             let targets =
-                self.choose_push(chunk, &g, &cands, budget, false, env.now(), catalog, rng);
-            for &q in &targets {
+                self.choose_push(chunk, &g, pushees, &cand, budget, false, env.now(), catalog, rng);
+            for &q in targets.iter() {
                 let entry = Queued::Chunk { group: g, index: i, solicited: false };
                 if self.enqueue(q, entry, false, env) {
                     self.note_push(q, g, i, env.now());
@@ -166,94 +146,88 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                     self.owe(q, g, Bitmap::singleton(i), env);
                 }
             }
-            for &q in &cands {
-                if !targets.contains(&q) {
-                    self.announce(q, g, Bitmap::singleton(i), env, catalog);
+            self.for_each(pushees, |node, q| {
+                if cand(node, q) && !targets.contains(&q) {
+                    node.announce(q, g, Bitmap::singleton(i), env, catalog);
                 }
-            }
-            for q in self.announce_extra(&g, i, catalog) {
-                self.announce(q, g, Bitmap::singleton(i), env, catalog);
-            }
+            });
+            self.peer_scratch = targets;
+            self.announce_extra(g, i, env, catalog);
         }
         self.put_gossip(chunk, catalog);
     }
 
-    /// Chooses up to `budget` push targets from `cands` (`protocol.md` §5.3
-    /// `choose_push`, `[c16]`) with zero heap allocation.
+    /// Chooses up to `budget` push targets among the peers of `set` that `cand`
+    /// accepts (`protocol.md` §5.3 `choose_push`, `[c16]`). The targets come
+    /// in the node's peer scratch, which the caller gives back
+    /// (`self.peer_scratch`).
     #[allow(clippy::too_many_arguments)]
     pub fn choose_push<C, R>(
-        &self,
+        &mut self,
         chunk: &ChunkMsg<B>,
         group: &GroupId,
-        cands: &[PeerId],
+        set: PeerSet,
+        cand: &impl Fn(&Self, PeerId) -> bool,
         budget: usize,
         at_source: bool,
         now: Timestamp,
         catalog: &C,
         rng: &mut R,
-    ) -> InlineVec<PeerId, MAX_INLINE_PEERS>
+    ) -> PreallocVec<PeerId>
     where
         C: ObjectCatalog<B>,
         R: RngSource,
     {
-        if budget >= cands.len() {
-            return InlineVec::from_slice(cands);
-        }
+        let mut targets = std::mem::replace(&mut self.peer_scratch, PreallocVec::with_capacity(0));
+        targets.clear();
         if budget == 0 {
-            return InlineVec::new();
+            return targets;
         }
-        let mut order = InlineVec::<PeerId, MAX_INLINE_PEERS>::from_slice(cands);
-        order.as_mut_slice().sort_by(|&a, &b| {
-            let ta = (catalog.tiebreak(&chunk.cached_id, a), catalog.node_id(a));
-            let tb = (catalog.tiebreak(&chunk.cached_id, b), catalog.node_id(b));
-            tb.cmp(&ta)
+        for q in self.peers_of(set).filter(|&q| cand(self, q)) {
+            let _ = targets.push(q);
+        }
+        if budget >= targets.len() {
+            return targets;
+        }
+        // Ordered by the tiebreak, larger first; under `[c16]` the proven come before
+        // the unproven and, of each, those that know less first. A total order, so
+        // that the sort needs no buffer.
+        let card16 = self.config.card16_enabled;
+        let mut order = std::mem::replace(&mut self.push_scratch, PreallocVec::with_capacity(0));
+        order.clear();
+        for &p in targets.iter() {
+            let (unproven, known) = if card16 {
+                let has_bits = &self.pairs.has_bits(&(p, *group));
+                let pushed_bits = &self.pairs.pushed_bits(&(p, *group));
+                (self.guard_fails(p, group, now), (has_bits | pushed_bits).popcount())
+            } else {
+                (false, 0)
+            };
+            let tie = (catalog.tiebreak(&chunk.cached_id, p), catalog.node_id(p));
+            let _ = order.push(PushCand { unproven, known, tie, peer: p });
+        }
+        order.as_mut_slice().sort_unstable_by(|a, b| {
+            (a.unproven, a.known)
+                .cmp(&(b.unproven, b.known))
+                .then(b.tie.cmp(&a.tie))
+                .then(a.peer.cmp(&b.peer))
         });
-
-        if !self.config.card16_enabled {
-            order.truncate(budget);
-            return order;
-        }
-
-        let peer_metrics = |p: PeerId| -> (bool, u32) {
-            let has_bits = &self.pairs.has_bits(&(p, *group));
-            let pushed_bits = &self.pairs.pushed_bits(&(p, *group));
-            let known = (has_bits | pushed_bits).popcount();
-            let unproven = self.guard_fails(p, group, now);
-            (unproven, known)
-        };
-
-        order.as_mut_slice().sort_by_key(|&p| peer_metrics(p));
-
-        if !at_source {
-            let mut ok: InlineVec<(PeerId, u32), MAX_INLINE_PEERS> = InlineVec::new();
-            for &p in order.iter() {
-                let (unproven, known) = peer_metrics(p);
-                if !unproven {
-                    let _ = ok.push((p, known));
-                }
-            }
-            if !ok.is_empty() {
-                let median = ok[(ok.len() - 1) / 2].1;
-                let mut pool: InlineVec<PeerId, MAX_INLINE_PEERS> = InlineVec::new();
-                for &(p, known) in ok.iter() {
-                    if known <= median {
-                        let _ = pool.push(p);
-                    }
-                }
-                let draw_len = budget.min(pool.len());
-                let drawn: InlineVec<PeerId, MAX_INLINE_PEERS> =
-                    rng.sample_without_replacement(&pool, draw_len);
-                let mut new_order = drawn;
-                for &p in order.iter() {
-                    if !new_order.contains(&p) {
-                        let _ = new_order.push(p);
-                    }
-                }
-                order = new_order;
+        if card16 && !at_source {
+            // Of the proven, those at or under the median of what they know: drawn at
+            // random, ahead of the rest.
+            let proven = order.iter().take_while(|c| !c.unproven).count();
+            if proven > 0 {
+                let median = order[(proven - 1) / 2].known;
+                let pool = order[..proven].iter().take_while(|c| c.known <= median).count();
+                rng.sample_in_place(&mut order.as_mut_slice()[..pool], budget.min(pool));
             }
         }
-        order.truncate(budget);
-        order
+        targets.clear();
+        for c in order.iter().take(budget) {
+            let _ = targets.push(c.peer);
+        }
+        self.push_scratch = order;
+        targets
     }
 
     /// Proof guard (`protocol.md` §5.3 `guard_fails(p, g)` `[c16]`):
@@ -305,42 +279,30 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if b.is_empty() {
             return;
         }
-        let offer = Have::offer(group, b);
+        let offer = Have::offer(self.type_of(&group, catalog), group, b);
         if !self.enqueue(peer, Queued::from_have(offer), false, env) {
             self.owe(peer, group, b, env);
         }
     }
 
-    /// Extra peers outside the relation to announce to immediately
-    /// (`announce_extra(g, i)`, `[D5]`).
-    pub fn announce_extra<C>(
-        &self,
-        group: &GroupId,
-        index: u32,
-        catalog: &C,
-    ) -> InlineVec<PeerId, MAX_INLINE_PEERS>
+    /// Announces `(group, index)` to the links outside the relation, where the
+    /// type asks for it (`announce_extra(g, i)`, `[D5]`).
+    pub fn announce_extra<E, C>(&mut self, group: GroupId, index: u32, env: &mut E, catalog: &C)
     where
+        E: RuntimeEnv<B>,
         C: ObjectCatalog<B>,
     {
-        let mut out = InlineVec::new();
-        let t = self
-            .groups
-            .get(group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(group));
-        if catalog.params(t).announce_extra != AnnounceWidth::AllJoined {
-            return out;
+        let t = self.type_of(&group, catalog);
+        let prm = catalog.params(t);
+        if prm.announce_extra != AnnounceWidth::AllJoined {
+            return;
         }
-        let fam = catalog.family(t, group);
-        for q in self.links(t) {
-            let in_out = self.has_push_out_any_colour(q, t, fam);
-            let in_in = self.has_push_in_any_colour(q, t, fam);
-            if !in_out && !in_in && self.wants_from_me(q, group, catalog).has(index) {
-                let _ = out.push(q);
+        let fam = catalog.family(t, &group);
+        self.for_each(PeerSet::Unrelated(t, fam, prm.m.max(1)), |node, q| {
+            if node.wants_from_me(q, &group, catalog).has(index) {
+                node.announce(q, group, Bitmap::singleton(index), env, catalog);
             }
-        }
-        out
+        });
     }
 
     /// Converts a skipped or refused push into an owed offer if `peer` is in
@@ -360,18 +322,28 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             e.clear(index);
             self.pairs.set_pushed((peer, group), e);
         }
-        let t = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&group));
+        let t = self.type_of(&group, catalog);
         let fam = catalog.family(t, &group);
         let m = catalog.params(t).m.max(1) as u32;
         let c = (index % m) as u16;
-        if self.push_out.contains(&(peer, t, fam, c)) {
+        // Owed to a relation peer, or at a source to a peer of the pool the push was
+        // planned from, where it stays in the plan (§4.7).
+        let source = self.groups.get(&group).is_some_and(|r| r.origin.is_some());
+        if source {
+            self.plan_refused.insert((peer, group, index));
+        }
+        let pooled = source && self.in_set(self.source_pool(t, fam, c), peer);
+        if self.push_out.contains(&(peer, t, fam, c)) || pooled {
             self.owe(peer, group, Bitmap::singleton(index), env);
         }
+    }
+
+    /// Whom a source pushes below `STRIPE_UPLINK`, and offers to: the relation,
+    /// or with none in the family for the colour, the links. The caller filters
+    /// by interest (`protocol-v2.md` §4.7 `source_pool`).
+    pub fn source_pool(&self, t: TypeId, fam: FamilyId, colour: Colour) -> PeerSet {
+        let relation = self.out_pushees(t, fam, colour);
+        if self.count(relation) == 0 { self.links(t) } else { relation }
     }
 
     /// Marks `bits` of `group` as owed to `peer` for the next write (`owe(p, g,
@@ -380,7 +352,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     where
         E: RuntimeEnv<B>,
     {
-        env.owe_offer(peer, group, bits);
+        self.sends.owe(peer, group, bits, env);
     }
 
     /// Publishes a group as its source (`protocol-v2.md` §4.7 `publish`, `[c2,
@@ -435,9 +407,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             let Some(f) = self.chunks.get(&(group, i)).cloned() else {
                 continue;
             };
-            let cands = self.candidates_for_source(&f, catalog);
-            let chosen = self.choose_push(&f, &group, &cands, r, true, now, catalog, rng);
+            let wants =
+                |node: &Self, q: PeerId| node.wants_from_me(q, &group, catalog).has(f.index);
+            let pool = self.source_set(&f, catalog);
+            let chosen = self.choose_push(&f, &group, pool, &wants, r, true, now, catalog, rng);
             let targets = InlineVec::<PeerId, MAX_PLAN_TARGETS>::from_slice(&chosen);
+            self.peer_scratch = chosen;
             if !plan.push((i, targets)) {
                 break;
             }
@@ -446,7 +421,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             }
         }
 
-        let mut led: InlineVec<PeerId, MAX_INLINE_PEERS> = InlineVec::new();
+        // The peers given their leading holding in this pass carry its mark.
+        self.mark += 1;
+        let mark = self.mark;
         for copy in 0..r {
             for &(i, ref targets) in plan.iter() {
                 if copy < targets.len() {
@@ -454,7 +431,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                     let Some(f) = self.chunks.get(&(group, i)).cloned() else {
                         continue;
                     };
-                    if led.insert_unique(p) {
+                    let first = self.slots.get_mut(p).is_some_and(|slot| {
+                        let first = slot.mark != mark;
+                        slot.mark = mark;
+                        first
+                    });
+                    if first {
                         let bits = self
                             .groups
                             .get(&group)
@@ -474,16 +456,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 }
             }
         }
-
-        let fam = catalog.family(t, &group);
-        let m = catalog.params(t).m.max(1) as u32;
-        for i in 0..n {
-            let c = (i % m) as u16;
-            let rel_peers = self.out_pushees(t, fam, c);
-            for p in rel_peers {
-                self.announce(p, group, Bitmap::singleton(i), env, catalog);
-            }
-        }
+        // The pool's peers not chosen for a chunk are offered it at its
+        // acknowledgement (`origin_acked`).
     }
 
     /// Keeps `chunk` for the heartbeat's gossip, if its type is gossiped at
@@ -493,21 +467,18 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     where
         C: ObjectCatalog<B>,
     {
-        let t = self
-            .groups
-            .get(&chunk.group)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&chunk.group));
+        let t = self.type_of(&chunk.group, catalog);
         if catalog.params(t).announce_extra == AnnounceWidth::Sample {
             self.gossip_history.put(chunk);
         }
     }
 
-    /// Updates our paced source holding when a chunk of a group we published
-    /// leaves for the first time (`protocol-v2.md` §4.7 `origin_sent(f)`,
-    /// `[P4]`).
-    pub fn origin_sent<E, C>(&mut self, group: GroupId, index: u32, env: &mut E, catalog: &C)
+    /// A chunk of a group we publish is known to have arrived somewhere: a
+    /// peer's holding names it, or its first copy's room timed out. It joins
+    /// our holding, and the pool's peers not planned for it are offered it;
+    /// a refused push is owed, and not offered again (`protocol-v2.md` §4.7
+    /// `origin_acked`, `[c3, P4]`).
+    pub fn origin_acked<E, C>(&mut self, group: GroupId, index: u32, env: &mut E, catalog: &C)
     where
         E: RuntimeEnv<B>,
         C: ObjectCatalog<B>,
@@ -519,46 +490,34 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return;
         }
         orig.set(index);
-        for q in self.suppression_scope(&group, catalog) {
-            self.send_have(q, group, env, catalog);
-        }
+        self.for_each(self.suppression_scope(&group, catalog), |node, q| {
+            node.send_have(q, group, env, catalog);
+        });
+        let t = self.type_of(&group, catalog);
+        let fam = catalog.family(t, &group);
+        let c = (index % catalog.params(t).m.max(1) as u32) as u16;
+        // `announce` leaves out a push that was made.
+        self.for_each(self.source_pool(t, fam, c), |node, p| {
+            if !node.plan_refused.contains(&(p, group, index)) {
+                node.announce(p, group, Bitmap::singleton(index), env, catalog);
+            }
+        });
     }
 
-    /// Returns candidate peers for source pushes (`protocol-v2.md` §4.7
-    /// `candidates_for_source`).
-    pub fn candidates_for_source<C>(
-        &self,
-        chunk: &ChunkMsg<B>,
-        catalog: &C,
-    ) -> InlineVec<PeerId, MAX_INLINE_PEERS>
+    /// The peers a source's pushes of `chunk` are chosen from, before their
+    /// interest is looked at (`protocol-v2.md` §4.7 `candidates_for_source`).
+    pub fn source_set<C>(&self, chunk: &ChunkMsg<B>, catalog: &C) -> PeerSet
     where
         C: ObjectCatalog<B>,
     {
         let g = chunk.group;
-        let t = self
-            .groups
-            .get(&g)
-            .and_then(|r| r.t_of.as_ref())
-            .copied()
-            .unwrap_or_else(|| catalog.type_of_group(&g));
+        let t = self.type_of(&g, catalog);
+        if self.config.card13_enabled && self.config.uplink_bps >= self.config.stripe_uplink_bps {
+            return self.links(t);
+        }
         let fam = catalog.family(t, &g);
         let m = catalog.params(t).m.max(1) as u32;
-        let c = (chunk.index % m) as u16;
-
-        let pool = if self.config.card13_enabled &&
-            self.config.uplink_bps >= self.config.stripe_uplink_bps
-        {
-            self.links(t)
-        } else {
-            self.out_pushees(t, fam, c)
-        };
-        let mut out = InlineVec::new();
-        for q in pool {
-            if self.wants_from_me(q, &g, catalog).has(chunk.index) {
-                let _ = out.push(q);
-            }
-        }
-        out
+        self.source_pool(t, fam, (chunk.index % m) as u16)
     }
 
     /// Returns `true` if `peer` is projected to reach `K` for `group` without

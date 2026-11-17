@@ -15,8 +15,6 @@ use seacast_codec::{
 };
 use seacast_core::{ChunkMsg, PreallocVec, TypeId};
 
-const TOPIC: &[u8] = b"topic";
-
 /// Fastest of `runs` calls, in seconds.
 fn best<R>(runs: usize, mut f: impl FnMut() -> R) -> f64 {
     let mut fastest = f64::INFINITY;
@@ -252,7 +250,7 @@ fn main() {
         let (descriptor, shards) = build_group::<Vec<u8>, _, _>(&body, &mut pool, &comp);
         // What a domain would put there: the codec only carries it.
         let context = [7u8; 40];
-        let mut all = build_chunks(TypeId(0), TOPIC, &context, &descriptor, &shards, &mut pool);
+        let mut all = build_chunks(TypeId(0), &context, &descriptor, &shards, &mut pool);
         // As a node holds them: with the leaf digest level 1 leaves behind.
         for chunk in &mut all {
             chunk.memo = frame_leaf_hash(chunk.index, &chunk.frame, context.len()).expect("valid");
@@ -277,27 +275,14 @@ fn main() {
         let most: Vec<_> = (0..k).map(|i| chunk(if i % 8 == 0 { k + i } else { i })).collect();
         for (case, available) in [("half lost", &half), ("1 in 8 lost", &most)] {
             let mut rebuilt = PreallocVec::with_capacity(2 * k);
-            let decoded = decode_and_reencode(
-                available,
-                context.len(),
-                &mut pool,
-                &comp,
-                &mut rebuilt,
-                TOPIC,
-            );
+            let decoded =
+                decode_and_reencode(available, context.len(), &mut pool, &comp, &mut rebuilt);
             assert_eq!(decoded.as_deref(), Some(&body[..]));
             assert!(cfg!(feature = "data_only_root") || rebuilt.len() == 2 * k);
             line(
                 &format!("decode_and_reencode, {name}, {case}"),
                 best(5, || {
-                    decode_and_reencode(
-                        available,
-                        context.len(),
-                        &mut pool,
-                        &comp,
-                        &mut rebuilt,
-                        TOPIC,
-                    )
+                    decode_and_reencode(available, context.len(), &mut pool, &comp, &mut rebuilt)
                 }),
                 body.len(),
             );

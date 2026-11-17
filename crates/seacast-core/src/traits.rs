@@ -1,10 +1,12 @@
 use crate::{
     bitmap::{Bitmap, MAX_CHUNKS},
-    collections::{InlineVec, MAX_INLINE_PEERS, MAX_PROJECTED, PreallocMap, PreallocVec},
-    message::{ChunkMsg, Have, Join, Queued},
+    collections::{
+        InlineVec, MAX_INLINE_PEERS, MAX_JOINED_TYPES, MAX_PROJECTED, PreallocMap, PreallocVec,
+    },
+    message::{ChunkMsg, Join},
     types::{
-        Ask, Bytes32, ChunkId, Duty, FamilyId, GroupId, NodeId, PeerId, Shape, Timestamp, TypeId,
-        TypeParams, ValidationResult,
+        Ask, Bytes32, ChunkId, Duty, FamilyId, GenerationPeerId, GroupId, InterestKind, LinkFloor,
+        NodeId, PeerId, Shape, Timestamp, TypeId, TypeParams, ValidationResult,
     },
 };
 
@@ -92,6 +94,19 @@ pub trait RngSource {
         pool
     }
 
+    /// [`Self::sample_without_replacement`] in place: the sample is the first
+    /// `k` of `items`. The same draws.
+    fn sample_in_place<T>(&mut self, items: &mut [T], k: usize)
+    where
+        Self: Sized,
+    {
+        let len = items.len();
+        for i in 0..k.min(len) {
+            let j = i + ((self.next_u64() as usize) % (len - i));
+            items.swap(i, j);
+        }
+    }
+
     /// Picks one element uniformly at random (`choice(xs)` in the spec).
     fn choice<'a, T>(&mut self, items: &'a [T]) -> Option<&'a T>
     where
@@ -146,9 +161,9 @@ pub enum TimerEvent {
     WindowTimeout { peer: PeerId, group: GroupId, index: u32, at_bits: u64 },
     /// Reconsider a delayed decode duty (`reconsider(g, at_bits)`).
     Reconsider { group: GroupId, at_bits: u64 },
-    /// Retry a sampler's standing request on another link (`resample(g, bits,
-    /// q)`).
-    Resample { group: GroupId, bits: Bitmap, peer: PeerId },
+    /// A sampler's wait on `peer` ran out (`resample(g, i, q, first)`). No
+    /// peer: nobody could be asked in the first phase.
+    Resample { group: GroupId, index: u32, peer: Option<GenerationPeerId>, first: bool },
     /// Paced gossip tick (`on_pace_tick()`, every `HEARTBEAT / 16`).
     PaceTick,
     /// Heartbeat tick (`on_heartbeat()`, every `HEARTBEAT`).
@@ -230,6 +245,17 @@ impl<B> DeferredStore<B> for BoundedDeferredStore {
     }
 }
 
+/// The input of a group's level 2 (`RuntimeEnv::start_decode`).
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeJob<'a, B> {
+    pub t: TypeId,
+    pub shape: &'a Shape,
+    /// The indices of `chunks`: passed back to `SeacastNode::on_decoded`.
+    pub given: Bitmap,
+    /// The chunks held, in index order.
+    pub chunks: &'a [ChunkMsg<B>],
+}
+
 /// Pluggable runtime environment for timers, background decode tasks, I/O
 /// wakeups, and callbacks.
 pub trait RuntimeEnv<B: ChunkBuffer> {
@@ -240,51 +266,16 @@ pub trait RuntimeEnv<B: ChunkBuffer> {
     /// fn, ...)`).
     fn schedule_after(&mut self, delay: f64, event: TimerEvent);
 
-    /// Hands `item` to the host to send to `peer`, ahead of what is not
-    /// `urgent`. The node keeps no queue: order, batching and flow control
-    /// are the host's. `false` if the host has no room for it. Before
-    /// writing an item the host passes it to `SeacastNode::on_write`.
-    fn send(&mut self, peer: PeerId, item: Queued, urgent: bool) -> bool;
-
-    /// `peer` holds `(group, index)`: a copy of that chunk still waiting to be
-    /// sent to it is not needed, and one in flight has arrived.
-    fn cancel_chunk(&mut self, _peer: PeerId, _group: GroupId, _index: u32) {}
-
-    /// The asks for `bits` of `group` waiting to be sent to `peer` are
-    /// withdrawn.
-    fn cancel_asks(&mut self, _peer: PeerId, _group: GroupId, _bits: &Bitmap) {}
-
-    /// `group` has ended: nothing of it is to be sent.
-    fn cancel_group(&mut self, _group: &GroupId) {}
-
-    /// An offer the host refused: `bits` of `group` are still to be offered to
-    /// `peer`.
-    fn owe_offer(&mut self, _peer: PeerId, _group: GroupId, _bits: Bitmap) {}
-
-    /// An answer the host refused: `(group, index)` is still to be sent to
-    /// `peer`.
-    fn owe_answer(&mut self, _peer: PeerId, _group: GroupId, _index: u32) {}
-
-    /// Merges `have` into a holding of the same group still waiting to be sent
-    /// to `peer`. `false` if there is none, and `have` is then sent on its
-    /// own.
-    fn merge_holding(&mut self, _peer: PeerId, _have: &Have) -> bool {
-        false
-    }
-
-    /// Whether an ask for `ask` is waiting to be sent to `peer`.
-    fn ask_waiting(&self, _peer: PeerId, _ask: Ask) -> bool {
-        false
-    }
-
-    /// Wakes the per-peer writer loop for `peer` (`wake(p)` / `kick(p)`).
-    /// Called by [`SendQueues`](crate::SendQueues) only.
+    /// `peer`'s writer has something to take: the host calls
+    /// `SeacastNode::next_to_send` for it until that gives nothing.
     fn wake_writer(&mut self, _peer: PeerId) {}
 
-    /// Starts an asynchronous/off-path Level 2 decode task for `group`
-    /// (`start(decode_group, g)`). When finished, the host calls
-    /// `SeacastNode::decode_group(g, ...)`.
-    fn start_decode(&mut self, group: GroupId);
+    /// Level 2 of `group` is due (`start(decode_group, g)`). The host runs
+    /// `TypeCodec::decode` on `job`, on any thread, and passes the result to
+    /// `SeacastNode::on_decoded`. `job` borrows the node's scratch: the host
+    /// copies what it needs out of it before returning. A host that decodes
+    /// on the node's thread may call `SeacastNode::decode_group` instead.
+    fn start_decode(&mut self, group: GroupId, job: DecodeJob<'_, B>);
 
     /// Delivers a reconstructed and Level-2-verified object to the application
     /// for Level 3 checks (`deliver(g, object)`).
@@ -398,6 +389,13 @@ pub trait Domain {
         None
     }
 
+    /// The id under which a peer is asked for at most one sample: that of the
+    /// object the group is part of, where a node samples several groups of
+    /// one object (`protocol-v2.md` §4.10 `sampled_from`, I6).
+    fn sample_scope(&self, _t: TypeId, group: &GroupId) -> GroupId {
+        *group
+    }
+
     /// The shape of a group the domain knows ahead of its chunks.
     fn shape_by_group(&self, _group: &GroupId) -> Option<Shape> {
         None
@@ -444,7 +442,7 @@ pub trait Policy {
 
     /// Returns the list of object types this node participates in
     /// (`joined_types()`).
-    fn joined_types(&self) -> InlineVec<TypeId, 8>;
+    fn joined_types(&self) -> InlineVec<TypeId, MAX_JOINED_TYPES>;
 
     /// Returns the families of object type `t` in which this node has
     /// forwarding duty (`families_with_duty(T)`).
@@ -456,6 +454,33 @@ pub trait Policy {
     /// `t` (`wants_family(T, fam)`).
     fn wants_family(&self, _t: TypeId, _family: FamilyId) -> bool {
         true
+    }
+
+    /// Whether a peer's `DERIVED` interest holds every index of the groups of
+    /// `family` (`protocol-v2.md` §1.3 `link_cover`).
+    fn holds_family(
+        &self,
+        _t: TypeId,
+        _family: FamilyId,
+        _peer: PeerId,
+        _node_id: &NodeId,
+        _join: &Join,
+    ) -> bool {
+        true
+    }
+
+    /// Whether a peer counts as one of high custody in a floor that asks for
+    /// diversity (`protocol-v2.md` §1.3). The base custody count is the
+    /// domain's, so the default knows only interest `ALL`.
+    fn high_custody(&self, _t: TypeId, join: &Join) -> bool {
+        join.interest == InterestKind::All
+    }
+
+    /// The link floors of `t` beyond the relation floor: the repair, source
+    /// and coverage floors this node keeps (`protocol-v2.md` §1.3, §4.6,
+    /// §4.7). Read by `SeacastNode::link_deficits`.
+    fn link_floors(&self, _t: TypeId) -> InlineVec<LinkFloor, MAX_CHUNKS> {
+        InlineVec::new()
     }
 
     /// Returns this node's duty for `group` (`duty_for(g)`).

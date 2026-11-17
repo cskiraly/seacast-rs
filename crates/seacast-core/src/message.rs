@@ -24,6 +24,9 @@ pub struct Graft {
     pub family: FamilyId,
     pub colour: Colour,
     pub direction: Direction,
+    /// The yes to the receiver's GRAFT: not answered where the relation is
+    /// held (`protocol-v2.md` §4.1).
+    pub answer: bool,
 }
 
 /// `Prune`: relation teardown per family and colour (`protocol-v2.md` §2).
@@ -39,6 +42,7 @@ pub struct Prune {
 /// (`protocol-v2.md` §2 `[c7, D3]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Have {
+    pub object_type: TypeId,
     pub group: GroupId,
     pub bits: Bitmap,
     /// `true`: `"you may ask me for these"` (an offer);
@@ -53,25 +57,37 @@ pub struct Have {
 
 impl Have {
     #[inline]
-    pub const fn holding(group: GroupId, bits: Bitmap, claim_all: bool, complete: bool) -> Self {
-        Self { group, bits, offer: false, claim_all, complete }
+    pub const fn holding(
+        object_type: TypeId,
+        group: GroupId,
+        bits: Bitmap,
+        claim_all: bool,
+        complete: bool,
+    ) -> Self {
+        Self { object_type, group, bits, offer: false, claim_all, complete }
     }
 
     #[inline]
-    pub const fn offer(group: GroupId, bits: Bitmap) -> Self {
-        Self { group, bits, offer: true, claim_all: false, complete: false }
+    pub const fn offer(object_type: TypeId, group: GroupId, bits: Bitmap) -> Self {
+        Self { object_type, group, bits, offer: true, claim_all: false, complete: false }
     }
 }
 
 /// `Want`: `"send me these"`, per recipient (`protocol-v2.md` §2 `[D2]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Want {
+    pub object_type: TypeId,
     pub group: GroupId,
     pub bits: Bitmap,
-    /// Distinguishes an offer-driven pull ask (which starts a `PROMISE` timer
-    /// when written, `protocol.md` §7.2) from a standing/probe/custodian
-    /// `Want` (which starts no `PROMISE` timer at write time,
-    /// `protocol-v2.md` §4.5, §4.6, §4.10).
+    /// Also when the chunks arrive, not only if held now (§4.10, `[D12]`).
+    pub standing: bool,
+    /// Forwarding steps the request may still take (§4.10, `[D12]`).
+    pub hops: u8,
+    /// The probe of a claim: answered whatever the sender holds (§4.6, R5).
+    pub probe: bool,
+    /// Ours only, not sent: an offer-driven pull ask, whose `PROMISE` starts
+    /// when it is written (`protocol.md` §7.2). A standing, probe or custodian
+    /// ask starts none there (`protocol-v2.md` §4.5, §4.6, §4.10).
     pub track_promise: bool,
 }
 
@@ -79,15 +95,42 @@ impl Want {
     /// Creates an offer-driven pull ask for a single index (starts a promise
     /// when written).
     #[inline]
-    pub fn pull_ask(ask: Ask) -> Self {
-        Self { group: ask.group, bits: Bitmap::singleton(ask.index), track_promise: true }
+    pub fn pull_ask(object_type: TypeId, ask: Ask) -> Self {
+        Self {
+            object_type,
+            group: ask.group,
+            bits: Bitmap::singleton(ask.index),
+            standing: false,
+            hops: 0,
+            probe: false,
+            track_promise: true,
+        }
     }
 
-    /// Creates a standing / direct `Want` (e.g. for samplers, probes, or repair
-    /// custodian asks).
+    /// An ask answered only if held now: a repair's ask of a custodian (§4.6).
     #[inline]
-    pub const fn standing(group: GroupId, bits: Bitmap) -> Self {
-        Self { group, bits, track_promise: false }
+    pub const fn direct(object_type: TypeId, group: GroupId, bits: Bitmap) -> Self {
+        Self {
+            object_type,
+            group,
+            bits,
+            standing: false,
+            hops: 0,
+            probe: false,
+            track_promise: false,
+        }
+    }
+
+    /// A standing request: a sampler's (§4.10).
+    #[inline]
+    pub const fn standing(object_type: TypeId, group: GroupId, bits: Bitmap) -> Self {
+        Self { standing: true, ..Self::direct(object_type, group, bits) }
+    }
+
+    /// The probe of a claim (§4.6 `defer_on_claim`).
+    #[inline]
+    pub const fn probe(object_type: TypeId, group: GroupId, bits: Bitmap) -> Self {
+        Self { probe: true, ..Self::direct(object_type, group, bits) }
     }
 }
 
@@ -123,7 +166,7 @@ pub struct Evidence<B> {
 /// one [`ChunkMsg`] per wire frame, performing **zero heap allocation**.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rpc<B> {
-    pub joins: InlineVec<Join, 4>,
+    pub joins: InlineVec<Join, MAX_ENTRY_CONTROL>,
     pub chunk: Option<ChunkMsg<B>>,
     pub haves: InlineVec<Have, MAX_ENTRY_CONTROL>,
     pub wants: InlineVec<Want, MAX_ENTRY_CONTROL>,
@@ -231,7 +274,7 @@ impl Queued {
 pub struct QueueEntry<B> {
     pub chunk: Option<ChunkMsg<B>>,
     pub solicited: bool,
-    pub joins: InlineVec<Join, 4>,
+    pub joins: InlineVec<Join, MAX_ENTRY_CONTROL>,
     pub haves: InlineVec<Have, MAX_ENTRY_CONTROL>,
     pub wants: InlineVec<Want, MAX_ENTRY_CONTROL>,
     pub grafts: InlineVec<Graft, MAX_ENTRY_CONTROL>,
