@@ -8,7 +8,7 @@ use crate::{
     collections::{InlineVec, MAX_ENTRY_CONTROL, PeerSlab, PreallocDeque, PreallocMap},
     message::{Control, Have, QueueEntry, Queued},
     node::SeacastNode,
-    state::{DispatchOutcome, PeerQueue},
+    state::{DispatchOutcome, GroupBits, Owed, PeerQueue},
     traits::{ChunkBuffer, ObjectCatalog, RuntimeEnv, TimerEvent},
     types::{Ask, GroupId, NodeConfig, PeerId},
 };
@@ -22,6 +22,12 @@ pub struct SendQueues {
     pub in_flight: usize,
     waiters: PreallocDeque<PeerId>,
     pub sent: PreallocMap<(PeerId, GroupId, u32), (u64, usize)>,
+    /// Offers a full queue refused, of groups of more than one chunk: they
+    /// leave with the peer's next RPC (`owed`).
+    pub owed: Owed,
+    /// Answers a full queue refused, of groups of more than one chunk: queued
+    /// again as the queue empties (`owed_answers`).
+    pub owed_answers: Owed,
 }
 
 impl SendQueues {
@@ -30,11 +36,16 @@ impl SendQueues {
         let cap = config.capacities;
         Self {
             queue: PeerSlab::with_capacity(cap.max_peers, || {
-                PeerQueue::with_capacity(cap.max_queue_entries_per_peer, cap.max_groups)
+                PeerQueue::with_capacity(
+                    cap.max_queue_entries_per_peer,
+                    cap.max_owed_single_per_peer,
+                )
             }),
             in_flight: 0,
             waiters: PreallocDeque::with_capacity(cap.max_peers),
             sent: PreallocMap::with_capacity(cap.max_peers * 64),
+            owed: Owed::with_capacity(cap.max_owed_pairs, cap.max_peers),
+            owed_answers: Owed::with_capacity(cap.max_owed_pairs, cap.max_peers),
             config,
         }
     }
@@ -49,6 +60,8 @@ impl SendQueues {
         if let Some(q) = self.queue.close(peer) {
             q.clear();
         }
+        self.owed.drop_peer(peer);
+        self.owed_answers.drop_peer(peer);
         self.leave_line(peer, env);
         let mut freed = 0;
         self.sent.retain(|key, &mut (_, bytes)| {
@@ -125,25 +138,34 @@ impl SendQueues {
     }
 
     /// Marks `bits` of `group` as owed to `peer` for the next write (`owe(p, g,
-    /// bits)`).
+    /// bits)`). `single`: the group has one chunk.
     pub fn owe<B: ChunkBuffer, E: RuntimeEnv<B>>(
         &mut self,
         peer: PeerId,
         group: GroupId,
         bits: Bitmap,
+        single: bool,
         env: &mut E,
     ) {
         if let Some(q) = self.queue.get_mut(peer) {
-            *q.owed.entry_or_default(group) |= bits;
+            if single {
+                owe_single(&mut q.owed_single, group);
+            } else {
+                self.owed.add(peer, group, &bits);
+            }
         }
         env.wake_writer(peer);
     }
 
     /// Records an answer a full queue refused, to be queued again as the queue
-    /// empties.
-    pub fn owe_answer(&mut self, peer: PeerId, group: GroupId, index: u32) {
+    /// empties. `single`: the group has one chunk.
+    pub fn owe_answer(&mut self, peer: PeerId, group: GroupId, index: u32, single: bool) {
         if let Some(q) = self.queue.get_mut(peer) {
-            q.owed_answers.entry_or_default(group).set(index);
+            if single {
+                owe_single(&mut q.owed_single_answers, group);
+            } else {
+                self.owed_answers.add(peer, group, &Bitmap::singleton(index));
+            }
         }
     }
 
@@ -200,9 +222,9 @@ impl SendQueues {
                 Queued::Control(Control::Want(w)) => &w.group != group,
                 Queued::Control(_) => true,
             });
-            q.owed.remove(group);
-            q.owed_answers.remove(group);
         }
+        self.owed.drop_group(group);
+        self.owed_answers.drop_group(group);
     }
 
     /// Attempts to acquire `need` bytes in the node-wide congestion window for
@@ -312,16 +334,27 @@ impl SendQueues {
     }
 
     pub fn has_owed_offers(&self, peer: PeerId) -> bool {
-        self.queue.get(peer).is_some_and(|q| q.owed.iter().any(|(_, b)| !b.is_empty()))
+        self.owed.any(peer) || self.queue.get(peer).is_some_and(|q| !q.owed_single.is_empty())
     }
 
     fn has_owed_answers(&self, peer: PeerId) -> bool {
-        self.queue.get(peer).is_some_and(|q| !q.owed_answers.is_empty())
+        self.owed_answers.any(peer) ||
+            self.queue.get(peer).is_some_and(|q| !q.owed_single_answers.is_empty())
     }
 
     fn has_queue_room(&self, peer: PeerId) -> bool {
         self.queue.get(peer).map(|q| q.has_room()).unwrap_or(true)
     }
+}
+
+fn owe_single(owed: &mut PreallocDeque<GroupId>, group: GroupId) {
+    if (0..owed.len()).any(|at| owed.get(at) == Some(&group)) {
+        return;
+    }
+    if owed.is_full() {
+        owed.pop_front();
+    }
+    let _ = owed.push_back(group);
 }
 
 impl<B: ChunkBuffer> SeacastNode<B> {
@@ -481,14 +514,23 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         // empty, takes them next.
         let room = MAX_ENTRY_CONTROL - entry.haves.len();
         let mut owed_groups: InlineVec<(GroupId, Bitmap), MAX_ENTRY_CONTROL> = InlineVec::new();
+        // The lowest group id first: the order does not depend on the table's.
+        while owed_groups.len() < room {
+            let Some((g, _)) = self.sends.owed.lowest(peer) else {
+                break;
+            };
+            let bits = self.sends.owed.take(peer, &g).unwrap_or(Bitmap::EMPTY);
+            let _ = owed_groups.push((g, bits));
+        }
         if let Some(q) = self.sends.queue.get_mut(peer) {
             while owed_groups.len() < room {
-                // The lowest group id first: the order does not depend on the table's.
-                let Some(g) = q.owed.keys().copied().min() else {
+                let Some(g) = q.owed_single.pop_front() else {
                     break;
                 };
-                let bits = q.owed.remove(&g).unwrap_or(Bitmap::EMPTY);
-                let _ = owed_groups.push((g, bits));
+                // Ended since it was owed: nothing of it is offered.
+                if self.groups.has_bits(&g, GroupBits::Mine) {
+                    let _ = owed_groups.push((g, Bitmap::singleton(0)));
+                }
             }
         }
         if owed_groups.is_empty() {
@@ -554,15 +596,14 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     }
 
     fn pop_owed_answer(&mut self, peer: PeerId) -> Option<(GroupId, u32)> {
-        let owed = &mut self.sends.queue.get_mut(peer)?.owed_answers;
-        // The lowest group id, then its lowest index.
-        let (g, idx) = owed.iter().filter_map(|(&g, bits)| Some((g, bits.first_index()?))).min()?;
-        if let Some(bits) = owed.get_mut(&g) {
-            bits.clear(idx);
-            if bits.is_empty() {
-                owed.remove(&g);
+        // The lowest group id, then its lowest index; then the groups of one chunk.
+        let (g, idx) = match self.sends.owed_answers.lowest(peer) {
+            Some((g, idx)) => {
+                self.sends.owed_answers.take_index(peer, &g, idx);
+                (g, idx)
             }
-        }
+            None => (self.sends.queue.get_mut(peer)?.owed_single_answers.pop_front()?, 0),
+        };
         self.chunks.contains_key(&(g, idx)).then_some((g, idx))
     }
 }

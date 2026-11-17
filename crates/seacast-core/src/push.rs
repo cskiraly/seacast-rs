@@ -3,7 +3,7 @@ use crate::{
     collections::{InlineVec, PreallocVec},
     message::{ChunkMsg, Have, Queued},
     node::SeacastNode,
-    state::{PeerSet, PushCand},
+    state::{GroupBits, PeerSet, PushCand},
     traits::{ChunkBuffer, ObjectCatalog, RngSource, RuntimeEnv},
     types::{
         AnnounceWidth, Colour, Duty, FamilyId, GroupId, GroupState, PeerId, Shape, Timestamp,
@@ -38,7 +38,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if h.claim_all {
             self.groups.rec(group).claimed_all = true;
         }
-        if self.groups.get(&group).is_some_and(|r| r.origin.is_some()) &&
+        if self.groups.has_bits(&group, GroupBits::Origin) &&
             self.config.merge_holdings &&
             self.sends.merge_waiting(peer, &h)
         {
@@ -60,16 +60,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             .map(|h| h.n)
             .or_else(|| catalog.shape_by_group(&group).map(|h| h.n))
             .unwrap_or(0);
-        let (whole, done) = if self.groups.get(&group).is_some_and(|r| r.origin.is_some()) {
+        let (whole, done) = if self.groups.has_bits(&group, GroupBits::Origin) {
             let all_sent = n > 0 && bits.popcount() >= n;
             (all_sent, all_sent)
         } else {
-            let mine_count = self
-                .groups
-                .get(&group)
-                .and_then(|r| r.mine.as_ref())
-                .map(|b| b.popcount())
-                .unwrap_or(0);
+            let mine_count =
+                self.groups.bits(&group, GroupBits::Mine).map(|b| b.popcount()).unwrap_or(0);
             // A decoding node claims what it can produce, which may be less than all.
             let whole = n > 0 && mine_count >= n;
             let done = self
@@ -87,11 +83,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     /// `protocol.md` §4.2 `[P4]`).
     #[inline]
     pub fn have_bits(&self, group: &GroupId) -> Bitmap {
-        if let Some(orig) = self.groups.get(group).and_then(|r| r.origin.as_ref()) {
-            *orig
-        } else {
-            self.groups.get(group).and_then(|r| r.mine.as_ref()).copied().unwrap_or(Bitmap::EMPTY)
-        }
+        self.groups
+            .bits(group, GroupBits::Origin)
+            .or_else(|| self.groups.bits(group, GroupBits::Mine))
+            .unwrap_or(Bitmap::EMPTY)
     }
 
     /// Forwards a verified chunk along each projected `(group, index)` axis
@@ -328,7 +323,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let c = (index % m) as u16;
         // Owed to a relation peer, or at a source to a peer of the pool the push was
         // planned from, where it stays in the plan (§4.7).
-        let source = self.groups.get(&group).is_some_and(|r| r.origin.is_some());
+        let source = self.groups.has_bits(&group, GroupBits::Origin);
         if source {
             self.plan_refused.insert((peer, group, index));
         }
@@ -352,7 +347,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     where
         E: RuntimeEnv<B>,
     {
-        self.sends.owe(peer, group, bits, env);
+        let single = self.single_chunk(&group);
+        self.sends.owe(peer, group, bits, single, env);
     }
 
     /// Publishes a group as its source (`protocol-v2.md` §4.7 `publish`, `[c2,
@@ -384,18 +380,18 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         rec.hdr = Some(shape);
         rec.authentic = true;
         rec.deadline = deadline;
-        rec.interest = Some(catalog.own_interest(t, &group));
         rec.known_at.get_or_insert(now);
+        self.groups.put_bits(group, GroupBits::Interest, catalog.own_interest(t, &group));
 
         for f in shards {
             self.seen_ids.insert(f.cached_id);
             self.put_gossip(f, catalog);
             self.store_chunk(group, f.index, f.clone(), now);
         }
-        self.groups.rec(group).mine.replace(Bitmap::all_bits(n));
+        self.groups.put_bits(group, GroupBits::Mine, Bitmap::all_bits(n));
         self.groups.rec(group).state.replace(GroupState::Complete);
         self.groups.rec(group).stop_pull.replace(true);
-        self.groups.rec(group).origin.replace(Bitmap::new());
+        self.groups.put_bits(group, GroupBits::Origin, Bitmap::new());
 
         let r = self.config.r;
         // A chunk's targets are at most its budget. A chunk the plan has no room for is
@@ -437,13 +433,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                         first
                     });
                     if first {
-                        let bits = self
-                            .groups
-                            .get(&group)
-                            .and_then(|r| r.origin.as_ref())
-                            .copied()
-                            .unwrap_or(Bitmap::EMPTY) |
-                            Bitmap::singleton(i);
+                        let bits =
+                            self.groups.bits(&group, GroupBits::Origin).unwrap_or(Bitmap::EMPTY) |
+                                Bitmap::singleton(i);
                         let holding = self.holding_of(group, bits, catalog);
                         if holding.claim_all {
                             self.groups.rec(group).claimed_all = true;
@@ -483,13 +475,14 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         E: RuntimeEnv<B>,
         C: ObjectCatalog<B>,
     {
-        let Some(orig) = self.groups.get_mut(&group).and_then(|r| r.origin.as_mut()) else {
+        let Some(mut orig) = self.groups.bits(&group, GroupBits::Origin) else {
             return;
         };
         if orig.has(index) {
             return;
         }
         orig.set(index);
+        self.groups.put_bits(group, GroupBits::Origin, orig);
         self.for_each(self.suppression_scope(&group, catalog), |node, q| {
             node.send_have(q, group, env, catalog);
         });

@@ -6,7 +6,10 @@ use crate::{
     },
     message::{ChunkMsg, Control, Join, Queued, Rpc, Want},
     queue::SendQueues,
-    state::{AskPeers, GossipHistory, Groups, MAX_GOSSIP_GROUPS, Pairs, Peer, PushCand, Relations},
+    state::{
+        AskPeers, GossipHistory, GroupBits, Groups, MAX_GOSSIP_GROUPS, Pairs, Peer, PushCand,
+        Relations,
+    },
     traits::{ChunkBuffer, DeferredStore, ObjectCatalog, RngSource, RuntimeEnv, TimerEvent},
     types::{
         Ask, ChunkId, Colour, FamilyId, GenerationPeerId, GroupId, GroupState, NodeConfig, NodeId,
@@ -114,6 +117,9 @@ pub struct SeacastNode<B> {
     /// `planned`): whom a chunk is not offered at its acknowledgement.
     pub plan_refused: PreallocSet<(PeerId, GroupId, u32)>,
     pub rsample_asked: PreallocSet<(GroupId, u32, PeerId)>,
+    /// The indices asked for as a group's repair sample (`rsample`), of the
+    /// groups that have one.
+    pub rsamples: PreallocMap<GroupId, InlineVec<u32, MAX_BITMAP_BITS>>,
 
     // Gate deferral & equivocation ties (`protocol.md` §4.2)
     pub seen_ids: PreallocSet<ChunkId>,
@@ -171,7 +177,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             grafted_in: PreallocSet::with_capacity(cap.max_relations),
             grafted_out: PreallocSet::with_capacity(cap.max_relations),
             backoff: PreallocMap::with_capacity(cap.max_relations),
-            groups: Groups::with_capacity(cap.max_groups),
+            groups: Groups::with_capacity(cap.max_groups, cap.max_wide_groups),
             chunks: PreallocMap::with_capacity(cap.max_stored_chunks),
             known_id: PreallocMap::with_capacity(cap.max_stored_chunks),
             tombstones: PreallocMap::with_capacity(cap.max_groups),
@@ -212,6 +218,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             forwarded: PreallocMap::with_capacity(cap.max_peers),
             plan_refused: PreallocSet::with_capacity(cap.max_stored_chunks),
             rsample_asked: PreallocSet::with_capacity(peer_asks),
+            rsamples: PreallocMap::with_capacity(cap.max_repair_samples),
             seen_ids: PreallocSet::with_capacity(cap.max_seen_ids),
             pending: PreallocVec::with_capacity(cap.max_deferred_chunks),
             pending_ids: PreallocSet::with_capacity(cap.max_deferred_chunks),
@@ -505,7 +512,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             }
             let entry = Queued::Chunk { group, index, solicited: true };
             if !self.enqueue(peer, entry, false, env) {
-                self.sends.owe_answer(peer, group, index);
+                let single = self.single_chunk(&group);
+                self.sends.owe_answer(peer, group, index, single);
             }
         }
     }
@@ -540,7 +548,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 // No holding came in time for a chunk this node published, which
                 // is acknowledged anyway (`protocol-v2.md` §4.11
                 // `window_timeout`). After a holding it is acknowledged already.
-                if self.groups.get(&group).is_some_and(|r| r.origin.is_some()) {
+                if self.groups.has_bits(&group, GroupBits::Origin) {
                     self.origin_acked(group, index, env, catalog);
                 }
             }
@@ -591,13 +599,16 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.chunks.get(&(*group, index)).cloned()
     }
 
+    /// Whether `group` is open with one chunk: what is owed of it is kept in a
+    /// peer's ring.
+    #[inline]
+    pub(crate) fn single_chunk(&self, group: &GroupId) -> bool {
+        self.groups.get(group).and_then(|r| r.hdr.as_ref()).is_some_and(|shape| shape.n == 1)
+    }
+
     #[inline]
     pub fn held(&self, ask: Ask) -> bool {
-        self.groups
-            .get(&ask.group)
-            .and_then(|r| r.mine.as_ref())
-            .map(|b| b.has(ask.index))
-            .unwrap_or(false)
+        self.groups.bits(&ask.group, GroupBits::Mine).map(|b| b.has(ask.index)).unwrap_or(false)
     }
 
     #[inline]

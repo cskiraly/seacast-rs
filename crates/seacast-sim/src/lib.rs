@@ -8,10 +8,10 @@ use std::{
 use seacast_codec::sha256;
 use seacast_core::{
     AnnounceWidth, Bitmap, BoundedDeferredStore, ChunkBuffer, ChunkId, ChunkMsg, DispatchOutcome,
-    Domain, Duty, FamilyId, GroupId, InlineVec, InterestKind, Join, MAX_CHUNKS, MAX_JOINED_TYPES,
-    MAX_PROJECTED, NodeConfig, NodeId, PeerId, PenaltyReason, Policy, PreallocVec, QueueEntry,
-    RngSource, RuntimeEnv, SeacastNode, Shape, SplitMix64, TimerEvent, Timestamp, TypeCodec,
-    TypeId, TypeParams, ValidationResult,
+    Domain, Duty, FamilyId, GroupBits, GroupId, InlineVec, InterestKind, Join, MAX_CHUNKS,
+    MAX_JOINED_TYPES, MAX_PROJECTED, NodeConfig, NodeId, PeerId, PenaltyReason, Policy,
+    PreallocVec, QueueEntry, RngSource, RuntimeEnv, SeacastNode, Shape, SplitMix64, TimerEvent,
+    Timestamp, TypeCodec, TypeId, TypeParams, ValidationResult,
 };
 
 /// The object types of this domain.
@@ -1012,8 +1012,8 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                         let rec = node.groups.rec(g_row);
                         rec.hdr = Some(Shape { n: hdr.n, k: hdr.k });
                         rec.state = Some(seacast_core::GroupState::Collecting);
-                        rec.interest = Some(want);
                         rec.known_at = Some(0.0);
+                        node.groups.put_bits(g_row, GroupBits::Interest, want);
                     }
                 }
             }
@@ -1123,9 +1123,7 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                                 } else {
                                     rcv_node
                                         .groups
-                                        .get(&g)
-                                        .and_then(|r| r.interest.as_ref())
-                                        .cloned()
+                                        .bits(&g, GroupBits::Interest)
                                         .unwrap_or_else(|| rcv_cat.own_interest(rcv_t, &g))
                                         .has(idx)
                                 };
@@ -1134,9 +1132,7 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                                         let t2 = rcv_cat.type_of_group(&g2);
                                         rcv_node
                                             .groups
-                                            .get(&g2)
-                                            .and_then(|r| r.interest.as_ref())
-                                            .cloned()
+                                            .bits(&g2, GroupBits::Interest)
                                             .unwrap_or_else(|| rcv_cat.own_interest(t2, &g2))
                                             .has(i2)
                                     });
@@ -1151,16 +1147,14 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                                     answers_sent += 1;
                                 } else if sender_node
                                     .groups
-                                    .get(&g)
-                                    .and_then(|r| r.rebuilt.as_ref())
+                                    .bits(&g, GroupBits::Rebuilt)
                                     .map(|b| b.has(idx))
                                     .unwrap_or(false)
                                 {
                                     repair_pushes += 1;
                                 } else if !sender_node
                                     .groups
-                                    .get(&g)
-                                    .and_then(|r| r.received.as_ref())
+                                    .bits(&g, GroupBits::Received)
                                     .map(|b| b.has(idx))
                                     .unwrap_or(false)
                                 {

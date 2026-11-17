@@ -1,5 +1,5 @@
 use crate::{
-    bitmap::{BITMAP_WORDS, Bitmap, MAX_BITMAP_BITS},
+    bitmap::{BITMAP_WORDS, Bitmap},
     collections::{InlineVec, PeerSets, PreallocDeque, PreallocMap, PreallocVec, word_bits},
     message::{ChunkMsg, Control, Join, QueueEntry, Queued},
     types::{
@@ -35,27 +35,107 @@ pub struct PeerQueue {
     pub urgent: PreallocDeque<Queued>,
     pub normal: PreallocVec<Queued>,
     pub max_entries: usize,
-    /// Offers a full queue refused, by group: they leave with the peer's next
-    /// RPC (`owed`).
-    pub owed: PreallocMap<GroupId, Bitmap>,
-    /// Answers a full queue refused, by group: queued again as it empties
-    /// (`owed_answers`).
-    pub owed_answers: PreallocMap<GroupId, Bitmap>,
+    /// The offers and the answers a full queue refused, of the groups of one
+    /// chunk, oldest first (`owed`, `owed_answers`). Full, the oldest goes. A
+    /// group that has ended stays until it is taken.
+    pub owed_single: PreallocDeque<GroupId>,
+    pub owed_single_answers: PreallocDeque<GroupId>,
     /// JOINs, GRAFTs and PRUNEs a full queue refused, and those handed over
     /// since, in order (`owed_relations`).
     pub owed_relations: PreallocDeque<Control>,
 }
 
+/// Indices of groups of more than one chunk owed to peers, by peer and group:
+/// one table for all peers. Full, what is owed of a pair not yet in it is
+/// dropped.
+#[derive(Debug, Clone)]
+pub struct Owed {
+    bits: PreallocMap<(PeerId, GroupId), Bitmap>,
+    /// The pairs of each peer: a peer with none is not searched for.
+    per_peer: Vec<u32>,
+}
+
+impl Owed {
+    pub fn with_capacity(pairs: usize, max_peers: usize) -> Self {
+        Self { bits: PreallocMap::with_capacity(pairs), per_peer: vec![0; max_peers] }
+    }
+
+    #[inline]
+    pub fn any(&self, peer: PeerId) -> bool {
+        self.per_peer[peer as usize] > 0
+    }
+
+    pub fn add(&mut self, peer: PeerId, group: GroupId, bits: &Bitmap) {
+        if bits.is_empty() {
+            return;
+        }
+        let key = (peer, group);
+        if let Some(owed) = self.bits.get_mut(&key) {
+            *owed |= bits;
+        } else if !self.bits.is_full() {
+            self.bits.insert(key, *bits);
+            self.per_peer[peer as usize] += 1;
+        }
+    }
+
+    /// The lowest group id owed to `peer` and the lowest index owed of it. A
+    /// pass over the table.
+    pub fn lowest(&self, peer: PeerId) -> Option<(GroupId, u32)> {
+        if !self.any(peer) {
+            return None;
+        }
+        self.bits
+            .iter()
+            .filter(|((of, _), _)| *of == peer)
+            .filter_map(|(&(_, group), bits)| Some((group, bits.first_index()?)))
+            .min()
+    }
+
+    pub fn take(&mut self, peer: PeerId, group: &GroupId) -> Option<Bitmap> {
+        let bits = self.bits.remove(&(peer, *group))?;
+        self.per_peer[peer as usize] -= 1;
+        Some(bits)
+    }
+
+    /// Takes `index` of `group` from what `peer` is owed.
+    pub fn take_index(&mut self, peer: PeerId, group: &GroupId, index: u32) {
+        let Some(bits) = self.bits.get_mut(&(peer, *group)) else {
+            return;
+        };
+        bits.clear(index);
+        if bits.is_empty() {
+            self.take(peer, group);
+        }
+    }
+
+    pub fn drop_peer(&mut self, peer: PeerId) {
+        if self.any(peer) {
+            self.bits.retain(|(of, _), _| *of != peer);
+            self.per_peer[peer as usize] = 0;
+        }
+    }
+
+    pub fn drop_group(&mut self, group: &GroupId) {
+        let per_peer = &mut self.per_peer;
+        self.bits.retain(|(peer, of), _| {
+            if of == group {
+                per_peer[*peer as usize] -= 1;
+            }
+            of != group
+        });
+    }
+}
+
 impl PeerQueue {
     /// Preallocates both lanes with fixed capacity `max_entries`, and what is
-    /// owed for `max_groups`.
-    pub fn with_capacity(max_entries: usize, max_groups: usize) -> Self {
+    /// owed for `max_single` groups of one chunk.
+    pub fn with_capacity(max_entries: usize, max_single: usize) -> Self {
         Self {
             urgent: PreallocDeque::with_capacity(max_entries),
             normal: PreallocVec::with_capacity(max_entries),
             max_entries,
-            owed: PreallocMap::with_capacity(max_groups),
-            owed_answers: PreallocMap::with_capacity(max_groups),
+            owed_single: PreallocDeque::with_capacity(max_single),
+            owed_single_answers: PreallocDeque::with_capacity(max_single),
             owed_relations: PreallocDeque::with_capacity(max_entries),
         }
     }
@@ -64,8 +144,8 @@ impl PeerQueue {
     pub fn clear(&mut self) {
         self.urgent.clear();
         self.normal.clear();
-        self.owed.clear();
-        self.owed_answers.clear();
+        self.owed_single.clear();
+        self.owed_single_answers.clear();
         self.owed_relations.clear();
     }
 
@@ -265,6 +345,35 @@ impl Relations {
     }
 }
 
+/// The bitmaps of a group's record. Each is unset until it is first written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupBits {
+    Received,
+    Rebuilt,
+    Mine,
+    Interest,
+    /// As a source: the indices acknowledged.
+    Origin,
+}
+
+impl GroupBits {
+    const COUNT: usize = 5;
+}
+
+/// Where one of a record's bitmaps is: in the record while it names no index
+/// past 63, else in the record's row of `Groups::wide`. A group of few chunks
+/// then takes no row.
+#[derive(Debug, Clone, Copy, Default)]
+enum KeptBits {
+    #[default]
+    Unset,
+    Narrow {
+        inverted: bool,
+        word: u64,
+    },
+    Wide,
+}
+
 /// Everything kept of one group. A field is `None` until it is first written,
 /// as its entry was absent when each field was a map of its own.
 #[derive(Debug, Clone, Default)]
@@ -282,15 +391,14 @@ pub struct Group {
     /// When the group leaves the domain's window (`Domain::deadline`).
     pub deadline: Option<Timestamp>,
     pub state: Option<GroupState>,
-    pub received: Option<Bitmap>,
-    pub rebuilt: Option<Bitmap>,
-    pub mine: Option<Bitmap>,
-    pub interest: Option<Bitmap>,
+    /// The record's bitmaps, read and written through [`Groups`].
+    bits: [KeptBits; GroupBits::COUNT],
+    /// The row of `Groups::wide` that holds the bitmaps kept there.
+    wide: Option<u32>,
     pub stop_pull: Option<bool>,
     /// Whether a holding of this group has gone out with `claim_all`: any index
     /// may then be asked for.
     pub claimed_all: bool,
-    pub origin: Option<Bitmap>,
     pub known_at: Option<Timestamp>,
     pub last_activity: Option<Timestamp>,
     // Claims, deferral, probe and repair sampling (`protocol-v2.md` §3, §4.6)
@@ -301,7 +409,6 @@ pub struct Group {
     pub probed: Option<PeerId>,
     /// The probe's verdict, once: whether the claimant's own copy came.
     pub probe_ok: Option<bool>,
-    pub rsample: Option<InlineVec<u32, MAX_BITMAP_BITS>>,
     pub rsample_step: Option<usize>,
     pub rsample_final: Option<bool>,
 }
@@ -320,16 +427,69 @@ pub struct Groups {
     spill: Group,
     open: usize,
     max_groups: usize,
+    /// The bitmaps that name an index past 63, a row a group that has one.
+    wide: Vec<[Bitmap; GroupBits::COUNT]>,
+    free_rows: Vec<u32>,
 }
 
 impl Groups {
-    pub fn with_capacity(max_groups: usize) -> Self {
+    pub fn with_capacity(max_groups: usize, max_wide_groups: usize) -> Self {
         Self {
             recs: PreallocMap::with_capacity(2 * max_groups),
             spill: Group::default(),
             open: 0,
             max_groups,
+            wide: vec![[Bitmap::EMPTY; GroupBits::COUNT]; max_wide_groups],
+            free_rows: (0..max_wide_groups as u32).rev().collect(),
         }
+    }
+
+    pub fn bits(&self, group: &GroupId, field: GroupBits) -> Option<Bitmap> {
+        let rec = self.recs.get(group)?;
+        match rec.bits[field as usize] {
+            KeptBits::Unset => None,
+            KeptBits::Narrow { inverted, word } => {
+                let mut words = [0; BITMAP_WORDS];
+                words[0] = word;
+                Some(Bitmap::from_raw(inverted, words))
+            }
+            KeptBits::Wide => Some(self.wide[rec.wide? as usize][field as usize]),
+        }
+    }
+
+    #[inline]
+    pub fn has_bits(&self, group: &GroupId, field: GroupBits) -> bool {
+        self.recs.get(group).is_some_and(|rec| !matches!(rec.bits[field as usize], KeptBits::Unset))
+    }
+
+    /// Writes one of `group`'s bitmaps, its record made if it has none. Not
+    /// kept, as with [`Self::rec`], past the limit on groups that are not
+    /// open; nor is a bitmap that names an index past 63 once every row of
+    /// `max_wide_groups` is taken: the bitmap then stays as it was.
+    pub fn put_bits(&mut self, group: GroupId, field: GroupBits, bits: Bitmap) {
+        if !self.recs.contains_key(&group) && self.recs.len() - self.open >= self.max_groups {
+            return;
+        }
+        let rec = self.recs.get_or_insert_with(group, Group::default);
+        let (inverted, words) = bits.raw();
+        if words[1..].iter().all(|word| *word == 0) {
+            rec.bits[field as usize] = KeptBits::Narrow { inverted, word: words[0] };
+            return;
+        }
+        if rec.wide.is_none() {
+            rec.wide = self.free_rows.pop();
+        }
+        if let Some(row) = rec.wide {
+            self.wide[row as usize][field as usize] = bits;
+            rec.bits[field as usize] = KeptBits::Wide;
+        }
+    }
+
+    /// Changes one of `group`'s bitmaps, from empty if it is unset.
+    pub fn edit_bits(&mut self, group: GroupId, field: GroupBits, edit: impl FnOnce(&mut Bitmap)) {
+        let mut bits = self.bits(&group, field).unwrap_or_default();
+        edit(&mut bits);
+        self.put_bits(group, field, bits);
     }
 
     #[inline]
@@ -376,6 +536,9 @@ impl Groups {
         let rec = self.recs.remove(group)?;
         if rec.t_of.is_some() {
             self.open -= 1;
+        }
+        if let Some(row) = rec.wide {
+            self.free_rows.push(row);
         }
         Some(rec)
     }
@@ -995,5 +1158,41 @@ impl Pairs {
             }
             kept
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bitmap that names an index past 63 takes a row, which its group's
+    /// end frees; with no row left such a bitmap stays as it was.
+    #[test]
+    fn wide_bitmaps_take_a_row() {
+        let mut groups = Groups::with_capacity(4, 1);
+        let (a, b) = ([1; 32], [2; 32]);
+        let narrow = Bitmap::from_indices([0, 63]);
+        let wide = Bitmap::from_indices([0, 64, 1023]);
+
+        groups.put_bits(a, GroupBits::Mine, narrow);
+        groups.put_bits(a, GroupBits::Interest, Bitmap::EVERY_INDEX);
+        assert_eq!(groups.bits(&a, GroupBits::Mine), Some(narrow));
+        assert_eq!(groups.bits(&a, GroupBits::Interest), Some(Bitmap::EVERY_INDEX));
+        assert_eq!(groups.bits(&a, GroupBits::Received), None);
+        assert_eq!(groups.free_rows.len(), 1);
+
+        groups.put_bits(a, GroupBits::Mine, wide);
+        groups.edit_bits(a, GroupBits::Received, |bits| bits.set(700));
+        assert_eq!(groups.bits(&a, GroupBits::Mine), Some(wide));
+        assert_eq!(groups.bits(&a, GroupBits::Received), Some(Bitmap::singleton(700)));
+        assert!(groups.free_rows.is_empty());
+
+        groups.put_bits(b, GroupBits::Mine, narrow);
+        groups.put_bits(b, GroupBits::Mine, wide);
+        assert_eq!(groups.bits(&b, GroupBits::Mine), Some(narrow));
+
+        groups.remove(&a);
+        groups.put_bits(b, GroupBits::Mine, wide);
+        assert_eq!(groups.bits(&b, GroupBits::Mine), Some(wide));
     }
 }

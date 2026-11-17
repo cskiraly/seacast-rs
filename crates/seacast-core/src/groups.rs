@@ -3,6 +3,7 @@ use crate::{
     collections::{InlineVec, PreallocVec},
     message::ChunkMsg,
     node::SeacastNode,
+    state::GroupBits,
     traits::{
         ChunkBuffer, DecodeJob, DeferredStore, ObjectCatalog, PenaltyReason, RngSource, RuntimeEnv,
         TimerEvent,
@@ -253,15 +254,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         let already_held = self
             .groups
-            .get(&group)
-            .and_then(|r| r.received.as_ref())
+            .bits(&group, GroupBits::Received)
             .map(|b| b.has(index))
             .unwrap_or(false) ||
-            self.groups
-                .get(&group)
-                .and_then(|r| r.rebuilt.as_ref())
-                .map(|b| b.has(index))
-                .unwrap_or(false);
+            self.groups.bits(&group, GroupBits::Rebuilt).map(|b| b.has(index)).unwrap_or(false);
         if already_held {
             if let Some(p) = sender {
                 self.probe_answer(group, index, p);
@@ -271,9 +267,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         self.store_chunk(group, index, chunk.clone(), env.now());
         if sender.is_some() {
-            self.groups.rec(group).received.get_or_insert_with(Default::default).set(index);
+            self.groups.edit_bits(group, GroupBits::Received, |bits| bits.set(index));
         } else {
-            self.groups.rec(group).rebuilt.get_or_insert_with(Default::default).set(index);
+            self.groups.edit_bits(group, GroupBits::Rebuilt, |bits| bits.set(index));
         }
         // Only the claimant's own copy passes its probe; another peer's leaves
         // the probe's promise open (§4.6, R5).
@@ -287,11 +283,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         self.serve_standing(group, index, env, catalog);
 
-        let mine_entry = self.groups.rec(group).mine.get_or_insert_with(Default::default);
-        let claim = !mine_entry.has(index);
-        if claim {
-            mine_entry.set(index);
-        }
+        let claim = !self.groups.bits(&group, GroupBits::Mine).is_some_and(|mine| mine.has(index));
+        self.groups.edit_bits(group, GroupBits::Mine, |mine| mine.set(index));
         let scope = self.suppression_scope(&group, catalog);
         if claim {
             self.for_each(scope, |node, q| node.send_have(q, group, env, catalog));
@@ -329,11 +322,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             rec.hdr = header;
         }
         rec.state = Some(GroupState::Collecting);
-        // What a sampler declared, or an offer recorded, before the group opened is
-        // kept.
-        *rec.interest.get_or_insert_with(Default::default) |= &catalog.own_interest(t, &group);
         rec.known_at.get_or_insert(now);
         rec.last_activity = Some(now);
+        // What a sampler declared, or an offer recorded, before the group opened is
+        // kept.
+        let own = catalog.own_interest(t, &group);
+        self.groups.edit_bits(group, GroupBits::Interest, |interest| *interest |= &own);
         // Holdings that arrived before the group opened count from now on.
         for p in self.pairs.having(&group) {
             let Some(entry) = self.pairs.peer_has(&(p, group)) else {
@@ -503,12 +497,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 let count = self.groups.get(&g).and_then(|r| r.hdr.as_ref()).map(|h| h.n);
                 for i in bits.iter().filter(|&i| count.is_none_or(|n| i < n)) {
                     self.asked_parked.remove(&(g, i), p);
-                    let held = self
-                        .groups
-                        .get(&g)
-                        .and_then(|r| r.mine.as_ref())
-                        .map(|b| b.has(i))
-                        .unwrap_or(false);
+                    let held =
+                        self.groups.bits(&g, GroupBits::Mine).map(|b| b.has(i)).unwrap_or(false);
                     if !held {
                         self.add_offer(Ask::new(g, i), p, now);
                     }
@@ -556,7 +546,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if self.groups.get(&group).and_then(|r| r.state.as_ref()) != Some(&GroupState::Collecting) {
             return;
         }
-        let Some(interest) = self.groups.get(&group).and_then(|r| r.interest.as_ref()) else {
+        let Some(interest) = self.groups.bits(&group, GroupBits::Interest) else {
             return;
         };
         if interest.is_empty() || !self.interest_satisfied(&group, catalog) {
@@ -567,9 +557,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if catalog.decode_at_k(t, &group) {
             self.groups.rec(group).state.replace(GroupState::Decoding);
             if let Some(h) = self.groups.get(&group).and_then(|r| r.hdr.as_ref()).copied() {
-                let rec = self.groups.rec(group);
-                let held = rec.mine.unwrap_or(Bitmap::EMPTY);
-                rec.mine.replace(catalog.producible(t, &h, &held));
+                let held = self.groups.bits(&group, GroupBits::Mine).unwrap_or(Bitmap::EMPTY);
+                self.groups.put_bits(group, GroupBits::Mine, catalog.producible(t, &h, &held));
             }
         } else {
             self.groups.rec(group).state.replace(GroupState::Complete);
@@ -601,13 +590,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let Some(h) = self.groups.get(group).and_then(|r| r.hdr.as_ref()) else {
             return false;
         };
-        let recv =
-            self.groups.get(group).and_then(|r| r.received.as_ref()).unwrap_or(Bitmap::empty_ref());
-        let reb =
-            self.groups.get(group).and_then(|r| r.rebuilt.as_ref()).unwrap_or(Bitmap::empty_ref());
+        let recv = self.groups.bits(group, GroupBits::Received).unwrap_or(Bitmap::EMPTY);
+        let reb = self.groups.bits(group, GroupBits::Rebuilt).unwrap_or(Bitmap::EMPTY);
         let have = recv | reb;
-        let want =
-            self.groups.get(group).and_then(|r| r.interest.as_ref()).unwrap_or(Bitmap::empty_ref());
+        let want = self.groups.bits(group, GroupBits::Interest).unwrap_or(Bitmap::EMPTY);
         if want.is_unbounded() { have.popcount() >= h.k } else { want.and_not(&have).is_empty() }
     }
 
@@ -631,7 +617,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         let rec = self.groups.get(group)?;
         let h = rec.hdr.as_ref().cloned()?;
-        let held = rec.mine.as_ref().copied().unwrap_or(Bitmap::EMPTY);
+        let held = self.groups.bits(group, GroupBits::Mine).unwrap_or(Bitmap::EMPTY);
         self.decode_in_scratch.clear();
         let mut given = Bitmap::EMPTY;
         // One lookup an index, not a pass over every group's chunks.
@@ -716,12 +702,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             self.drop_group(group);
             return;
         };
-        let recv = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.received.as_ref())
-            .copied()
-            .unwrap_or(Bitmap::EMPTY);
+        let recv = self.groups.bits(&group, GroupBits::Received).unwrap_or(Bitmap::EMPTY);
         let mut new_indices: InlineVec<u32, MAX_BITMAP_BITS> = InlineVec::new();
         let mut filled_groups: InlineVec<GroupId, MAX_CHUNKS> = InlineVec::new();
         let now = env.now();
@@ -733,7 +714,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             if !recv.has(i) {
                 let _ = new_indices.push(i);
                 self.store_chunk(group, i, ch.clone(), now);
-                self.groups.rec(group).rebuilt.get_or_insert_with(Default::default).set(i);
+                self.groups.edit_bits(group, GroupBits::Rebuilt, |bits| bits.set(i));
                 for (g2, i2) in Self::projections(catalog, t, ch) {
                     if g2 == group {
                         continue;
@@ -896,6 +877,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.probe_answers.retain(|(_, of, _)| !gone(of));
         self.plan_refused.retain(|(_, of, _)| !gone(of));
         self.rsample_asked.retain(|(of, _, _)| !gone(of));
+        self.rsamples.retain(|of, _| !gone(of));
 
         // Queued chunks, offers and asks of them, and what is owed; their holdings
         // still leave.
