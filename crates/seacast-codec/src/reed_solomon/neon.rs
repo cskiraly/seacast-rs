@@ -3,7 +3,7 @@
 
 use core::arch::aarch64::*;
 
-use super::nibble_tables;
+use super::{linear_tables, nibble_tables};
 
 /// A constant's products with the sixteen low nibbles, then with the sixteen
 /// high ones.
@@ -15,6 +15,13 @@ const WIDTH: usize = 16;
 #[inline]
 pub(super) fn coeff(c: u8) -> Coeff {
     nibble_tables(c)
+}
+
+/// The map linear over `GF(2)` that takes bit `j` of a byte to `images[j]`, in
+/// place of a product.
+#[inline]
+pub(super) fn linear(images: [u8; 8]) -> Coeff {
+    linear_tables(images)
 }
 
 /// `dst[i] = sum_j coeffs[j] * srcs[j][at + i]` over the whole vectors of
@@ -171,6 +178,67 @@ pub(super) fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
             let y = veorq_u8(x, vld1q_u8(hp));
             vst1q_u8(hp, y);
             vst1q_u8(gp, mul_add(low, high, y, x));
+        }
+    }
+    whole
+}
+
+/// [`butterfly`] over the two planes of `GF(2^16)` symbols, whose product by a
+/// constant is `(c[0] h0 + c[1] h1, c[2] h0 + c[3] h1)`, each `c` a [`linear`]
+/// map. Returns the
+/// bytes done of each plane.
+pub(super) fn butterfly2(
+    c: &[Coeff; 4],
+    g0: &mut [u8],
+    g1: &mut [u8],
+    h0: &mut [u8],
+    h1: &mut [u8],
+) -> usize {
+    let whole = g0.len() / WIDTH * WIDTH;
+    assert!(g1.len() >= whole && h0.len() >= whole && h1.len() >= whole);
+    // SAFETY: NEON is baseline on aarch64. Every load and store is below `whole`
+    // of a plane, checked above, or inside a 32-byte coefficient.
+    unsafe {
+        let low = c.map(|c| vld1q_u8(c.as_ptr()));
+        let high = c.map(|c| vld1q_u8(c.as_ptr().add(16)));
+        for off in (0..whole).step_by(WIDTH) {
+            let (g0, g1) = (g0.as_mut_ptr().add(off), g1.as_mut_ptr().add(off));
+            let (h0, h1) = (h0.as_mut_ptr().add(off), h1.as_mut_ptr().add(off));
+            let (y0, y1) = (vld1q_u8(h0), vld1q_u8(h1));
+            let x0 = mul_add(low[1], high[1], y1, mul_add(low[0], high[0], y0, vld1q_u8(g0)));
+            let x1 = mul_add(low[3], high[3], y1, mul_add(low[2], high[2], y0, vld1q_u8(g1)));
+            vst1q_u8(g0, x0);
+            vst1q_u8(g1, x1);
+            vst1q_u8(h0, veorq_u8(x0, y0));
+            vst1q_u8(h1, veorq_u8(x1, y1));
+        }
+    }
+    whole
+}
+
+/// The reverse of [`butterfly2`].
+pub(super) fn butterfly2_back(
+    c: &[Coeff; 4],
+    g0: &mut [u8],
+    g1: &mut [u8],
+    h0: &mut [u8],
+    h1: &mut [u8],
+) -> usize {
+    let whole = g0.len() / WIDTH * WIDTH;
+    assert!(g1.len() >= whole && h0.len() >= whole && h1.len() >= whole);
+    // SAFETY: as in `butterfly2`.
+    unsafe {
+        let low = c.map(|c| vld1q_u8(c.as_ptr()));
+        let high = c.map(|c| vld1q_u8(c.as_ptr().add(16)));
+        for off in (0..whole).step_by(WIDTH) {
+            let (g0, g1) = (g0.as_mut_ptr().add(off), g1.as_mut_ptr().add(off));
+            let (h0, h1) = (h0.as_mut_ptr().add(off), h1.as_mut_ptr().add(off));
+            let (x0, x1) = (vld1q_u8(g0), vld1q_u8(g1));
+            let (y0, y1) = (veorq_u8(x0, vld1q_u8(h0)), veorq_u8(x1, vld1q_u8(h1)));
+            vst1q_u8(h0, y0);
+            vst1q_u8(h1, y1);
+            vst1q_u8(g0, mul_add(low[1], high[1], y1, mul_add(low[0], high[0], y0, x0)));
+            vst1q_u8(g1, mul_add(low[3], high[3], y1, mul_add(low[2], high[2], y0, x1)));
         }
     }
     whole

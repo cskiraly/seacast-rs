@@ -56,7 +56,23 @@ An experiment behind a cargo feature of `seacast-codec` (README, "Where this dif
 - **The GFNI and NEON arms compute several rows a pass; AVX2 does not.** It has sixteen registers and needs two for a coefficient's tables, so at most four rows of one vector; not tried.
 - **Running the transform in the parity chunks themselves, with no work buffer, was tried and was slower.** Chunks a multiple of the page size apart land in the same cache sets.
 - **`fft::parity` allocates its work buffer on every call**, K strips.
-- **Recovery is still by matrix.** Its cost grows with the chunks lost; a transform-based erasure decode would bound it. Not tried.
+- **Recovery over GF(2^8) is still by matrix.** Its cost grows with the chunks lost; a transform-based erasure decode would bound it. Not tried there.
+- **A group of more than 256 chunks is coded over GF(2^16)** (`reed_solomon/gf16.rs`), with the code and the chunk layout of Leopard-RS: a chunk is a Leopard shard. A product by a constant is linear over GF(2), so it is four maps of a byte to a byte and the kernels are shared: each has a butterfly over two planes and builds its coefficient from such a map (`linear`). Open points:
+  - **A 10 MiB body is not coded.** K = 640 gives 1280 chunks and a bitmap names 1024 (`BITMAP_WORDS`). Twenty words would take it, and widen every bitmap, queue entry and pair record. The code's tables follow `MAX_BITMAP_BITS`.
+  - **The format is not in the specification.** It is that of `leo_encode` of Leopard-RS with as many recovery shards as original ones, and the descriptor does not name it: the count alone says which field. A change needs a descriptor version.
+  - **Compatibility is checked against parity from one build of the reference** (`github.com/catid/leopard` at `910ad0a`, the legacy `leo_encode`): six cases, by a hash and the first bytes, in `test_parity_is_leopards`. The reference's decoder has not been run on chunks made here, and no port of Leopard (`reed-solomon-simd`, `klauspost/reedsolomon`) has been checked.
+  - **Only the wide code is Leopard's.** A group of 256 chunks or fewer is the specification's GF(2^8) code, which is not Leopard's 8-bit code.
+  - **Leopard picks its transform length from the recovery count.** The code here is always that of `K` recovery shards, which is what a group has. `rs_parity_rows` with fewer rows gives rows of that code, not what `leo_encode` gives for the smaller count.
+  - **A chunk is split into two planes in the work buffer and joined on the way out**, a copy each way. A kernel over the blocks as they lie would save both; not written.
+  - **Recovery costs the same whatever is lost**: two transforms over twice the points and the derivative. With few chunks lost a matrix over GF(2^16) would do less; not written.
+  - **The transform of the data does not skip the zero slots** past `K`, and the transform to the parity is not cut to the `K` rows, as Leopard's is, so K just past a power of two pays for twice the points.
+  - **The locator is a sum of logarithms per point and point not known**, quadratic in the points. A Walsh transform would make it `n log n`; not measured as a share of recovery.
+  - **`parity` and `restore` allocate their work buffers on every call**, and the tables are built at the first wide call (`LazyLock`): the first group pays for them. `restore` builds a constant for every chunk known and wanted on every call.
+  - **The bytes past a kernel's last whole vector go through the logarithm tables**, a symbol at a time, as does every byte of the portable arm. Only a segment whose half is not whole vectors has such bytes.
+  - **The strip length was placed from the benchmark on the GFNI kernel only.**
+  - **The NEON butterfly is type-checked for `aarch64-apple-darwin` and has not run.** The AVX2 and portable arms were tested by building for `haswell` and `x86-64`.
+  - **No group of more than 256 chunks has gone through the core or the simulator.** The codec's tests cover it; the core already took plain groups of that length.
+  - **`MAX_CODED_BODY` is four times what it was**, so a host that reserves it per group reserves that much more, and a coded group may decompress to that.
 - **`gfni::row` is `#[inline]`** because adding the FFT module stopped it being inlined into `combine`, which slowed recovery. The other kernels' `row` were already out of line and are unchanged.
 
 ## The specification's v0.10 changes

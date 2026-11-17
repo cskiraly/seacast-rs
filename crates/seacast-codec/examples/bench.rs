@@ -208,6 +208,37 @@ fn main() {
         bytes,
     );
 
+    // Past 256 chunks the code is over `GF(2^16)`.
+    for k in [129usize, 256, 512] {
+        let data: Vec<Vec<u8>> = (0..k).map(|i| random(UNIT, 900 + i as u64)).collect();
+        let bytes = k * UNIT;
+        let parity = rs_parity(&data, k);
+        line(&format!("rs_parity, K = {k}, 16 KiB"), best(5, || rs_parity(&data, k)), bytes);
+        let all_parity: Vec<(u32, Vec<u8>)> =
+            parity.iter().enumerate().map(|(i, p)| ((k + i) as u32, p.clone())).collect();
+        assert_eq!(rs_reconstruct_data(k, 2 * k, UNIT, &all_parity).expect("decodes"), data);
+        line(
+            &format!("rs_reconstruct_data, K = {k}, all parity"),
+            best(5, || rs_reconstruct_data(k, 2 * k, UNIT, &all_parity)),
+            bytes,
+        );
+        let mostly_data: Vec<(u32, Vec<u8>)> = (0..k)
+            .map(|i| {
+                if i % 8 == 0 {
+                    ((k + i) as u32, parity[i].clone())
+                } else {
+                    (i as u32, data[i].clone())
+                }
+            })
+            .collect();
+        assert_eq!(rs_reconstruct_data(k, 2 * k, UNIT, &mostly_data).expect("decodes"), data);
+        line(
+            &format!("rs_reconstruct_data, K = {k}, 1 in 8 lost"),
+            best(5, || rs_reconstruct_data(k, 2 * k, UNIT, &mostly_data)),
+            bytes,
+        );
+    }
+
     let leaves: Vec<Vec<u8>> = data.iter().chain(&parity).cloned().collect();
     line(
         "merkle build, 256 leaves of 16 KiB",
@@ -226,24 +257,29 @@ fn main() {
     );
 
     let comp = SnappyBlockCompressor;
-    for (name, body) in [("structured", structured(2 << 20, 7)), ("random", random(2 << 20, 9))] {
+    for (name, body) in [
+        ("structured", structured(2 << 20, 7)),
+        ("random", random(2 << 20, 9)),
+        ("random, N > 256", random(8 << 20, 11)),
+    ] {
+        let mib = body.len() >> 20;
         let compressed = comp.compress(&body);
         assert_eq!(comp.decompress(&compressed).as_deref(), Some(&body[..]));
         println!("snappy, {name}: {} -> {} bytes", body.len(), compressed.len());
         line(
-            &format!("snappy compress, 2 MiB {name}"),
+            &format!("snappy compress, {mib} MiB {name}"),
             best(10, || comp.compress(&body)),
             body.len(),
         );
         line(
-            &format!("snappy decompress, 2 MiB {name}"),
+            &format!("snappy decompress, {mib} MiB {name}"),
             best(10, || comp.decompress(&compressed)),
             body.len(),
         );
 
         let mut pool = VecBufferPool;
         line(
-            &format!("build_group, 2 MiB {name}"),
+            &format!("build_group, {mib} MiB {name}"),
             best(5, || build_group::<Vec<u8>, _, _>(&body, &mut pool, &comp)),
             body.len(),
         );

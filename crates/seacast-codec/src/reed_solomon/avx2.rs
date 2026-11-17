@@ -3,7 +3,7 @@
 
 use core::arch::x86_64::*;
 
-use super::nibble_tables;
+use super::{linear_tables, nibble_tables};
 
 /// A constant's products with the sixteen low nibbles, then with the sixteen
 /// high ones.
@@ -15,6 +15,13 @@ const WIDTH: usize = 32;
 #[inline]
 pub(super) fn coeff(c: u8) -> Coeff {
     nibble_tables(c)
+}
+
+/// The map linear over `GF(2)` that takes bit `j` of a byte to `images[j]`, in
+/// place of a product.
+#[inline]
+pub(super) fn linear(images: [u8; 8]) -> Coeff {
+    linear_tables(images)
 }
 
 /// `dst[i] = sum_j coeffs[j] * srcs[j][at + i]` over the whole vectors of
@@ -120,6 +127,85 @@ pub(super) fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
             let y = _mm256_xor_si256(x, _mm256_loadu_si256(hp.cast()));
             _mm256_storeu_si256(hp.cast(), y);
             _mm256_storeu_si256(gp.cast(), _mm256_xor_si256(x, mul(low, high, y)));
+        }
+    }
+    whole
+}
+
+/// [`butterfly`] over the two planes of `GF(2^16)` symbols, whose product by a
+/// constant is `(c[0] h0 + c[1] h1, c[2] h0 + c[3] h1)`, each `c` a [`linear`]
+/// map. Returns the
+/// bytes done of each plane.
+pub(super) fn butterfly2(
+    c: &[Coeff; 4],
+    g0: &mut [u8],
+    g1: &mut [u8],
+    h0: &mut [u8],
+    h1: &mut [u8],
+) -> usize {
+    let whole = g0.len() / WIDTH * WIDTH;
+    assert!(g1.len() >= whole && h0.len() >= whole && h1.len() >= whole);
+    // SAFETY: the module is compiled only with `avx2` enabled. Every load and
+    // store is below `whole` of a plane, checked above, or inside a 32-byte
+    // coefficient.
+    unsafe {
+        let low = c.map(|c| _mm256_broadcastsi128_si256(_mm_loadu_si128(c.as_ptr().cast())));
+        let high =
+            c.map(|c| _mm256_broadcastsi128_si256(_mm_loadu_si128(c.as_ptr().add(16).cast())));
+        for off in (0..whole).step_by(WIDTH) {
+            let (g0, g1) = (g0.as_mut_ptr().add(off), g1.as_mut_ptr().add(off));
+            let (h0, h1) = (h0.as_mut_ptr().add(off), h1.as_mut_ptr().add(off));
+            let (y0, y1) = (_mm256_loadu_si256(h0.cast()), _mm256_loadu_si256(h1.cast()));
+            let x0 = _mm256_xor_si256(
+                _mm256_loadu_si256(g0.cast()),
+                _mm256_xor_si256(mul(low[0], high[0], y0), mul(low[1], high[1], y1)),
+            );
+            let x1 = _mm256_xor_si256(
+                _mm256_loadu_si256(g1.cast()),
+                _mm256_xor_si256(mul(low[2], high[2], y0), mul(low[3], high[3], y1)),
+            );
+            _mm256_storeu_si256(g0.cast(), x0);
+            _mm256_storeu_si256(g1.cast(), x1);
+            _mm256_storeu_si256(h0.cast(), _mm256_xor_si256(x0, y0));
+            _mm256_storeu_si256(h1.cast(), _mm256_xor_si256(x1, y1));
+        }
+    }
+    whole
+}
+
+/// The reverse of [`butterfly2`].
+pub(super) fn butterfly2_back(
+    c: &[Coeff; 4],
+    g0: &mut [u8],
+    g1: &mut [u8],
+    h0: &mut [u8],
+    h1: &mut [u8],
+) -> usize {
+    let whole = g0.len() / WIDTH * WIDTH;
+    assert!(g1.len() >= whole && h0.len() >= whole && h1.len() >= whole);
+    // SAFETY: as in `butterfly2`.
+    unsafe {
+        let low = c.map(|c| _mm256_broadcastsi128_si256(_mm_loadu_si128(c.as_ptr().cast())));
+        let high =
+            c.map(|c| _mm256_broadcastsi128_si256(_mm_loadu_si128(c.as_ptr().add(16).cast())));
+        for off in (0..whole).step_by(WIDTH) {
+            let (g0, g1) = (g0.as_mut_ptr().add(off), g1.as_mut_ptr().add(off));
+            let (h0, h1) = (h0.as_mut_ptr().add(off), h1.as_mut_ptr().add(off));
+            let (x0, x1) = (_mm256_loadu_si256(g0.cast()), _mm256_loadu_si256(g1.cast()));
+            let y0 = _mm256_xor_si256(x0, _mm256_loadu_si256(h0.cast()));
+            let y1 = _mm256_xor_si256(x1, _mm256_loadu_si256(h1.cast()));
+            _mm256_storeu_si256(h0.cast(), y0);
+            _mm256_storeu_si256(h1.cast(), y1);
+            let x0 = _mm256_xor_si256(
+                x0,
+                _mm256_xor_si256(mul(low[0], high[0], y0), mul(low[1], high[1], y1)),
+            );
+            let x1 = _mm256_xor_si256(
+                x1,
+                _mm256_xor_si256(mul(low[2], high[2], y0), mul(low[3], high[3], y1)),
+            );
+            _mm256_storeu_si256(g0.cast(), x0);
+            _mm256_storeu_si256(g1.cast(), x1);
         }
     }
     whole
