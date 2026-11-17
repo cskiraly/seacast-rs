@@ -713,6 +713,35 @@ fn a_validated_header_resumes_its_deferred_chunks() {
     assert!(world.node.tied_to_root(1, Ask { group: other, index: 0 }));
 }
 
+/// A chunk's head settles a duplicate before its body is read: a copy of a
+/// chunk held is answered with a holding, one of a chunk that waits ties its
+/// sender, and a chunk not yet seen is read.
+#[test]
+fn a_duplicate_is_settled_by_its_head() {
+    let (held, waiting) = (group(1), group(2));
+    let mut world = World::new(Catalog::new(8, 8), 2, InterestKind::All);
+    world.rpc(1, chunk_rpc(chunk(held, 0, [5; 32])));
+    world.drain(2);
+
+    let head = |world: &mut World, peer, t, g: &GroupId, index, id: Option<&ChunkId>| {
+        world.node.on_chunk_head(peer, t, g, index, id, &mut world.env, &world.catalog)
+    };
+    assert!(!head(&mut world, 2, TYPE, &held, 0, None));
+    let sent = world.drain(2);
+    assert!(sent.iter().any(|e| e.haves.iter().any(|h| !h.offer && h.group == held)));
+    assert!(head(&mut world, 2, TYPE, &held, 1, None));
+    assert!(!head(&mut world, 2, TypeId(TYPE.0 + 1), &held, 1, None));
+
+    world.catalog.installed = Some([9; 32]);
+    let deferred = chunk(waiting, 0, [5; 32]);
+    world.rpc(1, chunk_rpc(deferred.clone()));
+    assert_eq!(world.node.pending_ids.len(), 1);
+    assert!(!head(&mut world, 1, TYPE, &waiting, 0, None));
+    assert!(head(&mut world, 2, TYPE, &waiting, 0, None));
+    assert!(!head(&mut world, 2, TYPE, &waiting, 0, Some(&deferred.cached_id)));
+    assert!(world.node.tied_to_root(2, Ask { group: waiting, index: 0 }));
+}
+
 /// A JOIN for a type this node does not run asks nothing of the catalog and
 /// leaves no state.
 #[test]

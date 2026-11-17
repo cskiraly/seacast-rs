@@ -8,8 +8,8 @@ use crate::{
         TimerEvent,
     },
     types::{
-        Ask, Duty, GenerationPeerId, GroupId, GroupState, PeerId, Shape, Timestamp,
-        ValidationResult,
+        Ask, ChunkId, Duty, GenerationPeerId, GroupId, GroupState, PeerId, Shape, Timestamp,
+        TypeId, ValidationResult,
     },
 };
 
@@ -54,6 +54,54 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         let res = self.level1(&chunk, catalog);
         self.route(peer, chunk, res, env, catalog, rng, deferred_store);
+    }
+
+    /// What a chunk's head settles before its body is read: `false` if the
+    /// body is not wanted, with what a duplicate does already done. `true`:
+    /// the host reads the body and passes the chunk to [`Self::on_chunk`].
+    ///
+    /// For a host that runs the proof check itself before `on_chunk`: a chunk
+    /// kept at `(group, index)` then passed it, and the group's id binds its
+    /// content, so another copy at that place is the same chunk. `id` is the
+    /// chunk's id where the head alone gives it; without it a copy of a
+    /// chunk another peer's waits for the domain's word is read.
+    ///
+    /// The copy that answers this node's probe is read: a claimant must not
+    /// pass with a head.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_chunk_head<E, C>(
+        &mut self,
+        peer: PeerId,
+        t: TypeId,
+        group: &GroupId,
+        index: u32,
+        id: Option<&ChunkId>,
+        env: &mut E,
+        catalog: &C,
+    ) -> bool
+    where
+        E: RuntimeEnv<B>,
+        C: ObjectCatalog<B>,
+    {
+        if index as usize >= MAX_BITMAP_BITS || !self.is_linked(peer, t) || self.expired(group) {
+            return false;
+        }
+        let ask = Ask::new(*group, index);
+        if self.accepted(group, index) {
+            if self.probe_asks.contains(&ask) {
+                return true;
+            }
+            self.send_have(peer, *group, env, catalog);
+            return false;
+        }
+        if self.tied_to_root(peer, ask) {
+            return false;
+        }
+        if id.is_some_and(|id| self.pending_ids.contains(id)) {
+            self.tie_index(peer, *group, index);
+            return false;
+        }
+        true
     }
 
     /// Level 1 of a chunk, in the order of its cost: the codec's checks that
@@ -341,17 +389,21 @@ impl<B: ChunkBuffer> SeacastNode<B> {
 
     /// Ties a sender to the group its deferred chunk is of (`protocol.md` §4.2
     /// `tie`).
-    pub fn tie<C>(&mut self, peer: PeerId, chunk: &ChunkMsg<B>, catalog: &C)
+    pub fn tie<C>(&mut self, peer: PeerId, chunk: &ChunkMsg<B>, _catalog: &C)
     where
         C: ObjectCatalog<B>,
     {
-        if self.expired(&chunk.group) {
+        self.tie_index(peer, chunk.group, chunk.index);
+    }
+
+    fn tie_index(&mut self, peer: PeerId, group: GroupId, index: u32) {
+        if self.expired(&group) {
             return;
         }
-        if !self.admit_group(peer, &chunk.group) || !self.tie_room(peer, chunk, catalog) {
+        if !self.admit_group(peer, &group) || !self.tie_room(peer, &group, index) {
             return;
         }
-        let key = (peer, chunk.group);
+        let key = (peer, group);
         if !self.tied.contains_key(&key) && self.tied.is_full() {
             return;
         }
@@ -360,9 +412,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 slot.tie_count += 1;
             }
         }
-        self.tied.entry_or_default(key).set(chunk.index);
-        self.tied_bits.entry_or_default((peer, chunk.group)).set(chunk.index);
-        self.close_promises(chunk.group, chunk.index, Some(peer));
+        self.tied.entry_or_default(key).set(index);
+        self.tied_bits.entry_or_default((peer, group)).set(index);
+        self.close_promises(group, index, Some(peer));
     }
 
     /// Returns `true` if `peer` has a copy of `ask` waiting for the domain's

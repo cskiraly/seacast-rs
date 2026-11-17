@@ -30,6 +30,7 @@ Questions that need Silver's code read (tcache):
 - **Cost with many types is not measured.** A host with a type per subnet joins up to about 200. `maintain_relations` and the heartbeat's gossip walk every joined type, `joined_types()` returns `MAX_JOINED_TYPES` ids by value, and each connection's record holds three maps sized `max_types`.
 - **A chunk's context is in every chunk.** A type whose context is long (a column's commitments) pays it N times. `protocol-v2.md` sends a header once a group and link; not done here.
 - **A cancelled push leaves an offer owed** through `SendQueues::owe`. Whether the node should send that offer itself was left open.
+- **`on_chunk_head` trusts the host's proof check.** It drops a copy of a chunk held, or of one that waits, on its head alone. A host that leaves the proof to `TypeCodec::check_proof` must not call it. A copy of a chunk that waits is told only by its id, which a segmented chunk's head does not give: such a copy from another peer is read. The entry has one test, with scripted peers.
 - **A popped chunk must get a verdict.** A host that takes a chunk from `pop_unverified` and never calls `on_validated` leaves its id in `verifying` until the group ends, and other copies are refused meanwhile. There is no timeout.
 - **A deadline is fixed when first asked**, and a group known only from offers has none until its first chunk.
 - **Memory.** The per (peer, group) table is the largest. Ideas not tried: peer lists held inline, a dense index for pairs. `cargo run --release -p seacast-core --example node_size` prints the heap a node holds after `new`. Most of it is the send queues: three lanes of `max_queue_entries_per_peer` entries and two maps of `max_groups` bitmaps for every peer id, allocated whether the peer is connected or not. An entry is as wide as a control message with its bitmap, also when it stands for a chunk.
@@ -137,7 +138,7 @@ Open on the floors, the sampler and the rest of §4.1:
 
 ## Small cleanups
 
-- `projected`, `valid_have`, `tie_room` and `interest_satisfied` keep an unused `_catalog` parameter.
+- `projected`, `valid_have`, `tie` and `interest_satisfied` keep an unused `_catalog` parameter.
 - `tied` and `tied_bits` appear to hold the same thing since ties became keyed by group; check and merge.
 - `tied_to_root` keeps the specification's name though the core has no root.
 - `SendQueues`' methods are still `pub`, as when a host kept the queues. Only `connect`, `disconnect` and the queue's state need to be seen outside `seacast-core`, the last by the tests.
