@@ -268,6 +268,12 @@ pub struct TypeParams {
     pub repair_reask: bool,
     /// Optional fraud-proof evidence object type (`EVIDENCE`, `[D6]`).
     pub evidence: Option<TypeId>,
+    /// Most chunks a group of this type has. Not in the specification: read
+    /// by [`CapacityConfig::size_for`] only.
+    pub max_chunks: u32,
+    /// Most groups of this type the domain takes in one of its slots. Not in
+    /// the specification: read by [`CapacityConfig::size_for`] only.
+    pub max_groups_per_slot: u32,
 }
 
 impl Default for TypeParams {
@@ -299,6 +305,8 @@ impl Default for TypeParams {
             sample_wait: 0.0,
             repair_reask: false,
             evidence: None,
+            max_chunks: crate::bitmap::MAX_BITMAP_BITS as u32,
+            max_groups_per_slot: 4,
         }
     }
 }
@@ -435,6 +443,9 @@ pub struct CapacityConfig {
     pub max_types: usize,
     /// Maximum active groups tracked concurrently (`256`).
     pub max_groups: usize,
+    /// Of those, the groups with a chunk index past 63 (`256`): their
+    /// bitmaps are kept apart from their records.
+    pub max_wide_groups: usize,
     /// Maximum (peer, group) pairs with state. `max_peers * max_groups` refuses
     /// none.
     pub max_pairs: usize,
@@ -453,6 +464,15 @@ pub struct CapacityConfig {
     pub max_deferred_chunks: usize,
     /// Maximum queue entries per peer lane (`512`).
     pub max_queue_entries_per_peer: usize,
+    /// Maximum (peer, group) pairs with offers owed, and as many with answers
+    /// owed, of the groups of more than one chunk (`4096`).
+    pub max_owed_pairs: usize,
+    /// Maximum groups of one chunk with an offer, and as many with an answer,
+    /// owed to one peer (`256`). Past it the oldest is dropped.
+    pub max_owed_single_per_peer: usize,
+    /// Maximum groups with a repair sample (`256`). Past it a group asks for
+    /// none.
+    pub max_repair_samples: usize,
     /// Maximum parks kept of nodes not connected (`1024`).
     pub max_kept_parks: usize,
     /// Maximum (ask, peer) records in each of the tried and promise tables
@@ -466,6 +486,7 @@ impl Default for CapacityConfig {
             max_peers: 64,
             max_types: 8,
             max_groups: 256,
+            max_wide_groups: 256,
             max_pairs: 64 * 256,
             max_wide_pairs: 64 * 16,
             max_stored_chunks: 4096,
@@ -474,9 +495,39 @@ impl Default for CapacityConfig {
             max_seen_ids: 8192,
             max_deferred_chunks: 1024,
             max_queue_entries_per_peer: 512,
+            max_owed_pairs: 4096,
+            max_owed_single_per_peer: 256,
+            max_repair_samples: 256,
             max_kept_parks: 1024,
             max_ask_peers: 4096,
         }
+    }
+}
+
+impl CapacityConfig {
+    /// Sizes the tables that grow with the groups for the types a node
+    /// joins: `types` gives each type's parameters with the number of types
+    /// joined that have them (the subnets of a topic), and `slots` how many
+    /// of the domain's slots a group lives.
+    pub fn size_for<'a>(
+        &mut self,
+        types: impl IntoIterator<Item = (&'a TypeParams, usize)>,
+        slots: usize,
+    ) {
+        let (mut joined, mut groups, mut wide, mut chunks) = (0, 0, 0, 0);
+        for (params, count) in types {
+            let of_type = count * params.max_groups_per_slot as usize * slots;
+            joined += count;
+            groups += of_type;
+            chunks += of_type * params.max_chunks as usize;
+            if params.max_chunks > 64 {
+                wide += of_type;
+            }
+        }
+        self.max_types = joined;
+        self.max_groups = groups;
+        self.max_wide_groups = wide;
+        self.max_stored_chunks = chunks;
     }
 }
 

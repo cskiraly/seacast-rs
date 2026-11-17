@@ -4,10 +4,10 @@
 
 use seacast_core::{
     Ask, Bitmap, BoundedDeferredStore, ChunkId, ChunkMsg, Direction, DispatchOutcome, Domain, Duty,
-    FamilyId, Graft, GroupId, GroupState, Have, InlineVec, InterestKind, Join, LinkFloor,
-    MAX_CHUNKS, MAX_JOINED_TYPES, NodeConfig, NodeId, PeerId, PenaltyReason, Policy, PreallocVec,
-    Rpc, RuntimeEnv, SeacastNode, Shape, SplitMix64, TimerEvent, Timestamp, TypeCodec, TypeId,
-    TypeParams, ValidationResult, Want,
+    FamilyId, Graft, GroupBits, GroupId, GroupState, Have, InlineVec, InterestKind, Join,
+    LinkFloor, MAX_CHUNKS, MAX_JOINED_TYPES, NodeConfig, NodeId, PeerId, PenaltyReason, Policy,
+    PreallocVec, Rpc, RuntimeEnv, SeacastNode, Shape, SplitMix64, TimerEvent, Timestamp, TypeCodec,
+    TypeId, TypeParams, ValidationResult, Want,
 };
 
 type Chunk = ChunkMsg<Vec<u8>>;
@@ -546,7 +546,32 @@ fn owed_offers_are_never_dropped() {
     }
     offered.sort_unstable();
     assert_eq!(offered, (0..50).map(group).collect::<Vec<_>>());
-    assert!(world.node.sends.queue.get(1).is_some_and(|q| q.owed.is_empty()));
+    assert!(!world.node.sends.owed.any(1));
+}
+
+/// What is owed of groups of one chunk is kept in a ring a peer: past its
+/// length the oldest offer goes.
+#[test]
+fn offers_owed_of_single_chunks_are_bounded() {
+    let mut config = NodeConfig::default();
+    config.capacities.max_owed_single_per_peer = 4;
+    let mut world = World::with_config(config, Catalog::new(1, 1), 2, InterestKind::All);
+    for tag in 0..6 {
+        world.rpc(1, chunk_rpc(chunk(group(tag), 0, [5; 32])));
+    }
+    world.drain(2);
+    for tag in 0..6 {
+        world.node.owe(2, group(tag), Bitmap::singleton(0), &mut world.env);
+        world.node.owe(2, group(tag), Bitmap::singleton(0), &mut world.env);
+    }
+    assert!(!world.node.sends.owed.any(2));
+    let queue = world.node.sends.queue.get(2).unwrap();
+    assert_eq!(queue.owed_single.len(), 4);
+    assert_eq!(queue.owed_single.front(), Some(&group(2)));
+    assert!(world.node.sends.has_owed_offers(2));
+
+    world.drain(2);
+    assert!(!world.node.sends.has_owed_offers(2));
 }
 
 /// A chunk that waited for its block from a peer that then left can still
@@ -584,7 +609,7 @@ fn a_sampler_completes_on_its_declared_indices() {
     world.node.sample(g, wanted, &mut world.env, &world.catalog, &mut world.rng);
     world.rpc(1, chunk_rpc(chunk(g, 2, [0; 32])));
     assert_eq!(world.node.group_state(&g), Some(GroupState::Collecting));
-    assert_eq!(world.node.groups.get(&g).and_then(|rec| rec.interest), Some(wanted));
+    assert_eq!(world.node.groups.bits(&g, GroupBits::Interest), Some(wanted));
     world.rpc(1, chunk_rpc(chunk(g, 5, [0; 32])));
     assert_eq!(world.node.group_state(&g), Some(GroupState::Complete));
 }

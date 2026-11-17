@@ -43,8 +43,8 @@ pub use message::{
 pub use node::SeacastNode;
 pub use queue::SendQueues;
 pub use state::{
-    AskPeers, DispatchOutcome, GossipHistory, Group, Groups, Pairs, Peer, PeerQueue, PeerSet,
-    Relations,
+    AskPeers, DispatchOutcome, GossipHistory, Group, GroupBits, Groups, Owed, Pairs, Peer,
+    PeerQueue, PeerSet, Relations,
 };
 pub use traits::{
     BoundedDeferredStore, ChunkBuffer, DecodeJob, DeferredStore, Domain, ObjectCatalog,

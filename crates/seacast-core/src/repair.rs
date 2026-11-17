@@ -3,7 +3,7 @@ use crate::{
     collections::{InlineVec, PreallocVec},
     message::{Have, Queued, Want},
     node::SeacastNode,
-    state::PeerSet,
+    state::{GroupBits, PeerSet},
     traits::{ChunkBuffer, ObjectCatalog, PenaltyReason, RngSource, RuntimeEnv, TimerEvent},
     types::{
         Ask, Duty, GenerationPeerId, GroupId, GroupState, InterestKind, PeerId, RepairVerdict,
@@ -60,7 +60,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 self.sends.window_release(peer, h.group, i, env);
             }
             // A copy of a chunk we publish exists elsewhere (§4.7).
-            if self.groups.get(&h.group).is_some_and(|r| r.origin.is_some()) {
+            if self.groups.has_bits(&h.group, GroupBits::Origin) {
                 self.origin_acked(h.group, i, env, catalog);
             }
         }
@@ -110,8 +110,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     where
         C: ObjectCatalog<B>,
     {
-        let mut known =
-            self.groups.get(group).and_then(|r| r.mine.as_ref()).copied().unwrap_or(Bitmap::EMPTY);
+        let mut known = self.groups.bits(group, GroupBits::Mine).unwrap_or(Bitmap::EMPTY);
         for q in self.peers_of(self.suppression_scope(group, catalog)) {
             if self.claims.contains(group, q) {
                 continue;
@@ -129,8 +128,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     where
         C: ObjectCatalog<B>,
     {
-        let mut known =
-            self.groups.get(group).and_then(|r| r.mine.as_ref()).copied().unwrap_or(Bitmap::EMPTY);
+        let mut known = self.groups.bits(group, GroupBits::Mine).unwrap_or(Bitmap::EMPTY);
         let Some(h) = self.groups.get(group).and_then(|r| r.hdr.as_ref()) else {
             return known;
         };
@@ -166,10 +164,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         };
         let t = self.type_of(group, catalog);
         let n = h.n;
-        let recv =
-            self.groups.get(group).and_then(|r| r.received.as_ref()).unwrap_or(Bitmap::empty_ref());
-        let reb =
-            self.groups.get(group).and_then(|r| r.rebuilt.as_ref()).unwrap_or(Bitmap::empty_ref());
+        let recv = self.groups.bits(group, GroupBits::Received).unwrap_or(Bitmap::EMPTY);
+        let reb = self.groups.bits(group, GroupBits::Rebuilt).unwrap_or(Bitmap::EMPTY);
         for i in 0..n {
             if recv.has(i) || reb.has(i) {
                 continue;
@@ -178,9 +174,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 let t2 = self.type_of(&g2, catalog);
                 let interest2 = self
                     .groups
-                    .get(&g2)
-                    .and_then(|r| r.interest.as_ref())
-                    .copied()
+                    .bits(&g2, GroupBits::Interest)
                     .unwrap_or_else(|| catalog.own_interest(t2, &g2));
                 if interest2.has(i2) {
                     return true;
@@ -212,24 +206,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let repair_reask = catalog.params(t).repair_reask;
         let k = self.groups.get(&group).and_then(|r| r.rsample_step.as_ref()).copied().unwrap_or(0);
         if k > 0 {
-            let recv = self
-                .groups
-                .get(&group)
-                .and_then(|r| r.received.as_ref())
-                .copied()
-                .unwrap_or(Bitmap::EMPTY);
-            let reb = self
-                .groups
-                .get(&group)
-                .and_then(|r| r.rebuilt.as_ref())
-                .copied()
-                .unwrap_or(Bitmap::EMPTY);
-            let sampled = self
-                .groups
-                .get(&group)
-                .and_then(|r| r.rsample.as_ref())
-                .copied()
-                .unwrap_or_default();
+            let recv = self.groups.bits(&group, GroupBits::Received).unwrap_or(Bitmap::EMPTY);
+            let reb = self.groups.bits(&group, GroupBits::Rebuilt).unwrap_or(Bitmap::EMPTY);
+            let sampled = self.rsamples.get(&group).copied().unwrap_or_default();
             let mut lost: InlineVec<u32, MAX_BITMAP_BITS> = InlineVec::new();
             for i in sampled {
                 if !recv.has(i) && !reb.has(i) {
@@ -265,24 +244,16 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             }
         }
 
-        let current_len =
-            self.groups.get(&group).and_then(|r| r.rsample.as_ref()).map(|v| v.len()).unwrap_or(0);
+        let current_len = self.rsamples.get(&group).map(|v| v.len()).unwrap_or(0);
         let mut want = steps[k].0.saturating_sub(current_len);
         let n = self.groups.get(&group).and_then(|r| r.hdr.as_ref()).map(|h| h.n).unwrap_or(0);
-        let recv = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.received.as_ref())
-            .copied()
-            .unwrap_or(Bitmap::EMPTY);
-        let reb = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.rebuilt.as_ref())
-            .copied()
-            .unwrap_or(Bitmap::EMPTY);
-        let existing =
-            self.groups.get(&group).and_then(|r| r.rsample.as_ref()).copied().unwrap_or_default();
+        let recv = self.groups.bits(&group, GroupBits::Received).unwrap_or(Bitmap::EMPTY);
+        let reb = self.groups.bits(&group, GroupBits::Rebuilt).unwrap_or(Bitmap::EMPTY);
+        let existing = self.rsamples.get(&group).copied().unwrap_or_default();
+        // No room to keep a sample of this group: none is asked for.
+        if !self.rsamples.contains_key(&group) && self.rsamples.is_full() {
+            want = 0;
+        }
         let mut pool: InlineVec<u32, MAX_BITMAP_BITS> = InlineVec::new();
         for i in 0..n {
             if !recv.has(i) && !reb.has(i) && !existing.contains(&i) {
@@ -295,18 +266,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 break;
             }
             if self.ask_custodian(group, i, env, catalog, rng) {
-                let _ = self.groups.rec(group).rsample.get_or_insert_with(Default::default).push(i);
+                let _ = self.rsamples.entry_or_default(group).push(i);
                 want -= 1;
             }
         }
         self.groups.rec(group).rsample_step.replace(k + 1);
-        if self
-            .groups
-            .get(&group)
-            .and_then(|r| r.rsample.as_ref())
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-        {
+        if self.rsamples.get(&group).is_some_and(|v| !v.is_empty()) {
             RepairVerdict::Asked
         } else {
             RepairVerdict::Repaired
@@ -395,11 +360,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             .get(&group)
             .and_then(|r| r.probe.as_ref())
             .map(|&p_idx| {
-                self.groups
-                    .get(&group)
-                    .and_then(|r| r.received.as_ref())
-                    .map(|b| b.has(p_idx))
-                    .unwrap_or(false)
+                self.groups.bits(&group, GroupBits::Received).map(|b| b.has(p_idx)).unwrap_or(false)
             })
             .unwrap_or(false);
         let fam = catalog.family(t, &group);
@@ -443,9 +404,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
 
         self.groups.rec(group).state.replace(GroupState::Decoding);
-        let rec = self.groups.rec(group);
-        let held = rec.mine.unwrap_or(Bitmap::EMPTY);
-        rec.mine.replace(catalog.producible(t, &h, &held));
+        let held = self.groups.bits(&group, GroupBits::Mine).unwrap_or(Bitmap::EMPTY);
+        self.groups.put_bits(group, GroupBits::Mine, catalog.producible(t, &h, &held));
         self.for_each(self.suppression_scope(&group, catalog), |node, q| {
             node.send_have(q, group, env, catalog);
         });
@@ -475,12 +435,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         {
             if let Some(h) = self.groups.get(&group).and_then(|r| r.hdr.as_ref()) {
                 let n = h.n;
-                let mine_count = self
-                    .groups
-                    .get(&group)
-                    .and_then(|r| r.mine.as_ref())
-                    .map(|b| b.popcount())
-                    .unwrap_or(0);
+                let mine_count =
+                    self.groups.bits(&group, GroupBits::Mine).map(|b| b.popcount()).unwrap_or(0);
                 if mine_count < n {
                     self.defer_on_claim(group, env, catalog, rng);
                 }
@@ -501,8 +457,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         };
         let t = self.type_of(&group, catalog);
         let n = h.n;
-        let mine =
-            self.groups.get(&group).and_then(|r| r.mine.as_ref()).unwrap_or(Bitmap::empty_ref());
+        let mine = self.groups.bits(&group, GroupBits::Mine).unwrap_or(Bitmap::EMPTY);
         // An index we lack, at random: the claimant cannot tell which
         // (`protocol-v2.md` §4.6 `defer_on_claim`).
         let lacked = (0..n).filter(|&i| !mine.has(i)).count();
@@ -770,7 +725,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return;
         }
         let now = env.now();
-        *self.groups.rec(group).interest.get_or_insert_with(Default::default) |= bits;
+        self.groups.edit_bits(group, GroupBits::Interest, |interest| *interest |= bits);
         self.groups.rec(group).known_at.get_or_insert(now);
         for i in bits.iter() {
             self.ask_sample(group, i, true, env, catalog, rng);
@@ -795,8 +750,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
         R: RngSource,
     {
-        let held =
-            self.groups.get(&group).and_then(|r| r.mine.as_ref()).is_some_and(|m| m.has(index));
+        let held = self.groups.bits(&group, GroupBits::Mine).is_some_and(|m| m.has(index));
         if held || self.expired(&group) {
             return;
         }
@@ -901,8 +855,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 }
             }
         }
-        let held =
-            self.groups.get(&group).and_then(|r| r.mine.as_ref()).is_some_and(|m| m.has(index));
+        let held = self.groups.bits(&group, GroupBits::Mine).is_some_and(|m| m.has(index));
         if !held && !self.expired(&group) {
             // Not a connection closed since: another may have its peer id.
             if let Some(q) = peer.and_then(|p| self.slots.resolve(p)) {

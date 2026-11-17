@@ -2,6 +2,7 @@ use crate::{
     bitmap::Bitmap,
     message::{QueueEntry, Queued, Want},
     node::SeacastNode,
+    state::GroupBits,
     traits::{ChunkBuffer, ObjectCatalog, RuntimeEnv, TimerEvent},
     types::{Ask, PeerId},
 };
@@ -22,18 +23,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let &Queued::Chunk { group, index, solicited: false } = entry else {
             return false;
         };
-        let in_received = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.received.as_ref())
-            .map(|b| b.has(index))
-            .unwrap_or(false);
-        let in_rebuilt = self
-            .groups
-            .get(&group)
-            .and_then(|r| r.rebuilt.as_ref())
-            .map(|b| b.has(index))
-            .unwrap_or(false);
+        let in_received =
+            self.groups.bits(&group, GroupBits::Received).map(|b| b.has(index)).unwrap_or(false);
+        let in_rebuilt =
+            self.groups.bits(&group, GroupBits::Rebuilt).map(|b| b.has(index)).unwrap_or(false);
         !in_received && !in_rebuilt
     }
 

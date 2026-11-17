@@ -3,7 +3,7 @@ use crate::{
     collections::InlineVec,
     message::{Have, Queued, Want},
     node::SeacastNode,
-    state::PeerSet,
+    state::{GroupBits, PeerSet},
     traits::{ChunkBuffer, ObjectCatalog, PenaltyReason, RngSource, RuntimeEnv, TimerEvent},
     types::{Ask, ChunkId, Duty, GroupId, InterestKind, PeerId, Timestamp, TypeId},
 };
@@ -40,17 +40,15 @@ impl<B: ChunkBuffer> SeacastNode<B> {
 
         let t = self.type_of(&g, catalog);
         let now = env.now();
-        let interest = match self.groups.get(&g).and_then(|r| r.interest.as_ref()) {
-            Some(interest) => *interest,
+        let interest = match self.groups.bits(&g, GroupBits::Interest) {
+            Some(interest) => interest,
             None => catalog.own_interest(t, &g),
         };
         // Nothing is kept of an offer that names nothing this node wants: state for a
         // group starts with an offer the admission above counts (`offered`, by
         // `add_offer`).
         if (h.bits & interest)
-            .and_not(
-                self.groups.get(&g).and_then(|r| r.mine.as_ref()).unwrap_or(Bitmap::empty_ref()),
-            )
+            .and_not(&self.groups.bits(&g, GroupBits::Mine).unwrap_or(Bitmap::EMPTY))
             .is_empty()
         {
             return InlineVec::new();
@@ -61,8 +59,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         // what it lets the node ask for is the next heartbeat's (`protocol.md`
         // §4.4).
         if self.over_ihave_limits(peer) {
-            let mine = self.groups.get(&g).and_then(|r| r.mine.as_ref());
-            let wanted = (h.bits & interest).and_not(mine.unwrap_or(Bitmap::empty_ref()));
+            let mine = self.groups.bits(&g, GroupBits::Mine);
+            let wanted = (h.bits & interest).and_not(&mine.unwrap_or(Bitmap::EMPTY));
             let held = self.pairs.offered(&(peer, g)).unwrap_or_default();
             self.pairs.set_offered((peer, g), held | wanted);
             self.pairs.set_offer_at((peer, g), now);
@@ -75,8 +73,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return self.deferred_offers(peer, h, &interest, known_at, start_delay, env);
         }
 
-        let mine =
-            self.groups.get(&g).and_then(|r| r.mine.as_ref()).copied().unwrap_or(Bitmap::EMPTY);
+        let mine = self.groups.bits(&g, GroupBits::Mine).unwrap_or(Bitmap::EMPTY);
         let wanted = (h.bits & interest).and_not(&mine);
         let auth = catalog.authenticable(t, &g);
 
@@ -133,8 +130,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let g = h.group;
         let now = env.now();
         let due = (known_at + start_delay - now).max(0.0) + 1e-6;
-        let mine =
-            self.groups.get(&g).and_then(|r| r.mine.as_ref()).copied().unwrap_or(Bitmap::EMPTY);
+        let mine = self.groups.bits(&g, GroupBits::Mine).unwrap_or(Bitmap::EMPTY);
         let wanted = (h.bits & interest).and_not(&mine);
         for i in wanted.iter() {
             let a = Ask::new(g, i);
@@ -193,8 +189,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             let invited = if claimed_all || ours == Some(InterestKind::All) {
                 Bitmap::EVERY_INDEX
             } else {
-                let wanted = self.groups.get(&g).and_then(|r| r.interest.as_ref());
-                catalog.own_interest(t, &g) | wanted.unwrap_or(Bitmap::empty_ref())
+                let wanted = self.groups.bits(&g, GroupBits::Interest);
+                catalog.own_interest(t, &g) | wanted.unwrap_or(Bitmap::EMPTY)
             };
             let budget = self.config.max_served_per_heartbeat;
             // A routed sample request may come to a node with duty that neither holds
@@ -219,7 +215,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 }
                 // The peer's probe of our claim: answered whatever it holds, once
                 // for the group (`protocol-v2.md` §4.6 `probe_of_claim`).
-                let claimed = self.groups.get(&g).and_then(|r| r.mine.as_ref());
+                let claimed = self.groups.bits(&g, GroupBits::Mine);
                 let flagged = w.probe &&
                     claimed.is_some_and(|mine| mine.has(idx)) &&
                     !self.pairs.probe_served(&(peer, g));
@@ -371,7 +367,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             node.pairs.add_served((q, group));
             let entry = Queued::Chunk { group, index, solicited: true };
             if !node.enqueue(q, entry, false, env) {
-                node.sends.owe_answer(q, group, index);
+                let single = node.single_chunk(&group);
+                node.sends.owe_answer(q, group, index, single);
             }
             node.note_push(q, group, index, now);
         });
@@ -579,10 +576,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 bits |= b;
             }
         }
-        let mine =
-            self.groups.get(group).and_then(|r| r.mine.as_ref()).unwrap_or(Bitmap::empty_ref());
+        let mine = self.groups.bits(group, GroupBits::Mine).unwrap_or(Bitmap::EMPTY);
         let mut out = InlineVec::new();
-        for i in bits.and_not(mine).iter() {
+        for i in bits.and_not(&mine).iter() {
             let _ = out.push(Ask::new(*group, i));
         }
         out

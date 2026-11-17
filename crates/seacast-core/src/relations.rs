@@ -3,7 +3,7 @@ use crate::{
     collections::{InlineVec, PreallocVec, word_bits},
     message::{Control, Graft, Join, Prune},
     node::SeacastNode,
-    state::PeerSet,
+    state::{GroupBits, PeerSet},
     traits::{ChunkBuffer, ObjectCatalog, RngSource, RuntimeEnv},
     types::{
         Colour, Direction, Duty, FamilyId, GroupId, GroupState, InterestKind, PeerId, Timestamp,
@@ -410,13 +410,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 continue;
             }
             let mut bits = Bitmap::new();
-            for idx in self
-                .groups
-                .get(&g)
-                .and_then(|r| r.mine.as_ref())
-                .unwrap_or(Bitmap::empty_ref())
-                .iter()
-            {
+            for idx in self.groups.bits(&g, GroupBits::Mine).unwrap_or(Bitmap::EMPTY).iter() {
                 if (idx % m) as u16 == colour && self.chunks.contains_key(&(g, idx)) {
                     bits.set(idx);
                 }
