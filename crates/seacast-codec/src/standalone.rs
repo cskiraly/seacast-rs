@@ -7,16 +7,15 @@ use seacast_core::{
     Bytes32, ChunkMsg, GroupId, PreallocVec, Shape, TypeCodec, TypeId, ValidationResult,
 };
 
-use crate::{buffer::ChunkBytes, sha256::Sha256};
+use crate::{buffer::ChunkBytes, sha256::Sha256, wire::chunk_wire_size};
 
-/// The id of the group of a standalone chunk: `sha256(0x04 || uint16_le(type)
+/// The group of a standalone chunk: index 0 under the key `sha256(0x04 || type
 /// || frame)`.
 pub fn standalone_group(type_id: TypeId, frame: &[u8]) -> GroupId {
     let mut h = Sha256::new();
-    h.update(&[0x04]);
-    h.update(&type_id.0.to_le_bytes());
+    h.update(&[0x04, type_id.0]);
     h.update(frame);
-    h.finalize()
+    GroupId::new(type_id, h.finalize(), 0)
 }
 
 /// Level 1 of a standalone chunk, all of it: it is index 0, its frame holds a
@@ -52,7 +51,7 @@ impl<B: ChunkBytes> TypeCodec<B> for StandaloneCodec {
 
     fn check(&self, chunk: &ChunkMsg<B>) -> bool {
         check_standalone(
-            chunk.type_id,
+            chunk.group.type_id,
             &chunk.group,
             chunk.index,
             chunk.frame.as_bytes(),
@@ -66,7 +65,7 @@ impl<B: ChunkBytes> TypeCodec<B> for StandaloneCodec {
     }
 
     fn header_id(&self, chunk: &ChunkMsg<B>) -> Bytes32 {
-        chunk.group
+        chunk.group.key
     }
 
     fn context<'a>(&self, chunk: &'a ChunkMsg<B>) -> &'a [u8] {
@@ -76,7 +75,6 @@ impl<B: ChunkBytes> TypeCodec<B> for StandaloneCodec {
     /// The object is the one chunk's frame, context included.
     fn decode(
         &mut self,
-        _t: TypeId,
         _group: &GroupId,
         available: &[ChunkMsg<B>],
         _shape: &Shape,
@@ -87,8 +85,8 @@ impl<B: ChunkBytes> TypeCodec<B> for StandaloneCodec {
         Some(chunk.frame.clone())
     }
 
-    fn wire_size(&self, chunk: &ChunkMsg<B>) -> usize {
-        2 + 32 + 4 + chunk.frame.len()
+    fn wire_size(&self, chunk: &ChunkMsg<B>, _first_of_group: bool) -> usize {
+        chunk_wire_size(chunk)
     }
 }
 
@@ -115,11 +113,10 @@ mod tests {
         let t = TypeId(7);
         let frame = b"ctx:a small message".to_vec();
         let chunk = ChunkMsg {
-            type_id: t,
             group: standalone_group(t, &frame),
             index: 0,
             frame: frame.clone(),
-            cached_id: [0; 56],
+            cached_id: [0; 59],
             memo: [0; 32],
         };
         let mut codec = StandaloneCodec { context_len: 4, max_data: 64 };
@@ -128,8 +125,7 @@ mod tests {
         assert_eq!(codec.shape(&chunk), Some(Shape { n: 1, k: 1 }));
         let mut rebuilt = PreallocVec::with_capacity(1);
         let shape = Shape { n: 1, k: 1 };
-        let object =
-            codec.decode(t, &chunk.group, std::slice::from_ref(&chunk), &shape, &mut rebuilt);
+        let object = codec.decode(&chunk.group, std::slice::from_ref(&chunk), &shape, &mut rebuilt);
         assert_eq!(object, Some(frame));
         assert_eq!(rebuilt.len(), 1);
     }

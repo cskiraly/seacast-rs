@@ -294,7 +294,7 @@ fn main() {
         let chunk = |index: usize| all[index].clone();
         let valid = |chunk: &ChunkMsg<Vec<u8>>| {
             let (index, frame) = (chunk.index, &chunk.frame[..]);
-            check_frame(chunk.type_id, &chunk.group, index, frame, context.len()) &&
+            check_frame(chunk.group.type_id, &chunk.group, index, frame, context.len()) &&
                 check_frame_proof(index, frame, context.len())
         };
         let k = descriptor.k() as usize;

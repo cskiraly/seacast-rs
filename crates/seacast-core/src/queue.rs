@@ -10,7 +10,7 @@ use crate::{
     node::SeacastNode,
     state::{DispatchOutcome, GroupBits, Owed, PeerQueue},
     traits::{ChunkBuffer, ObjectCatalog, RuntimeEnv, TimerEvent},
-    types::{Ask, GroupId, NodeConfig, PeerId},
+    types::{Ask, GroupId, NodeConfig, PeerId, SourceOffers, TypeId},
 };
 
 #[derive(Debug, Clone)]
@@ -121,20 +121,31 @@ impl SendQueues {
     }
 
     /// What is owed of the relation's messages, queued in order while there is
-    /// room: the writer's first step (`queue_owed_relations`).
+    /// room: the writer's first step (`queue_owed_relations`). True if a JOIN
+    /// was queued.
     fn queue_owed_relations<B: ChunkBuffer, E: RuntimeEnv<B>>(
         &mut self,
         peer: PeerId,
         env: &mut E,
-    ) {
+    ) -> bool {
+        let mut joined = false;
         while self.has_queue_room(peer) {
             let Some(message) = self.queue.get_mut(peer).and_then(|q| q.owed_relations.pop_front())
             else {
-                return;
+                break;
             };
             let urgent = matches!(message, Control::Join(_));
+            joined |= urgent;
             self.send(peer, Queued::Control(message), urgent, env);
         }
+        joined
+    }
+
+    /// Our JOIN for `t` to `peer` is owed, not queued.
+    pub fn join_owed(&self, peer: PeerId, t: TypeId) -> bool {
+        self.queue.get(peer).is_some_and(|q| {
+            q.owed_relations.iter().any(|m| matches!(m, Control::Join(j) if j.object_type == t))
+        })
     }
 
     /// Marks `bits` of `group` as owed to `peer` for the next write (`owe(p, g,
@@ -310,17 +321,20 @@ impl SendQueues {
     }
 
     /// Frees in-flight window bytes on `WINDOW_TIMEOUT` (`window_timeout`).
+    /// True if the room was still held: no holding freed it first.
     pub fn window_timeout<B: ChunkBuffer, E: RuntimeEnv<B>>(
         &mut self,
         key: (PeerId, GroupId, u32),
         at_bits: u64,
         env: &mut E,
-    ) {
-        if let Some(&(sent_at, need)) = self.sent.get(&key) {
-            if sent_at == at_bits {
+    ) -> bool {
+        match self.sent.get(&key) {
+            Some(&(sent_at, need)) if sent_at == at_bits => {
                 self.sent.remove(&key);
                 self.free_room(need, env);
+                true
             }
+            _ => false,
         }
     }
 
@@ -371,7 +385,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
     {
         loop {
-            self.sends.queue_owed_relations(peer, env);
+            if self.sends.queue_owed_relations(peer, env) {
+                // A link counts once our JOIN is queued (§4.1 `links`).
+                for t in catalog.joined_types() {
+                    self.relink(peer, t);
+                }
+            }
             if self.sends.has_owed_answers(peer) && self.sends.has_queue_room(peer) {
                 if let Some((group, index)) = self.pop_owed_answer(peer) {
                     let entry = Queued::Chunk { group, index, solicited: true };
@@ -379,7 +398,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 }
             }
             if let Some(urgent_entry) = self.take_head(peer, true) {
-                if let Some(out) = self.with_owed(peer, urgent_entry, catalog) {
+                if let Some(out) = self.with_owed(peer, urgent_entry) {
                     return DispatchOutcome::Send(out);
                 }
                 continue;
@@ -388,7 +407,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 self.sends.queue.get(peer).map(|q| q.normal.is_empty()).unwrap_or(true);
             if normal_empty {
                 if self.sends.has_owed_offers(peer) {
-                    if let Some(out) = self.with_owed(peer, QueueEntry::empty(), catalog) {
+                    if let Some(out) = self.with_owed(peer, QueueEntry::empty()) {
                         return DispatchOutcome::Send(out);
                     }
                 }
@@ -405,12 +424,14 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                         self.sends.queue.get_mut(peer).expect("queue exists").normal.remove(k);
                         continue;
                     };
-                    let need = catalog.wire_size(&chunk);
+                    let first = !solicited && !self.pairs.first_written(&(peer, group));
+                    let need = catalog.wire_size(&chunk, first);
                     if need > 0 && !self.sends.acquire_room(peer, need, env) {
                         return DispatchOutcome::Wait;
                     }
                     self.sends.queue.get_mut(peer).expect("queue exists").normal.remove(k);
-                    (QueueEntry::from_chunk(chunk, solicited), need)
+                    let entry = QueueEntry::from_chunk(chunk, solicited);
+                    (QueueEntry { first_of_group: first, ..entry }, need)
                 }
                 // `choose` names a control item only at the head.
                 _ => match self.take_head(peer, false) {
@@ -426,8 +447,15 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             if let Some(out_entry) = out {
                 if let Some(ref ch) = out_entry.chunk {
                     self.sends.track_in_flight(peer, ch.group, ch.index, need, env);
+                    if out_entry.first_of_group {
+                        self.pairs.set_first_written((peer, ch.group));
+                    }
+                    if self.config.source_offers == SourceOffers::Publish {
+                        let (g, i) = (ch.group, ch.index);
+                        self.origin_written(g, i, env, catalog);
+                    }
                 }
-                if let Some(final_entry) = self.with_owed(peer, out_entry, catalog) {
+                if let Some(final_entry) = self.with_owed(peer, out_entry) {
                     return DispatchOutcome::Send(final_entry);
                 }
             }
@@ -503,12 +531,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
 
     /// Attaches owed offers for `peer` to `entry` (`protocol.md` §7.2
     /// `with_owed`).
-    pub fn with_owed<C: ObjectCatalog<B>>(
-        &mut self,
-        peer: PeerId,
-        mut entry: QueueEntry<B>,
-        catalog: &C,
-    ) -> Option<QueueEntry<B>> {
+    pub fn with_owed(&mut self, peer: PeerId, mut entry: QueueEntry<B>) -> Option<QueueEntry<B>> {
         // Only as many groups as the entry has room for leave `owed`: the rest stay
         // owed, and the writer, which runs until the queue and `owed` are both
         // empty, takes them next.
@@ -546,7 +569,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 }
             }
             if !b.is_empty() {
-                entry.add_offer(Have::offer(self.type_of(&g, catalog), g, b));
+                entry.add_offer(Have::offer(g, b));
             }
         }
         if entry.is_empty() { None } else { Some(entry) }

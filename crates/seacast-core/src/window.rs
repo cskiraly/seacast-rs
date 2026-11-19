@@ -86,17 +86,34 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if self.expired(&g) {
             return Bitmap::EMPTY;
         }
-        let t = self.type_of(&g, catalog);
+        let t = g.type_id;
         let promise = catalog.params(t).promise;
         let at_bits = env.now().to_bits();
         let mut asked = Bitmap::new();
+        // Our probe of the group, settled while queued, is not written (§4.6).
+        if want.probe && self.groups.get(&g).is_some_and(|r| r.probe_ok.is_some()) {
+            return Bitmap::EMPTY;
+        }
         for idx in want.bits.iter() {
             let a = Ask::new(g, idx);
-            let held = self.held(a) && !self.probe_waits(peer, want, idx);
+            let waits = self.probe_waits(peer, want, idx);
+            let held = self.held(a) && !waits;
             if held || self.gated(a) || self.tied_to_root(peer, a) {
                 continue;
             }
-            if want.track_promise && !self.promises.contains(a, peer) {
+            if waits && !self.groups.get(&g).is_some_and(|r| r.probe_sent) {
+                // Our probe, written now: its promise and the verdict's wait start here.
+                if !self.promises.insert(a, peer, at_bits) {
+                    continue;
+                }
+                let window = catalog.params(t).defer_window;
+                env.schedule_after(window, TimerEvent::PromiseDue { ask: a, peer, at_bits });
+                let rec = self.groups.rec(g);
+                rec.probe_sent = true;
+                let now = env.now();
+                let at = rec.reconsider_at.map(f64::from_bits).unwrap_or(now).max(now + window);
+                self.arm(g, at, env);
+            } else if want.track_promise && !self.promises.contains(a, peer) {
                 // An ask whose promise cannot be recorded is not written: its retry
                 // takes it up.
                 if !self.promises.insert(a, peer, at_bits) {

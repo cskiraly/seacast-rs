@@ -2,7 +2,8 @@ use crate::{
     bitmap::Bitmap,
     collections::{InlineVec, MAX_ENTRY_CONTROL},
     types::{
-        Ask, Bytes32, ChunkId, Colour, Direction, Duty, FamilyId, GroupId, InterestKind, TypeId,
+        Ask, Bytes32, ChunkId, Colour, Direction, Duty, FamilyId, ForkDigest, GroupId,
+        InterestKind, TypeId,
     },
 };
 
@@ -11,6 +12,9 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Join {
     pub object_type: TypeId,
+    /// A link carries the type only where both ends name the same fork
+    /// (`protocol-v2-bindings.md` §1.3).
+    pub fork_digest: ForkDigest,
     pub interest: InterestKind,
     pub custody_count: u64,
     pub duty: Duty,
@@ -42,7 +46,6 @@ pub struct Prune {
 /// (`protocol-v2.md` §2 `[c7, D3]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Have {
-    pub object_type: TypeId,
     pub group: GroupId,
     pub bits: Bitmap,
     /// `true`: `"you may ask me for these"` (an offer);
@@ -57,26 +60,19 @@ pub struct Have {
 
 impl Have {
     #[inline]
-    pub const fn holding(
-        object_type: TypeId,
-        group: GroupId,
-        bits: Bitmap,
-        claim_all: bool,
-        complete: bool,
-    ) -> Self {
-        Self { object_type, group, bits, offer: false, claim_all, complete }
+    pub const fn holding(group: GroupId, bits: Bitmap, claim_all: bool, complete: bool) -> Self {
+        Self { group, bits, offer: false, claim_all, complete }
     }
 
     #[inline]
-    pub const fn offer(object_type: TypeId, group: GroupId, bits: Bitmap) -> Self {
-        Self { object_type, group, bits, offer: true, claim_all: false, complete: false }
+    pub const fn offer(group: GroupId, bits: Bitmap) -> Self {
+        Self { group, bits, offer: true, claim_all: false, complete: false }
     }
 }
 
 /// `Want`: `"send me these"`, per recipient (`protocol-v2.md` §2 `[D2]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Want {
-    pub object_type: TypeId,
     pub group: GroupId,
     pub bits: Bitmap,
     /// Also when the chunks arrive, not only if held now (§4.10, `[D12]`).
@@ -95,9 +91,8 @@ impl Want {
     /// Creates an offer-driven pull ask for a single index (starts a promise
     /// when written).
     #[inline]
-    pub fn pull_ask(object_type: TypeId, ask: Ask) -> Self {
+    pub fn pull_ask(ask: Ask) -> Self {
         Self {
-            object_type,
             group: ask.group,
             bits: Bitmap::singleton(ask.index),
             standing: false,
@@ -109,43 +104,34 @@ impl Want {
 
     /// An ask answered only if held now: a repair's ask of a custodian (§4.6).
     #[inline]
-    pub const fn direct(object_type: TypeId, group: GroupId, bits: Bitmap) -> Self {
-        Self {
-            object_type,
-            group,
-            bits,
-            standing: false,
-            hops: 0,
-            probe: false,
-            track_promise: false,
-        }
+    pub const fn direct(group: GroupId, bits: Bitmap) -> Self {
+        Self { group, bits, standing: false, hops: 0, probe: false, track_promise: false }
     }
 
     /// A standing request: a sampler's (§4.10).
     #[inline]
-    pub const fn standing(object_type: TypeId, group: GroupId, bits: Bitmap) -> Self {
-        Self { standing: true, ..Self::direct(object_type, group, bits) }
+    pub const fn standing(group: GroupId, bits: Bitmap) -> Self {
+        Self { standing: true, ..Self::direct(group, bits) }
     }
 
     /// The probe of a claim (§4.6 `defer_on_claim`).
     #[inline]
-    pub const fn probe(object_type: TypeId, group: GroupId, bits: Bitmap) -> Self {
-        Self { probe: true, ..Self::direct(object_type, group, bits) }
+    pub const fn probe(group: GroupId, bits: Bitmap) -> Self {
+        Self { probe: true, ..Self::direct(group, bits) }
     }
 }
 
 /// `ChunkMsg`: a chunk as the node holds it (`protocol-v2.md` §2). The node
-/// reads its type, group, index and id; its header, context, proof and data are
+/// reads its group, index and id; its header, context, proof and data are
 /// the type's codec's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkMsg<B> {
-    pub type_id: TypeId,
     pub group: GroupId,
     pub index: u32,
     /// The chunk's header, context, proof and data, laid out by its type's
     /// codec.
     pub frame: B,
-    /// Cached 56-byte structured chunk ID (`chunk_id(f)` / `message_id(f)`).
+    /// Cached 59-byte structured chunk ID ([`ChunkId`], `chunk_id(f)`).
     pub cached_id: ChunkId,
     /// What the type's codec keeps of the chunk from its level 1 for its level
     /// 2; zero until the codec sets it. The node does not read it.
@@ -209,7 +195,7 @@ impl<B> Rpc<B> {
 }
 
 /// One control message waiting in a peer's queue.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
     Join(Join),
     Have(Have),
@@ -274,6 +260,10 @@ impl Queued {
 pub struct QueueEntry<B> {
     pub chunk: Option<ChunkMsg<B>>,
     pub solicited: bool,
+    /// The chunk is unsolicited and the first of its group written to the
+    /// peer (`protocol-v2.md` §2, P2): its type may send more with it, as a
+    /// cell its header ([`TypeCodec::wire_size`](crate::TypeCodec)).
+    pub first_of_group: bool,
     pub joins: InlineVec<Join, MAX_ENTRY_CONTROL>,
     pub haves: InlineVec<Have, MAX_ENTRY_CONTROL>,
     pub wants: InlineVec<Want, MAX_ENTRY_CONTROL>,
@@ -288,6 +278,7 @@ impl<B> Default for QueueEntry<B> {
         Self {
             chunk: None,
             solicited: false,
+            first_of_group: false,
             joins: InlineVec::new(),
             haves: InlineVec::new(),
             wants: InlineVec::new(),

@@ -7,17 +7,17 @@
 use std::marker::PhantomData;
 
 #[cfg(feature = "data_only_root")]
-use seacast_core::Bitmap;
-use seacast_core::{
-    Bytes32, ChunkMsg, GroupId, PreallocVec, Shape, TypeCodec, TypeId, ValidationResult,
-};
+use seacast_core::{Bitmap, TypeId};
+use seacast_core::{Bytes32, ChunkMsg, GroupId, PreallocVec, Shape, TypeCodec, ValidationResult};
 
 use crate::{
     buffer::{BufferPool, ChunkBytes},
+    layout::ChunkLayout,
     segment::{
-        DESCRIPTOR_BYTES, SnappyBlockCompressor, check_frame, decode_and_reencode, frame_leaf_hash,
-        group_id, split_frame,
+        DESCRIPTOR_BYTES, SnappyBlockCompressor, check_frame, check_frame_leaf,
+        decode_and_reencode, frame_leaf_hash, group_id, split_frame,
     },
+    wire::chunk_wire_size,
 };
 
 type Chunk<B> = ChunkMsg<B>;
@@ -34,21 +34,38 @@ impl<Pool, B> SegmentedCodec<Pool, B> {
         Self { pool, context_len, _buffer: PhantomData }
     }
 
+    /// Sets a received chunk's id, and its `memo` to its data's leaf digest,
+    /// the proof not checked ([`ChunkLayout::identify`]).
+    pub fn identify(&self, chunk: &mut Chunk<B>)
+    where
+        B: ChunkBytes,
+    {
+        ChunkLayout::Segmented { context_len: self.context_len }.identify(chunk);
+    }
+
     /// The rest of level 1 for a chunk [`TypeCodec::check_proof`] answered
     /// `Pending` for: its Merkle proof. The host runs it wherever it sees
-    /// fit before it calls `on_validated`. The leaf digest it proved is left in
-    /// the chunk's `memo`, for level 2 not to hash the chunk again.
+    /// fit before it calls `on_validated`. The proof is checked from the leaf
+    /// digest in `memo` where [`identify`](Self::identify) left one, and the
+    /// data is not hashed again; otherwise the leaf is computed and left there.
+    /// Level 2 takes it from `memo`.
     pub fn check_proof(&self, chunk: &mut Chunk<B>) -> ValidationResult
     where
         B: ChunkBytes,
     {
-        match frame_leaf_hash(chunk.index, chunk.frame.as_bytes(), self.context_len) {
-            Some(leaf) => {
-                chunk.memo = leaf;
-                ValidationResult::Accept
+        let frame = chunk.frame.as_bytes();
+        let ok = if chunk.memo != Bytes32::default() {
+            check_frame_leaf(chunk.index, frame, self.context_len, &chunk.memo)
+        } else {
+            match frame_leaf_hash(chunk.index, frame, self.context_len) {
+                Some(leaf) => {
+                    chunk.memo = leaf;
+                    true
+                }
+                None => false,
             }
-            None => ValidationResult::Reject,
-        }
+        };
+        if ok { ValidationResult::Accept } else { ValidationResult::Reject }
     }
 }
 
@@ -64,7 +81,7 @@ where
 
     fn check(&self, chunk: &Chunk<B>) -> bool {
         check_frame(
-            chunk.type_id,
+            chunk.group.type_id,
             &chunk.group,
             chunk.index,
             chunk.frame.as_bytes(),
@@ -92,7 +109,6 @@ where
 
     fn decode(
         &mut self,
-        _t: TypeId,
         _group: &GroupId,
         available: &[Chunk<B>],
         _shape: &Shape,
@@ -113,8 +129,7 @@ where
         Bitmap::all_bits(shape.k) | held
     }
 
-    /// The chunk as it is sent: its type, group and index, then its frame.
-    fn wire_size(&self, chunk: &Chunk<B>) -> usize {
-        2 + 32 + 4 + chunk.frame.len()
+    fn wire_size(&self, chunk: &Chunk<B>, _first_of_group: bool) -> usize {
+        chunk_wire_size(chunk)
     }
 }

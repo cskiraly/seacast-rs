@@ -22,7 +22,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         D: DeferredStore<B>,
     {
         for slot in self.slots.iter_mut() {
-            slot.ihave_rpcs = 0;
+            slot.ihave_frames = 0;
             slot.ihave_asked = 0;
             slot.served_now = 0;
         }
@@ -166,7 +166,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             if self.expired(g) {
                 continue;
             }
-            let t = self.type_of(g, catalog);
+            let t = g.type_id;
             if catalog.params(t).announce_extra == AnnounceWidth::Sample {
                 self.announce(peer, *g, *bits, env, catalog);
             }

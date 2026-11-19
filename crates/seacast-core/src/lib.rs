@@ -52,9 +52,9 @@ pub use traits::{
 };
 pub use types::{
     AnnounceWidth, Ask, Bytes32, CapacityConfig, ChunkId, Colour, Direction, Duty, FamilyId,
-    GenerationPeerId, GroupId, GroupState, HaveEntry, InterestKind, LinkFloor, NodeConfig, NodeId,
-    PeerId, PushEntry, RepairVerdict, Shape, Timestamp, TypeId, TypeParams, UplinkClass,
-    ValidationResult,
+    ForkDigest, GenerationPeerId, GroupId, GroupState, HaveEntry, InterestKind, LinkFloor,
+    NodeConfig, NodeId, PeerId, PushEntry, RepairVerdict, Shape, SourceOffers, Timestamp, TypeId,
+    TypeParams, UplinkClass, ValidationResult,
 };
 
 #[cfg(test)]
@@ -170,7 +170,6 @@ mod tests {
         }
         fn decode(
             &mut self,
-            _t: TypeId,
             group: &GroupId,
             available: &[ChunkMsg<FixedChunkBuf>],
             _shape: &Shape,
@@ -182,11 +181,10 @@ mod tests {
             let mut pool = FixedBufferPool;
             for i in 0..self.n {
                 let frame = pool.alloc_from_slice(&[i as u8; 8]);
-                let mut cached_id = [0u8; 56];
-                cached_id[..32].copy_from_slice(group);
-                cached_id[32..36].copy_from_slice(&i.to_le_bytes());
+                let mut cached_id = [0u8; 59];
+                cached_id[1..33].copy_from_slice(&group.key);
+                cached_id[35..39].copy_from_slice(&i.to_le_bytes());
                 let _ = out_rebuilt.push(ChunkMsg {
-                    type_id: TYPE,
                     group: *group,
                     index: i,
                     frame,
@@ -201,28 +199,25 @@ mod tests {
     impl Domain for MockCatalog {
         fn authenticate(
             &mut self,
-            _t: TypeId,
             _group: &GroupId,
             _header_id: &Bytes32,
             _context: &[u8],
         ) -> ValidationResult {
             ValidationResult::Accept
         }
-        fn authenticable(&self, _t: TypeId, _group: &GroupId) -> bool {
+        fn authenticable(&self, _group: &GroupId) -> bool {
             true
         }
     }
 
     impl Policy for MockCatalog {
-        fn type_of_group(&self, _group: &GroupId) -> TypeId {
-            TYPE
-        }
         fn params(&self, _t: TypeId) -> &TypeParams {
             &self.params
         }
         fn our_join(&self, t: TypeId) -> Join {
             Join {
                 object_type: t,
+                fork_digest: [0; 4],
                 interest: InterestKind::All,
                 custody_count: 1,
                 duty: Duty::Forward,
@@ -250,7 +245,7 @@ mod tests {
         let mut catalog = MockCatalog { params: TypeParams::default(), n: 4, k: 2 };
         let mut rng = SplitMix64::new(42);
         let mut defer_store = BoundedDeferredStore::default();
-        let group = [7u8; 32];
+        let group = GroupId::new(TYPE, [7u8; 32], 0);
 
         // Start tracking heap allocations after initialization
         ALLOC_COUNT.store(0, Ordering::SeqCst);
@@ -268,22 +263,20 @@ mod tests {
         // 3. Receive chunks, trigger threshold K completion, decode & rebuild N chunks,
         //    forward/announce
         let mut pool_tmp = FixedBufferPool;
-        let mut id0 = [0u8; 56];
-        id0[..32].copy_from_slice(&group);
-        id0[32..36].copy_from_slice(&0u32.to_le_bytes());
+        let mut id0 = [0u8; 59];
+        id0[1..33].copy_from_slice(&group.key);
+        id0[35..39].copy_from_slice(&0u32.to_le_bytes());
         let c0 = ChunkMsg {
-            type_id: TYPE,
             group,
             index: 0,
             frame: pool_tmp.alloc_from_slice(&[10, 20, 30, 40]),
             cached_id: id0,
             memo: [0; 32],
         };
-        let mut id1 = [0u8; 56];
-        id1[..32].copy_from_slice(&group);
-        id1[32..36].copy_from_slice(&1u32.to_le_bytes());
+        let mut id1 = [0u8; 59];
+        id1[1..33].copy_from_slice(&group.key);
+        id1[35..39].copy_from_slice(&1u32.to_le_bytes());
         let c1 = ChunkMsg {
-            type_id: TYPE,
             group,
             index: 1,
             frame: pool_tmp.alloc_from_slice(&[50, 60, 70, 80]),
@@ -295,6 +288,7 @@ mod tests {
         // (`protocol-v2.md` §2).
         let peer_join = Join {
             object_type: TYPE,
+            fork_digest: [0; 4],
             interest: InterestKind::All,
             custody_count: 1,
             duty: Duty::Forward,
@@ -303,19 +297,19 @@ mod tests {
         let mut rpc0 = Rpc::default();
         let _ = rpc0.joins.push(peer_join);
         rpc0.chunk = Some(c0);
-        node.on_rpc(1, rpc0, &mut env, &mut catalog, &mut rng, &mut defer_store);
+        node.on_frame(1, rpc0, &mut env, &mut catalog, &mut rng, &mut defer_store);
 
         let rpc1 = Rpc { chunk: Some(c1), ..Default::default() };
-        node.on_rpc(1, rpc1, &mut env, &mut catalog, &mut rng, &mut defer_store);
+        node.on_frame(1, rpc1, &mut env, &mut catalog, &mut rng, &mut defer_store);
 
         node.decode_group(group, &mut env, &mut catalog, &mut rng);
 
         // 4. Receive Have and Want messages and drain writer queue
         let mut rpc_have = Rpc::default();
         let _ = rpc_have.joins.push(peer_join);
-        let _ = rpc_have.haves.push(Have::holding(TYPE, group, Bitmap::singleton(0), false, false));
-        let _ = rpc_have.wants.push(Want::pull_ask(TYPE, Ask { group, index: 2 }));
-        node.on_rpc(2, rpc_have, &mut env, &mut catalog, &mut rng, &mut defer_store);
+        let _ = rpc_have.haves.push(Have::holding(group, Bitmap::singleton(0), false, false));
+        let _ = rpc_have.wants.push(Want::pull_ask(Ask { group, index: 2 }));
+        node.on_frame(2, rpc_have, &mut env, &mut catalog, &mut rng, &mut defer_store);
 
         while let DispatchOutcome::Send(_) = node.next_to_send(2, &mut env, &catalog) {}
 

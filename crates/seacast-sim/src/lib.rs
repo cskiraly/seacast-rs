@@ -7,17 +7,19 @@ use std::{
 
 use seacast_codec::sha256;
 use seacast_core::{
-    AnnounceWidth, Bitmap, BoundedDeferredStore, ChunkBuffer, ChunkId, ChunkMsg, DispatchOutcome,
-    Domain, Duty, FamilyId, GroupBits, GroupId, InlineVec, InterestKind, Join, MAX_CHUNKS,
-    MAX_JOINED_TYPES, MAX_PROJECTED, NodeConfig, NodeId, PeerId, PenaltyReason, Policy,
-    PreallocVec, QueueEntry, RngSource, RuntimeEnv, SeacastNode, Shape, SplitMix64, TimerEvent,
-    Timestamp, TypeCodec, TypeId, TypeParams, ValidationResult,
+    AnnounceWidth, Bitmap, BoundedDeferredStore, Bytes32, ChunkBuffer, ChunkId, ChunkMsg,
+    DispatchOutcome, Domain, Duty, FamilyId, ForkDigest, GroupBits, GroupId, InlineVec,
+    InterestKind, Join, MAX_CHUNKS, MAX_JOINED_TYPES, MAX_PROJECTED, NodeConfig, NodeId, PeerId,
+    PenaltyReason, Policy, PreallocVec, QueueEntry, RngSource, RuntimeEnv, SeacastNode, Shape,
+    SplitMix64, TimerEvent, Timestamp, TypeCodec, TypeId, TypeParams, ValidationResult,
 };
 
 /// The object types of this domain.
 pub const PAYLOAD: TypeId = TypeId(0);
 pub const COLUMN: TypeId = TypeId(1);
 pub const ROW: TypeId = TypeId(2);
+/// The fork every node of a run is at.
+pub const FORK_DIGEST: ForkDigest = [0; 4];
 
 type BlockRoot = [u8; 32];
 
@@ -125,7 +127,6 @@ pub struct SimCatalog {
     pub reconstructors: BTreeSet<PeerId>,
     pub samplers: BTreeSet<PeerId>,
     pub liars: BTreeSet<PeerId>,
-    pub group_types: BTreeMap<GroupId, TypeId>,
     pub group_headers: BTreeMap<GroupId, SimHeader>,
     pub group_col: BTreeMap<GroupId, u32>,
     pub group_row_subnet: BTreeMap<GroupId, u32>,
@@ -160,7 +161,6 @@ impl TypeCodec<SimBlob> for SimCatalog {
 
     fn decode(
         &mut self,
-        _t: TypeId,
         group: &GroupId,
         available: &[ChunkMsg<SimBlob>],
         shape: &Shape,
@@ -178,12 +178,8 @@ impl TypeCodec<SimBlob> for SimCatalog {
         Some(SimBlob { byte_len: (shape.k as usize) * segment_size, tag: 1 })
     }
 
-    fn project(
-        &self,
-        t: TypeId,
-        chunk: &ChunkMsg<SimBlob>,
-    ) -> InlineVec<(GroupId, u32), MAX_PROJECTED> {
-        if (t == COLUMN || t == ROW) && self.keeps_rows {
+    fn project(&self, chunk: &ChunkMsg<SimBlob>) -> InlineVec<(GroupId, u32), MAX_PROJECTED> {
+        if (chunk.group.type_id == COLUMN || chunk.group.type_id == ROW) && self.keeps_rows {
             if let Some(&col) = self.group_col.get(&chunk.group) {
                 if let Some(h) = self.group_headers.get(&chunk.group) {
                     if let Some(&g_row) = self.row_groups_by_block.get(&(h.block, chunk.index)) {
@@ -205,25 +201,20 @@ impl TypeCodec<SimBlob> for SimCatalog {
         InlineVec::singleton((chunk.group, chunk.index))
     }
 
-    fn cross(
-        &self,
-        t: TypeId,
-        group: &GroupId,
-        index: u32,
-    ) -> InlineVec<(GroupId, u32), MAX_PROJECTED> {
+    fn cross(&self, group: &GroupId, index: u32) -> InlineVec<(GroupId, u32), MAX_PROJECTED> {
         if !self.keeps_rows {
             return InlineVec::new();
         }
         let Some(h) = self.group_headers.get(group) else {
             return InlineVec::new();
         };
-        if t == COLUMN {
+        if group.type_id == COLUMN {
             if let Some(&col) = self.group_col.get(group) {
                 if let Some(&g_row) = self.row_groups_by_block.get(&(h.block, index)) {
                     return InlineVec::singleton((g_row, col));
                 }
             }
-        } else if t == ROW {
+        } else if group.type_id == ROW {
             if let Some(row_idx) = h.row {
                 if let Some(&g_col) = self.col_groups_by_block.get(&(h.block, index)) {
                     return InlineVec::singleton((g_col, row_idx));
@@ -233,19 +224,18 @@ impl TypeCodec<SimBlob> for SimCatalog {
         InlineVec::new()
     }
 
-    fn wire_size(&self, chunk: &ChunkMsg<SimBlob>) -> usize {
+    fn wire_size(&self, chunk: &ChunkMsg<SimBlob>, _first_of_group: bool) -> usize {
         chunk.frame.len() + 180
     }
 }
 
 impl Domain for SimCatalog {
-    fn sample_scope(&self, _t: TypeId, group: &GroupId) -> GroupId {
-        self.group_headers.get(group).map_or(*group, |h| h.block)
+    fn sample_scope(&self, group: &GroupId) -> GroupId {
+        self.group_headers.get(group).map_or(*group, |h| GroupId::new(PAYLOAD, h.block, 0))
     }
 
     fn authenticate(
         &mut self,
-        t: TypeId,
         group: &GroupId,
         _header_id: &[u8; 32],
         _context: &[u8],
@@ -254,11 +244,15 @@ impl Domain for SimCatalog {
             .group_headers
             .get(group)
             .is_some_and(|h| self.installed_blocks.contains_key(&h.block));
-        if t == PAYLOAD && !installed { ValidationResult::Defer } else { ValidationResult::Accept }
+        if group.type_id == PAYLOAD && !installed {
+            ValidationResult::Defer
+        } else {
+            ValidationResult::Accept
+        }
     }
 
-    fn authenticable(&self, t: TypeId, group: &GroupId) -> bool {
-        if t == PAYLOAD {
+    fn authenticable(&self, group: &GroupId) -> bool {
+        if group.type_id == PAYLOAD {
             self.installed_blocks.values().any(|&bg| bg == Some(*group))
         } else {
             true
@@ -271,10 +265,6 @@ impl Domain for SimCatalog {
 }
 
 impl Policy for SimCatalog {
-    fn type_of_group(&self, group: &GroupId) -> TypeId {
-        self.group_types.get(group).copied().unwrap_or(PAYLOAD)
-    }
-
     fn params(&self, t: TypeId) -> &TypeParams {
         match t {
             PAYLOAD => &self.payload_params,
@@ -284,25 +274,24 @@ impl Policy for SimCatalog {
         }
     }
 
-    fn family(&self, t: TypeId, group: &GroupId) -> FamilyId {
-        match t {
+    fn family(&self, group: &GroupId) -> FamilyId {
+        match group.type_id {
             PAYLOAD => 0,
-            COLUMN => self.group_col.get(group).copied().unwrap_or(0),
-            ROW => self.group_row_subnet.get(group).copied().unwrap_or(0),
+            COLUMN => self.group_col.get(group).copied().unwrap_or(0) as FamilyId,
+            ROW => self.group_row_subnet.get(group).copied().unwrap_or(0) as FamilyId,
             _ => 0,
         }
     }
 
     fn derived_interest(
         &self,
-        t: TypeId,
         group: &GroupId,
         _shape: Option<&Shape>,
         peer: PeerId,
         _node_id: &NodeId,
         _join: &Join,
     ) -> Bitmap {
-        match t {
+        match group.type_id {
             PAYLOAD => Bitmap::EVERY_INDEX,
             COLUMN => {
                 let col = self.group_col.get(group).copied().unwrap_or(u32::MAX);
@@ -325,8 +314,8 @@ impl Policy for SimCatalog {
         }
     }
 
-    fn own_interest(&self, t: TypeId, group: &GroupId) -> Bitmap {
-        match t {
+    fn own_interest(&self, group: &GroupId) -> Bitmap {
+        match group.type_id {
             PAYLOAD => Bitmap::EVERY_INDEX,
             COLUMN => {
                 if self.samplers.contains(&self.node_id) {
@@ -358,6 +347,7 @@ impl Policy for SimCatalog {
         match t {
             PAYLOAD => Join {
                 object_type: PAYLOAD,
+                fork_digest: FORK_DIGEST,
                 interest: InterestKind::All,
                 custody_count: 0,
                 duty: Duty::Forward,
@@ -367,6 +357,7 @@ impl Policy for SimCatalog {
                 if self.samplers.contains(&self.node_id) {
                     Join {
                         object_type: COLUMN,
+                        fork_digest: FORK_DIGEST,
                         interest: InterestKind::Declared,
                         custody_count: 0,
                         duty: Duty::None,
@@ -377,6 +368,7 @@ impl Policy for SimCatalog {
                         self.custody_map.get(&self.node_id).map(|s| s.len() as u64).unwrap_or(0);
                     Join {
                         object_type: COLUMN,
+                        fork_digest: FORK_DIGEST,
                         interest: InterestKind::Derived,
                         custody_count: cgc,
                         duty: Duty::Forward,
@@ -390,6 +382,7 @@ impl Policy for SimCatalog {
                     self.setting != SimSetting::Rows;
                 Join {
                     object_type: ROW,
+                    fork_digest: FORK_DIGEST,
                     interest: if no_row { InterestKind::Declared } else { InterestKind::Derived },
                     custody_count: 0,
                     duty: if no_row { Duty::None } else { Duty::Forward },
@@ -423,9 +416,9 @@ impl Policy for SimCatalog {
         _join: &Join,
     ) -> bool {
         match t {
-            COLUMN => self.custody_map.get(&peer).is_some_and(|s| s.contains(&family)),
+            COLUMN => self.custody_map.get(&peer).is_some_and(|s| s.contains(&u32::from(family))),
             ROW => {
-                self.row_subnet_map.get(&peer).copied() == Some(family) &&
+                self.row_subnet_map.get(&peer).copied() == Some(u32::from(family)) &&
                     !self.samplers.contains(&peer)
             }
             _ => true,
@@ -439,7 +432,7 @@ impl Policy for SimCatalog {
                 let mut fams = InlineVec::new();
                 if let Some(s) = self.custody_map.get(&self.node_id) {
                     for &c in s {
-                        let _ = fams.push(c);
+                        let _ = fams.push(c as FamilyId);
                     }
                 }
                 fams
@@ -447,7 +440,7 @@ impl Policy for SimCatalog {
             ROW => {
                 let mut fams = InlineVec::new();
                 if let Some(&sub) = self.row_subnet_map.get(&self.node_id) {
-                    let _ = fams.push(sub);
+                    let _ = fams.push(sub as FamilyId);
                 }
                 fams
             }
@@ -459,15 +452,16 @@ impl Policy for SimCatalog {
         match t {
             PAYLOAD => true,
             COLUMN => {
+                let family = u32::from(family);
                 self.custody_map.get(&self.node_id).map(|s| s.contains(&family)).unwrap_or(false)
             }
-            ROW => self.row_subnet_map.get(&self.node_id).copied() == Some(family),
+            ROW => self.row_subnet_map.get(&self.node_id).copied() == Some(u32::from(family)),
             _ => false,
         }
     }
 
-    fn decode_at_k(&self, t: TypeId, group: &GroupId) -> bool {
-        match t {
+    fn decode_at_k(&self, group: &GroupId) -> bool {
+        match group.type_id {
             PAYLOAD => true,
             COLUMN => false,
             ROW => {
@@ -479,8 +473,8 @@ impl Policy for SimCatalog {
         }
     }
 
-    fn decode_later(&mut self, t: TypeId, group: &GroupId, rng: &mut dyn RngSource) -> Option<f64> {
-        if t != ROW {
+    fn decode_later(&mut self, group: &GroupId, rng: &mut dyn RngSource) -> Option<f64> {
+        if group.type_id != ROW {
             return None;
         }
         let own_row = self.row_subnet_map.get(&self.node_id).copied() ==
@@ -500,8 +494,11 @@ impl Policy for SimCatalog {
     }
 
     fn tiebreak(&self, chunk_id: &ChunkId, peer: PeerId) -> u64 {
+        // The group's key, the index and the content: the type and the group's
+        // index add nothing to the order.
         let mut buf = [0u8; 64];
-        buf[0..56].copy_from_slice(chunk_id);
+        buf[0..32].copy_from_slice(&chunk_id[1..33]);
+        buf[32..56].copy_from_slice(&chunk_id[35..59]);
         buf[56..64].copy_from_slice(&peer.to_le_bytes());
         let h = sha256(&buf);
         u64::from_le_bytes(h[0..8].try_into().unwrap())
@@ -510,6 +507,18 @@ impl Policy for SimCatalog {
     fn node_id(&self, peer: PeerId) -> NodeId {
         sha256(&peer.to_le_bytes())
     }
+}
+
+/// A chunk id of the binding's layout ([`ChunkId`]) with `content` in place of
+/// the digest of a frame: a blob has no bytes.
+fn sim_chunk_id(group: &GroupId, index: u32, content: &Bytes32) -> ChunkId {
+    let mut id = [0u8; 59];
+    id[0] = group.type_id.0;
+    id[1..33].copy_from_slice(&group.key);
+    id[33..35].copy_from_slice(&group.index.to_le_bytes());
+    id[35..39].copy_from_slice(&index.to_le_bytes());
+    id[39..59].copy_from_slice(&content[..20]);
+    id
 }
 
 /// Scheduled discrete event in the simulator.
@@ -711,7 +720,6 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
 
     // 2. Build canonical groups & chunks
     let block_root: BlockRoot = sha256(b"sim-block-root-1");
-    let mut group_types = BTreeMap::new();
     let mut group_headers = BTreeMap::new();
     let mut group_col = BTreeMap::new();
     let mut group_row_subnet = BTreeMap::new();
@@ -723,7 +731,7 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
 
     match cfg.setting {
         SimSetting::Tier4 | SimSetting::VariantC => {
-            let g = sha256(b"payload-group-1");
+            let g = GroupId::new(PAYLOAD, sha256(b"payload-group-1"), 0);
             let hdr = SimHeader {
                 block: block_root,
                 k: cfg.k_chunks,
@@ -732,25 +740,19 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                 column: None,
                 row: None,
             };
-            group_types.insert(g, PAYLOAD);
             group_headers.insert(g, hdr.clone());
             installed_blocks.insert(block_root, Some(g));
             let mut g_chunks = BTreeMap::new();
             for i in 0..cfg.n_chunks {
                 let mut id_seed = Vec::new();
-                id_seed.extend_from_slice(&g);
+                id_seed.extend_from_slice(&g.key);
                 id_seed.extend_from_slice(&i.to_le_bytes());
                 let digest = sha256(&id_seed);
-                let mut cid = [0u8; 56];
-                cid[0..32].copy_from_slice(&g);
-                cid[32..36].copy_from_slice(&i.to_le_bytes());
-                cid[36..56].copy_from_slice(&digest[0..20]);
                 g_chunks.insert(i, ChunkMsg {
-                    type_id: group_types[&g],
                     group: g,
                     index: i,
                     frame: SimBlob { byte_len: cfg.chunk_size, tag: (i as u64) + 1 },
-                    cached_id: cid,
+                    cached_id: sim_chunk_id(&g, i, &digest),
                     memo: [0; 32],
                 });
             }
@@ -762,7 +764,7 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
             for col in 0..cfg.num_columns {
                 let mut seed_bytes = b"col-group-".to_vec();
                 seed_bytes.extend_from_slice(&col.to_le_bytes());
-                let g = sha256(&seed_bytes);
+                let g = GroupId::new(COLUMN, sha256(&seed_bytes), 0);
                 let hdr = SimHeader {
                     block: block_root,
                     k: cfg.num_rows,
@@ -771,21 +773,16 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                     column: Some(col),
                     row: None,
                 };
-                group_types.insert(g, COLUMN);
                 group_headers.insert(g, hdr.clone());
                 group_col.insert(g, col);
                 col_groups_by_block.insert((block_root, col), g);
                 let mut g_chunks = BTreeMap::new();
                 for row in 0..cfg.num_rows {
-                    let mut cid = [0u8; 56];
-                    cid[0..32].copy_from_slice(&g);
-                    cid[32..36].copy_from_slice(&row.to_le_bytes());
                     g_chunks.insert(row, ChunkMsg {
-                        type_id: group_types[&g],
                         group: g,
                         index: row,
                         frame: SimBlob { byte_len: 2096, tag: ((col as u64) << 16) | (row as u64) },
-                        cached_id: cid,
+                        cached_id: sim_chunk_id(&g, row, &[0; 32]),
                         memo: [0; 32],
                     });
                 }
@@ -800,7 +797,7 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
             for row in 0..cfg.num_rows {
                 let mut seed_bytes = b"row-group-".to_vec();
                 seed_bytes.extend_from_slice(&row.to_le_bytes());
-                let g_row = sha256(&seed_bytes);
+                let g_row = GroupId::new(ROW, sha256(&seed_bytes), 0);
                 let hdr = SimHeader {
                     block: block_root,
                     k: cfg.num_columns / 2,
@@ -809,7 +806,6 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                     column: None,
                     row: Some(row),
                 };
-                group_types.insert(g_row, ROW);
                 group_headers.insert(g_row, hdr);
                 group_row_subnet.insert(g_row, row % cfg.row_subnets.max(1));
                 row_groups_by_block.insert((block_root, row), g_row);
@@ -871,7 +867,6 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
             reconstructors: reconstructors.clone(),
             samplers: samplers.clone(),
             liars: liars.clone(),
-            group_types: group_types.clone(),
             group_headers: group_headers.clone(),
             group_col: group_col.clone(),
             group_row_subnet: group_row_subnet.clone(),
@@ -934,8 +929,18 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                 for &u in &custodians {
                     for &v in &custodians {
                         if u != v {
-                            nodes.get_mut(&u).unwrap().push_out.insert((v, COLUMN, col, 0));
-                            nodes.get_mut(&u).unwrap().push_in.insert((v, COLUMN, col, 0));
+                            nodes.get_mut(&u).unwrap().push_out.insert((
+                                v,
+                                COLUMN,
+                                col as FamilyId,
+                                0,
+                            ));
+                            nodes.get_mut(&u).unwrap().push_in.insert((
+                                v,
+                                COLUMN,
+                                col as FamilyId,
+                                0,
+                            ));
                         }
                     }
                 }
@@ -948,8 +953,18 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                     for &u in &members {
                         for &v in &members {
                             if u != v {
-                                nodes.get_mut(&u).unwrap().push_out.insert((v, ROW, sub, 0));
-                                nodes.get_mut(&u).unwrap().push_in.insert((v, ROW, sub, 0));
+                                nodes.get_mut(&u).unwrap().push_out.insert((
+                                    v,
+                                    ROW,
+                                    sub as FamilyId,
+                                    0,
+                                ));
+                                nodes.get_mut(&u).unwrap().push_in.insert((
+                                    v,
+                                    ROW,
+                                    sub as FamilyId,
+                                    0,
+                                ));
                             }
                         }
                     }
@@ -1005,7 +1020,7 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                 if !cat.keeps_rows {
                     continue;
                 }
-                let want = cat.own_interest(ROW, &g_row);
+                let want = cat.own_interest(&g_row);
                 if !want.is_empty() {
                     let node = nodes.get_mut(&nid).unwrap();
                     if node.groups.open(g_row, ROW) {
@@ -1094,7 +1109,7 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                             // (`toy/node.py` `--fault claim`).
                             if liars.contains(&nid) {
                                 for h in entry.haves.as_mut_slice() {
-                                    if !h.offer && group_types.get(&h.group) == Some(&ROW) {
+                                    if !h.offer && h.group.type_id == ROW {
                                         h.bits = Bitmap::all_bits(cfg.num_columns);
                                         h.claim_all = true;
                                         h.complete = true;
@@ -1114,7 +1129,6 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                                 let idx = ch.index;
                                 let rcv_cat = &catalogs[&peer];
                                 let rcv_node = &nodes[&peer];
-                                let rcv_t = rcv_cat.type_of_group(&g);
                                 let wants_primary = if samplers.contains(&peer) {
                                     declared_samples
                                         .get(&(peer, g))
@@ -1124,18 +1138,16 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                                     rcv_node
                                         .groups
                                         .bits(&g, GroupBits::Interest)
-                                        .unwrap_or_else(|| rcv_cat.own_interest(rcv_t, &g))
+                                        .unwrap_or_else(|| rcv_cat.own_interest(&g))
                                         .has(idx)
                                 };
-                                let wants_cross =
-                                    rcv_cat.project(rcv_t, ch).iter().any(|&(g2, i2)| {
-                                        let t2 = rcv_cat.type_of_group(&g2);
-                                        rcv_node
-                                            .groups
-                                            .bits(&g2, GroupBits::Interest)
-                                            .unwrap_or_else(|| rcv_cat.own_interest(t2, &g2))
-                                            .has(i2)
-                                    });
+                                let wants_cross = rcv_cat.project(ch).iter().any(|&(g2, i2)| {
+                                    rcv_node
+                                        .groups
+                                        .bits(&g2, GroupBits::Interest)
+                                        .unwrap_or_else(|| rcv_cat.own_interest(&g2))
+                                        .has(i2)
+                                });
                                 // I3 binds pushes. An answer was asked for: a forwarder's, to
                                 // its WANT for a routed request, is outside its interest (§4.5).
                                 if !entry.solicited && !wants_primary && !wants_cross {
@@ -1182,7 +1194,7 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                 let cat = catalogs.get_mut(&nid).unwrap();
                 let rng = rngs.get_mut(&nid).unwrap();
                 let def_store = deferred_stores.get_mut(&nid).unwrap();
-                node.on_rpc(from, rpc, &mut env, cat, rng, def_store);
+                node.on_frame(from, rpc, &mut env, cat, rng, def_store);
 
                 // Record completion timestamps when `stop_pull[g]` becomes true
                 for (g, rec) in node.groups.iter() {
@@ -1242,7 +1254,7 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
         let node = &nodes[&nid];
         let cat = &catalogs[&nid];
         for &g in group_headers.keys() {
-            let t = group_types[&g];
+            let t = g.type_id;
             if t == ROW && cfg.setting != SimSetting::Rows {
                 continue;
             }
@@ -1253,7 +1265,7 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                 // columns
                 continue;
             } else {
-                cat.own_interest(t, &g)
+                cat.own_interest(&g)
             };
             if want.is_empty() {
                 continue;

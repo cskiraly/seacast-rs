@@ -75,8 +75,21 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         };
         let ours = rec.deferred == Some(true) && rec.probe == Some(index);
         if ours && rec.probed == Some(sender) && rec.probe_ok.is_none() {
-            rec.probe_ok = Some(true);
+            self.settle_probe(group, Some(true));
             self.promises.remove(Ask::new(group, index), sender);
+        }
+    }
+
+    /// The probe's verdict, once, or none. Settled, the probe's ask is gated
+    /// again: the probed cell is pulled past stop-pull no more
+    /// (`protocol-v2.md` §4.6 `settle_probe`).
+    pub(crate) fn settle_probe(&mut self, group: GroupId, verdict: Option<bool>) {
+        let Some(rec) = self.groups.get_mut(&group) else {
+            return;
+        };
+        rec.probe_ok = Some(verdict);
+        if let Some(i) = rec.probe {
+            self.probe_asks.remove(&Ask::new(group, i));
         }
     }
 
@@ -84,7 +97,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     /// (`probe_promise`).
     pub(crate) fn probe_promise(&self, group: GroupId, index: u32) -> Option<(PeerId, u64)> {
         let rec = self.groups.get(&group)?;
-        if rec.deferred != Some(true) || rec.probe != Some(index) {
+        // Settled, a promise under its key is a plain ask's, which any copy closes.
+        if rec.deferred != Some(true) || rec.probe != Some(index) || rec.probe_ok.is_some() {
             return None;
         }
         let claimant = rec.probed?;
@@ -132,13 +146,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let Some(h) = self.groups.get(group).and_then(|r| r.hdr.as_ref()) else {
             return known;
         };
-        let t = self.type_of(group, catalog);
         let n = h.n;
         for i in 0..n {
             if known.has(i) {
                 continue;
             }
-            for (g2, i2) in catalog.cross(t, group, i) {
+            for (g2, i2) in catalog.cross(group, i) {
                 let scope2 = self.suppression_scope(&g2, catalog);
                 if self
                     .peers_of(scope2)
@@ -162,7 +175,6 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let Some(h) = self.groups.get(group).and_then(|r| r.hdr.as_ref()) else {
             return false;
         };
-        let t = self.type_of(group, catalog);
         let n = h.n;
         let recv = self.groups.bits(group, GroupBits::Received).unwrap_or(Bitmap::EMPTY);
         let reb = self.groups.bits(group, GroupBits::Rebuilt).unwrap_or(Bitmap::EMPTY);
@@ -170,12 +182,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             if recv.has(i) || reb.has(i) {
                 continue;
             }
-            for (g2, i2) in catalog.cross(t, group, i) {
-                let t2 = self.type_of(&g2, catalog);
+            for (g2, i2) in catalog.cross(group, i) {
                 let interest2 = self
                     .groups
                     .bits(&g2, GroupBits::Interest)
-                    .unwrap_or_else(|| catalog.own_interest(t2, &g2));
+                    .unwrap_or_else(|| catalog.own_interest(&g2));
                 if interest2.has(i2) {
                     return true;
                 }
@@ -198,7 +209,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
         R: RngSource,
     {
-        let t = self.type_of(&group, catalog);
+        let t = group.type_id;
         let Some(ref steps_ref) = catalog.params(t).repair_sample else {
             return RepairVerdict::Repaired;
         };
@@ -293,15 +304,14 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
         R: RngSource,
     {
-        let t = self.type_of(&group, catalog);
-        let cross = catalog.cross(t, &group, index);
+        let cross = catalog.cross(&group, index);
         let Some(&(g2, i2)) = cross.first() else {
             return false;
         };
         if self.expired(&g2) {
             return false;
         }
-        let t2 = self.type_of(&g2, catalog);
+        let t2 = g2.type_id;
         let Some(q) = self.choose_one(self.links(t2), rng, |q| {
             let claimed = self.claims.contains(&group, q);
             let already = self.rsample_asked.contains(&(group, index, q));
@@ -310,7 +320,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return false;
         };
         self.rsample_asked.insert((group, index, q));
-        let want = Want::direct(self.type_of(&g2, catalog), g2, Bitmap::singleton(i2));
+        let want = Want::direct(g2, Bitmap::singleton(i2));
         self.enqueue(q, Queued::from_want(want), false, env);
         true
     }
@@ -336,11 +346,13 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         self.groups.get_mut(&group).and_then(|r| r.reconsider_at.take());
         // The probe's verdict, once: only the claimant's own copy passes it,
-        // whichever peer brought the cell (§4.6, R5).
-        if let Some(rec) = self.groups.get_mut(&group) {
+        // whichever peer brought the cell. A probe not written by now gets none, and
+        // our own repair goes on below (§4.6, R5).
+        if let Some(rec) = self.groups.get(&group) {
             if rec.deferred == Some(true) && rec.probe_ok.is_none() {
-                rec.probe_ok = Some(false);
-                if let Some(claimant) = rec.probed {
+                let (sent, claimant) = (rec.probe_sent, rec.probed);
+                self.settle_probe(group, sent.then_some(false));
+                if let Some(claimant) = claimant.filter(|_| sent) {
                     env.penalise(claimant, PenaltyReason::UnansweredClaimProbe);
                 }
             }
@@ -348,7 +360,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let Some(h) = self.groups.get(&group).and_then(|r| r.hdr.as_ref()).cloned() else {
             return;
         };
-        let t = self.type_of(&group, catalog);
+        let t = group.type_id;
         let n = h.n;
         if self.known_in_scope(&group, catalog).popcount() >= n {
             return;
@@ -363,7 +375,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 self.groups.bits(&group, GroupBits::Received).map(|b| b.has(p_idx)).unwrap_or(false)
             })
             .unwrap_or(false);
-        let fam = catalog.family(t, &group);
+        let fam = catalog.family(&group);
 
         if is_deferred &&
             probe_received &&
@@ -409,7 +421,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.for_each(self.suppression_scope(&group, catalog), |node, q| {
             node.send_have(q, group, env, catalog);
         });
-        self.start_decode(group, env, catalog);
+        self.start_decode(group, env);
     }
 
     /// Records a peer's `claim_all` and defers our own pending decode if armed
@@ -455,7 +467,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let Some(h) = self.groups.get(&group).and_then(|r| r.hdr.as_ref()) else {
             return;
         };
-        let t = self.type_of(&group, catalog);
+        let t = group.type_id;
         let n = h.n;
         let mine = self.groups.bits(&group, GroupBits::Mine).unwrap_or(Bitmap::EMPTY);
         // An index we lack, at random: the claimant cannot tell which
@@ -478,23 +490,31 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         let now = env.now();
         let defer_win = catalog.params(t).defer_window;
-        self.groups.rec(group).deferred.replace(true);
-        self.groups.rec(group).probe.replace(probe_idx);
-        self.groups.rec(group).probed.replace(q);
+        let duty_at = self
+            .groups
+            .get(&group)
+            .and_then(|r| r.reconsider_at)
+            .map(f64::from_bits)
+            .unwrap_or(now);
+        let rec = self.groups.rec(group);
+        rec.deferred.replace(true);
+        rec.probe.replace(probe_idx);
+        rec.probed.replace(q);
+        rec.duty_at = Some(duty_at);
 
         self.add_offer(a, q, now);
         self.tried.insert(a, q, now);
         self.probe_asks.insert(a);
 
-        let now_bits = now.to_bits();
-        self.promises.insert(a, q, now_bits);
-        env.schedule_after(defer_win, TimerEvent::PromiseDue {
-            ask: a,
-            peer: q,
-            at_bits: now_bits,
-        });
-        let want = Want::probe(t, group, Bitmap::singleton(probe_idx));
-        self.enqueue(q, Queued::from_want(want), false, env);
+        // Its promise starts at its write (`filter_entry`). Refused by a full queue,
+        // never written: no verdict, and our own repair is reconsidered at the duty's
+        // own time (§4.6).
+        let want = Want::probe(group, Bitmap::singleton(probe_idx));
+        if !self.enqueue(q, Queued::from_want(want), false, env) {
+            self.settle_probe(group, None);
+            self.arm(group, now.max(duty_at), env);
+            return;
+        }
 
         let current_reconsider = self
             .groups
@@ -520,8 +540,6 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
         R: RngSource,
     {
-        let t = self.type_of(&group, catalog);
-
         // Collect unique target groups g2 and their (i2, source_index) pairs on the
         // stack
         let mut group_order: InlineVec<GroupId, MAX_BITMAP_BITS> = InlineVec::new();
@@ -530,7 +548,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
 
         for &i in new_indices {
             if let Some(ch) = self.chunks.get(&(group, i)) {
-                for (g2, i2) in Self::projections(catalog, t, ch) {
+                for (g2, i2) in Self::projections(catalog, ch) {
                     group_order.insert_unique(g2);
                     let _ = projected_items.push((g2, i2, i));
                 }
@@ -538,7 +556,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
 
         for g2 in group_order {
-            if self.expired(&g2) {
+            if self.expired(&g2) || self.dropped(&g2) {
                 continue;
             }
             let mut items: InlineVec<(u32, u32), MAX_BITMAP_BITS> = InlineVec::new();
@@ -551,7 +569,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 continue;
             }
 
-            let t2 = self.type_of(&g2, catalog);
+            let t2 = g2.type_id;
             let Some(h2) = self
                 .groups
                 .get(&g2)
@@ -608,7 +626,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                     }
                     let entry = Queued::Chunk { group, index: src_i, solicited: false };
                     if self.enqueue(q, entry, false, env) {
-                        self.note_push(q, g2, i2, env.now());
+                        self.note_push(q, g2, i2, env.now(), catalog);
                     } else {
                         self.owe(q, g2, Bitmap::singleton(i2), env);
                     }
@@ -671,7 +689,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 }
                 pushed += 1;
                 if self.enqueue(q, entry, false, env) {
-                    self.note_push(q, g2, i2, env.now());
+                    self.note_push(q, g2, i2, env.now(), catalog);
                 } else {
                     self.owe(q, g2, Bitmap::singleton(i2), env);
                 }
@@ -691,13 +709,13 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
     {
         out.clear();
-        if let Some(custom) = catalog.repair_to(t, group) {
+        if let Some(custom) = catalog.repair_to(group) {
             for q in custom {
                 let _ = out.push(q);
             }
             return;
         }
-        let fam = catalog.family(t, group);
+        let fam = catalog.family(group);
         let m = catalog.params(t).m.max(1);
         for &q in self.peers.iter() {
             let in_rel = self.push_out.any_colour(q, t, fam, m);
@@ -754,9 +772,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if held || self.expired(&group) {
             return;
         }
-        let t = self.type_of(&group, catalog);
+        let t = group.type_id;
         let prm = catalog.params(t);
-        let scope = catalog.sample_scope(t, &group);
+        let scope = catalog.sample_scope(&group);
         let missing = Bitmap::singleton(index);
         let in_flight = self.samples_in_flight.get(&scope).copied().unwrap_or(0);
         if !first && in_flight >= prm.sample_outstanding.max(1) {
@@ -817,7 +835,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             *self.samples_in_flight.entry_or_default(scope) += 1;
         }
         // No promise timer: the waits are the WANT's own (§4.5).
-        let want = Want { hops, ..Want::standing(t, group, missing) };
+        let want = Want { hops, ..Want::standing(group, missing) };
         self.enqueue(q, Queued::from_want(want), false, env);
         let wait = if first { prm.sample_retry } else { prm.sample_retry2 };
         let peer = Some(self.slots.stamp(q));
@@ -845,8 +863,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
         R: RngSource,
     {
-        let t = self.type_of(&group, catalog);
-        let scope = catalog.sample_scope(t, &group);
+        let t = group.type_id;
+        let scope = catalog.sample_scope(&group);
         if !first {
             if let Some(n) = self.samples_in_flight.get_mut(&scope) {
                 *n = n.saturating_sub(1);
