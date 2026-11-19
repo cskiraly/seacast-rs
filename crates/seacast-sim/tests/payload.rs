@@ -10,7 +10,7 @@ use seacast_codec::{
     merkle_proof_from_layers, split_frame,
 };
 use seacast_core::{
-    Bitmap, BoundedDeferredStore, Bytes32, ChunkMsg, Duty, GroupId, GroupState, InterestKind, Join,
+    BoundedDeferredStore, Bytes32, ChunkMsg, Duty, GroupId, GroupState, InterestKind, Join,
     NodeConfig, NodeId, PeerId, PenaltyReason, PreallocVec, Rpc, RuntimeEnv, SeacastNode, Shape,
     SplitMix64, TimerEvent, Timestamp, TypeCodec, TypeParams, ValidationResult,
 };
@@ -74,8 +74,8 @@ impl PayloadHost for Blocks {
     }
 }
 
-/// A decode job: group, type, shape, the indices given and their chunks.
-type Job = (GroupId, Shape, Bitmap, Vec<ChunkMsg<Vec<u8>>>);
+/// A decode job: group, shape and the chunks.
+type Job = (GroupId, Shape, Vec<ChunkMsg<Vec<u8>>>);
 
 #[derive(Default)]
 struct Env {
@@ -92,7 +92,7 @@ impl RuntimeEnv<Vec<u8>> for Env {
     }
     fn schedule_after(&mut self, _delay: f64, _event: TimerEvent) {}
     fn start_decode(&mut self, group: GroupId, job: seacast_core::DecodeJob<'_, Vec<u8>>) {
-        self.to_decode.push((group, *job.shape, job.given, job.chunks.to_vec()));
+        self.to_decode.push((group, *job.shape, job.chunks.to_vec()));
     }
     fn deliver(&mut self, group: GroupId, payload: Vec<u8>) {
         self.delivered.push((group, payload));
@@ -198,12 +198,11 @@ impl World {
             verified += 1;
         }
         // Level 2 away from the node: only the result goes back to it.
-        for (group, shape, given, chunks) in std::mem::take(&mut self.env.to_decode) {
+        for (group, shape, chunks) in std::mem::take(&mut self.env.to_decode) {
             let mut rebuilt = PreallocVec::with_capacity(shape.n as usize);
             let object = self.catalog.decode(&group, &chunks, &shape, &mut rebuilt);
             self.node.on_decoded(
                 group,
-                given,
                 object,
                 rebuilt.as_slice(),
                 &mut self.env,
@@ -324,29 +323,10 @@ fn an_inconsistent_group_is_dropped() {
     let mut leaves: Vec<Vec<u8>> =
         good.iter().map(|c| split_frame(&c.frame, CONTEXT_LEN).unwrap().data.to_vec()).collect();
     leaves[k][0] ^= 1;
-    #[cfg(not(feature = "data_only_root"))]
-    let (descriptor, proofs) = {
-        let tree = build_merkle_layers(&leaves);
-        let proofs: Vec<MerkleProof> =
-            (0..leaves.len()).map(|i| merkle_proof_from_layers(&tree, i)).collect();
-        (SegmentDescriptor { root: tree.root(), ..descriptor }, proofs)
-    };
-    // The parity has a tree of its own: the node decodes from it and fails the data
-    // root.
-    #[cfg(feature = "data_only_root")]
-    let (descriptor, proofs) = {
-        let tree = build_merkle_layers(&leaves[k..]);
-        let proofs: Vec<MerkleProof> = (0..leaves.len())
-            .map(|i| {
-                if i < k {
-                    split_frame(&good[i].frame, CONTEXT_LEN).unwrap().proof()
-                } else {
-                    merkle_proof_from_layers(&tree, i - k)
-                }
-            })
-            .collect();
-        (SegmentDescriptor { parity_root: tree.root(), ..descriptor }, proofs)
-    };
+    let tree = build_merkle_layers(&leaves);
+    let proofs: Vec<MerkleProof> =
+        (0..leaves.len()).map(|i| merkle_proof_from_layers(&tree, i)).collect();
+    let descriptor = SegmentDescriptor { root: tree.root(), ..descriptor };
     let chunks = chunks(&descriptor, &leaves, &proofs);
     let group = chunks[0].group;
 
@@ -358,33 +338,4 @@ fn an_inconsistent_group_is_dropped() {
     assert_eq!(world.run(), k);
     assert_eq!(world.node.group_state(&group), Some(GroupState::Invalid));
     assert!(world.env.delivered.is_empty() && world.env.penalties.is_empty());
-}
-
-/// No parity is computed at level 2: the node holds the data chunks and the
-/// parity it received, and its holding claims those and not the group.
-#[cfg(feature = "data_only_root")]
-#[test]
-fn a_node_claims_what_it_can_serve() {
-    let body = body(4 * UNIT + 321);
-    let (descriptor, chunks) = built(&body);
-    let k = descriptor.k() as usize;
-    let group = chunks[0].group;
-    let mut world = World::new();
-    world.install(&descriptor);
-
-    // One data chunk short, made up by one parity chunk.
-    for chunk in &chunks[1..=k] {
-        world.chunk(chunk.clone());
-    }
-    assert_eq!(world.run(), k);
-    assert_eq!(world.env.delivered, vec![(group, body)]);
-    assert!(world.env.penalties.is_empty());
-    for chunk in &chunks[..=k] {
-        let held = world.node.chunks.get(&(group, chunk.index)).expect("held");
-        assert_eq!((&held.frame, held.cached_id), (&chunk.frame, chunk.cached_id));
-    }
-    assert_eq!(world.node.chunks.len(), k + 1);
-    let holding = world.node.holding_of(group, world.node.have_bits(&group), &world.catalog);
-    assert!(holding.bits == seacast_core::Bitmap::all_bits(k as u32 + 1));
-    assert!(holding.complete && !holding.claim_all);
 }

@@ -249,8 +249,6 @@ impl<B> DeferredStore<B> for BoundedDeferredStore {
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeJob<'a, B> {
     pub shape: &'a Shape,
-    /// The indices of `chunks`: passed back to `SeacastNode::on_decoded`.
-    pub given: Bitmap,
     /// The chunks held, in index order.
     pub chunks: &'a [ChunkMsg<B>],
 }
@@ -317,9 +315,8 @@ pub trait TypeCodec<B: ChunkBuffer> {
     fn context<'a>(&self, chunk: &'a ChunkMsg<B>) -> &'a [u8];
 
     /// Level 2 (`T.decode`): decodes `available`, checks consistency, and
-    /// writes to `out_rebuilt` the chunk at every index in
-    /// [`producible`](Self::producible) of `available`'s, lowest first. `None`
-    /// if the group is inconsistent.
+    /// writes to `out_rebuilt` the chunk at every index of the group, lowest
+    /// first. `None` if the group is inconsistent.
     fn decode(
         &mut self,
         group: &GroupId,
@@ -327,14 +324,6 @@ pub trait TypeCodec<B: ChunkBuffer> {
         shape: &Shape,
         out_rebuilt: &mut PreallocVec<ChunkMsg<B>>,
     ) -> Option<B>;
-
-    /// The indices a node that holds the chunks `held` of a group, enough to
-    /// decode it, holds or can produce: what it claims before it decodes
-    /// (`protocol.md` §4.6) and what `decode` gives. Every index where
-    /// `decode` re-encodes.
-    fn producible(&self, _t: TypeId, shape: &Shape, _held: &Bitmap) -> Bitmap {
-        Bitmap::all_bits(shape.n)
-    }
 
     /// Every `(group, index)` pair a single chunk fills (`T.project(f)`, `R4`).
     fn project(&self, chunk: &ChunkMsg<B>) -> InlineVec<(GroupId, u32), MAX_PROJECTED> {

@@ -8,6 +8,3 @@ description = "Discrete-event network simulator and invariant checker for SEACAS
 [dependencies]
 seacast-core = { path = "../seacast-core" }
 seacast-codec = { path = "../seacast-codec" }
-
-[features]
-data_only_root = ["seacast-codec/data_only_root"]
