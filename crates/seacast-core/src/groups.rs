@@ -560,12 +560,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return;
         }
         self.groups.rec(group).stop_pull.replace(true);
-        let t = group.type_id;
         if catalog.decode_at_k(&group) {
             self.groups.rec(group).state.replace(GroupState::Decoding);
             if let Some(h) = self.groups.get(&group).and_then(|r| r.hdr.as_ref()).copied() {
-                let held = self.groups.bits(&group, GroupBits::Mine).unwrap_or(Bitmap::EMPTY);
-                self.groups.put_bits(group, GroupBits::Mine, catalog.producible(t, &h, &held));
+                // Claimed before the decode (`claim_group`, §4.6).
+                self.groups.put_bits(group, GroupBits::Mine, Bitmap::all_bits(h.n));
             }
         } else {
             self.groups.rec(group).state.replace(GroupState::Complete);
@@ -616,9 +615,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     }
 
     /// Collects the chunks held of `group` into `decode_in_scratch`, in index
-    /// order: its shape and their indices. `None` if there is nothing to
-    /// decode.
-    fn decode_inputs(&mut self, group: &GroupId) -> Option<(Shape, Bitmap)> {
+    /// order, and gives its shape. `None` if there is nothing to decode.
+    fn decode_inputs(&mut self, group: &GroupId) -> Option<Shape> {
         if self.expired(group) {
             return None;
         }
@@ -626,15 +624,13 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let h = rec.hdr.as_ref().cloned()?;
         let held = self.groups.bits(group, GroupBits::Mine).unwrap_or(Bitmap::EMPTY);
         self.decode_in_scratch.clear();
-        let mut given = Bitmap::EMPTY;
         // One lookup an index, not a pass over every group's chunks.
         for i in held.iter() {
             if let Some(ch) = self.chunks.get(&(*group, i)) {
                 let _ = self.decode_in_scratch.push(ch.clone());
-                given.set(i);
             }
         }
-        (!self.decode_in_scratch.is_empty()).then_some((h, given))
+        (!self.decode_in_scratch.is_empty()).then_some(h)
     }
 
     /// Hands the host the level 2 of `group` (`RuntimeEnv::start_decode`).
@@ -642,11 +638,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     where
         E: RuntimeEnv<B>,
     {
-        let Some((h, given)) = self.decode_inputs(&group) else {
+        let Some(h) = self.decode_inputs(&group) else {
             return;
         };
         let chunks = self.decode_in_scratch.as_slice();
-        env.start_decode(group, DecodeJob { shape: &h, given, chunks });
+        env.start_decode(group, DecodeJob { shape: &h, chunks });
     }
 
     /// Level 2 and what follows it, on this thread (`protocol-v2.md` §4.6
@@ -663,7 +659,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
         R: RngSource,
     {
-        let Some((h, given)) = self.decode_inputs(&group) else {
+        let Some(h) = self.decode_inputs(&group) else {
             return;
         };
         // Taken for the call: `on_decoded` borrows the node.
@@ -671,20 +667,19 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             std::mem::replace(&mut self.decode_out_scratch, PreallocVec::with_capacity(0));
         out.clear();
         let decoded = catalog.decode(&group, &self.decode_in_scratch, &h, &mut out);
-        self.on_decoded(group, given, decoded, out.as_slice(), env, catalog, rng);
+        self.on_decoded(group, decoded, out.as_slice(), env, catalog, rng);
         self.decode_out_scratch = out;
     }
 
     /// The result of a group's level 2 (`protocol-v2.md` §4.6 `decode_group`,
     /// from the decode on): `decoded` and `rebuilt` are what
-    /// `TypeCodec::decode` gave for the job of `RuntimeEnv::start_decode`,
-    /// `given` is that job's. Stores what was rebuilt, fills the groups it
+    /// `TypeCodec::decode` gave for the job of `RuntimeEnv::start_decode`.
+    /// Stores what was rebuilt, fills the groups it
     /// crosses, pushes repair and delivers; `None` drops the group.
     #[allow(clippy::too_many_arguments)]
     pub fn on_decoded<E, C, R>(
         &mut self,
         group: GroupId,
-        given: Bitmap,
         decoded: Option<B>,
         rebuilt: &[ChunkMsg<B>],
         env: &mut E,
@@ -701,7 +696,6 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let Some(h) = self.groups.get(&group).and_then(|r| r.hdr.as_ref()).cloned() else {
             return;
         };
-        let t = group.type_id;
         let Some(object) = decoded else {
             self.drop_group(group);
             return;
@@ -711,10 +705,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let mut filled_groups: InlineVec<GroupId, MAX_CHUNKS> = InlineVec::new();
         let now = env.now();
 
-        // A chunk's place in the group is its place in `producible`, not its own index:
-        // a chunk of two groups keeps the index of its first (`R4`).
-        let places = catalog.producible(t, &h, &given);
-        for (ch, i) in rebuilt.iter().zip(places.iter()) {
+        // A chunk's place in the group is its place in `rebuilt`, not its own index: a
+        // chunk of two groups keeps the index of its first (`R4`).
+        for (ch, i) in rebuilt.iter().zip(0..h.n) {
             if !recv.has(i) {
                 let _ = new_indices.push(i);
                 self.store_chunk(group, i, ch.clone(), now);

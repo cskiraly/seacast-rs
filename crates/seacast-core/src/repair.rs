@@ -416,8 +416,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
 
         self.groups.rec(group).state.replace(GroupState::Decoding);
-        let held = self.groups.bits(&group, GroupBits::Mine).unwrap_or(Bitmap::EMPTY);
-        self.groups.put_bits(group, GroupBits::Mine, catalog.producible(t, &h, &held));
+        self.groups.put_bits(group, GroupBits::Mine, Bitmap::all_bits(h.n));
         self.for_each(self.suppression_scope(&group, catalog), |node, q| {
             node.send_have(q, group, env, catalog);
         });

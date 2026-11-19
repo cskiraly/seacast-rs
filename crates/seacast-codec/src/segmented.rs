@@ -6,8 +6,6 @@
 
 use std::marker::PhantomData;
 
-#[cfg(feature = "data_only_root")]
-use seacast_core::{Bitmap, TypeId};
 use seacast_core::{Bytes32, ChunkMsg, GroupId, PreallocVec, Shape, TypeCodec, ValidationResult};
 
 use crate::{
@@ -121,12 +119,6 @@ where
             &SnappyBlockCompressor,
             out_rebuilt,
         )
-    }
-
-    /// No parity is computed: the data chunks, and the chunks held.
-    #[cfg(feature = "data_only_root")]
-    fn producible(&self, _t: TypeId, shape: &Shape, held: &Bitmap) -> Bitmap {
-        Bitmap::all_bits(shape.k) | held
     }
 
     fn wire_size(&self, chunk: &Chunk<B>, _first_of_group: bool) -> usize {

@@ -44,17 +44,6 @@ Questions that need Silver's code read (tcache):
 - **A deadline is fixed when first asked**, and a group known only from offers has none until its first chunk.
 - **Memory.** The per (peer, group) table is the largest. Ideas not tried: peer lists held inline, a dense index for pairs. `cargo run --release -p seacast-core --example node_size` prints the heap a node holds after `new`. Most of it is the send queues: three lanes of `max_queue_entries_per_peer` entries and two maps of `max_groups` bitmaps for every peer id, allocated whether the peer is connected or not. An entry is as wide as a control message with its bitmap, also when it stands for a chunk.
 
-## `data_only_root`
-
-An experiment behind a cargo feature of `seacast-codec` (README, "Where this differs"). Open:
-
-- **A node that decodes from bad parity drops the group.** With two roots the data chunks alone still prove the body, so the node could discard the parity it holds, take back its claim and go on pulling data chunks. `drop_group` does none of that: the group goes `Invalid`. leanP2P's Lemma 1 (delivery whatever the parity holds, if the K data chunks are available) therefore holds only for a node that reaches K without a bad parity chunk.
-- **No notice of bad parity.** A node does not detect parity it did not decode from, and nothing tells its peers. leanP2P has a `BAD_PARITY` message.
-- **Parity that no node received is never created.** Repair pushes rebuilt data chunks only. With a release of few chunks the group's parity indices stay empty.
-- **The simulator does not run it.** Its five settings use a catalog of their own with no bytes. Only `crates/seacast-sim/tests/payload.rs` runs the feature through a node, with one peer. The effect on diffusion (fewer holders of parity, no `claim_all`, so no deferral by claim) is not measured.
-- **The codec benchmark's last table** times level 2 under both commitments in one build; the lines above it follow the build's feature.
-- **`just clippy` lints only the feature build** since it passes `--all-features`.
-
 ## Reed-Solomon
 
 - **The FFT parity path covers K a power of two only.** For another K the points `0..2K` are not closed under XOR and the matrix is used. Whether such a K can use a transform without changing the code is open; padding K up changes the parity, so it is a specification change.

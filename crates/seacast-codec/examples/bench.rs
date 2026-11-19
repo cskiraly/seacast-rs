@@ -314,7 +314,7 @@ fn main() {
             let decoded =
                 decode_and_reencode(available, context.len(), &mut pool, &comp, &mut rebuilt);
             assert_eq!(decoded.as_deref(), Some(&body[..]));
-            assert!(cfg!(feature = "data_only_root") || rebuilt.len() == 2 * k);
+            assert_eq!(rebuilt.len(), 2 * k);
             line(
                 &format!("decode_and_reencode, {name}, {case}"),
                 best(5, || {

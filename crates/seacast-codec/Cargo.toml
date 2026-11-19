@@ -7,9 +7,3 @@ description = "Reed-Solomon GF(2^8) erasure coding, Merkle trees, segmentation, 
 
 [dependencies]
 seacast-core = { path = "../seacast-core" }
-
-[features]
-# Two commitments in a coded group's descriptor: a root over the data chunks and
-# one over the parity chunks. Level 2 checks the data root alone and computes no
-# parity. Changes the descriptor's layout, so the group ids and the wire.
-data_only_root = []
