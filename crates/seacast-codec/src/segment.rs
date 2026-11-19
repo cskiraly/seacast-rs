@@ -10,11 +10,12 @@ use crate::{
     buffer::{BufferPool, ChunkBytes},
     merkle::{
         MerkleProof, MerkleTree, build_merkle_layers, leaf_hash, merkle_proof_from_layers,
-        proven_leaf_hash, tree_width,
+        proven_leaf_hash, tree_width, verify_leaf_path,
     },
     reed_solomon::{WIDE_BLOCK, rs_parity_rows, rs_reconstruct_into},
     sha256::{Sha256, sha256_prefixed_many},
     snappy,
+    wire::ChunkHead,
 };
 
 /// Target uncompressed segment size (`UNIT = 16 KiB` in `protocol.md` §1
@@ -230,16 +231,15 @@ pub fn group_id(d: &SegmentDescriptor) -> Bytes32 {
     h.finalize()
 }
 
-/// The id of a group of a segmented type: `sha256(0x03 || uint16_le(type) ||
+/// The group of a segmented type: index 0 under the key `sha256(0x03 || type ||
 /// header_id || context)`, where `header_id` is [`group_id`] of its descriptor
 /// and `context` is what the domain reads.
 pub fn group_key(type_id: TypeId, header_id: &Bytes32, context: &[u8]) -> GroupId {
     let mut h = Sha256::new();
-    h.update(&[0x03]);
-    h.update(&type_id.0.to_le_bytes());
+    h.update(&[0x03, type_id.0]);
     h.update(header_id);
     h.update(context);
-    h.finalize()
+    GroupId::new(type_id, h.finalize(), 0)
 }
 
 /// The digests in the proof of any leaf of a tree of `count` leaves.
@@ -298,17 +298,41 @@ pub fn build_frame(
     frame
 }
 
-/// The 56-byte id of a chunk: its group, its index, and the first 20 bytes of
-/// its `content`, which is the digest of its leaf for a segmented chunk and
-/// its group id for a standalone one. Level 1 binds either to the group, so a
-/// chunk that passed has no other id; one that did not has the id of the
-/// bytes it came with.
+/// The 59-byte id of a chunk (`protocol-v2-bindings.md` §1.3): its object
+/// header ([`ChunkHead`]), then the first 20 bytes of `content`, a digest that
+/// binds every byte of its frame level 1 reads ([`frame_content`],
+/// [`standalone_group`](crate::standalone_group)). Two copies that differ
+/// anywhere have two ids, so a forged copy, rejected, does not mark an honest
+/// one seen.
 pub fn chunk_id(group: &GroupId, index: u32, content: &Bytes32) -> ChunkId {
-    let mut out = [0u8; 56];
-    out[0..32].copy_from_slice(group);
-    out[32..36].copy_from_slice(&index.to_le_bytes());
-    out[36..56].copy_from_slice(&content[..20]);
+    let mut out = [0u8; 59];
+    out[..ChunkHead::BYTES].copy_from_slice(&ChunkHead { group: *group, index }.encode());
+    out[ChunkHead::BYTES..].copy_from_slice(&content[..20]);
     out
+}
+
+/// The content of a segmented chunk's id: `sha256(leaf || head)`, where `leaf`
+/// is the leaf digest of its data and `head` the frame's bytes before the data
+/// (descriptor, context, proof). The data is hashed once, for its leaf.
+pub fn frame_content(leaf: &Bytes32, head: &[u8]) -> Bytes32 {
+    let mut h = Sha256::new();
+    h.update(leaf);
+    h.update(head);
+    h.finalize()
+}
+
+/// A segmented chunk's id content and its data's leaf digest, the proof not
+/// checked: what a reader computes before level 1, which then checks the proof
+/// from the leaf ([`check_frame_leaf`]). A frame that does not split has the
+/// digest of all its bytes, and no leaf.
+pub fn frame_identity(frame: &[u8], context_len: usize) -> (Bytes32, Option<Bytes32>) {
+    match split_frame(frame, context_len) {
+        Some(f) => {
+            let leaf = leaf_hash(f.data);
+            (frame_content(&leaf, &frame[..frame.len() - f.data.len()]), Some(leaf))
+        }
+        None => (crate::sha256::sha256(frame), None),
+    }
 }
 
 /// `Shard`: a chunk's content and stack-allocated [`MerkleProof`] built by the
@@ -419,6 +443,16 @@ pub fn check_frame_proof(index: u32, frame: &[u8], context_len: usize) -> bool {
     frame_leaf_hash(index, frame, context_len).is_some()
 }
 
+/// [`check_frame_proof`] with the data's leaf digest already in hand
+/// ([`frame_identity`]): the data is not hashed again.
+pub fn check_frame_leaf(index: u32, frame: &[u8], context_len: usize, leaf: &Bytes32) -> bool {
+    let Some(f) = split_frame(frame, context_len) else {
+        return false;
+    };
+    let (root, at, count) = f.descriptor.tree_of(index);
+    verify_leaf_path(root, leaf, at, count, &f.proof())
+}
+
 /// [`check_frame_proof`], giving the leaf digest it proved: what
 /// [`complete_in_place`] takes for a chunk that is there.
 pub fn frame_leaf_hash(index: u32, frame: &[u8], context_len: usize) -> Option<Bytes32> {
@@ -444,13 +478,14 @@ where
     shards
         .iter()
         .map(|shard| {
-            let frame = build_frame(descriptor, context, &shard.proof, shard.data.as_bytes());
-            let leaf = leaf_hash(shard.data.as_bytes());
+            let data = shard.data.as_bytes();
+            let frame = build_frame(descriptor, context, &shard.proof, data);
+            let leaf = leaf_hash(data);
+            let content = frame_content(&leaf, &frame[..frame.len() - data.len()]);
             ChunkMsg {
-                type_id,
                 group,
                 index: shard.index,
-                cached_id: chunk_id(&group, shard.index, &leaf),
+                cached_id: chunk_id(&group, shard.index, &content),
                 frame: pool.alloc_from_slice(&frame),
                 memo: leaf,
             }
@@ -582,7 +617,7 @@ where
     if available_chunks.len() < k {
         return None;
     }
-    let (type_id, group) = (first_chunk.type_id, first_chunk.group);
+    let group = first_chunk.group;
     // Every chunk of the group has the same header, context and proof length before
     // its data.
     let skip = DESCRIPTOR_BYTES + context_len + 32 * descriptor.proof_len();
@@ -694,11 +729,11 @@ where
         } else {
             let proof = merkle_proof_from_layers(&tree, i);
             let frame = build_frame(descriptor, context, &proof, leaf);
+            let content = frame_content(&tree.leaf(i), &frame[..frame.len() - leaf.len()]);
             let msg = ChunkMsg {
-                type_id,
                 group,
                 index: idx,
-                cached_id: chunk_id(&group, idx, &tree.leaf(i)),
+                cached_id: chunk_id(&group, idx, &content),
                 frame: pool.alloc_from_slice(&frame),
                 memo: tree.leaf(i),
             };
@@ -725,7 +760,7 @@ mod tests {
 
     fn valid(chunk: &ChunkMsg<Vec<u8>>) -> bool {
         let (index, frame) = (chunk.index, &chunk.frame[..]);
-        check_frame(chunk.type_id, &chunk.group, index, frame, CONTEXT.len()) &&
+        check_frame(chunk.group.type_id, &chunk.group, index, frame, CONTEXT.len()) &&
             check_frame_proof(index, frame, CONTEXT.len())
     }
 
@@ -1015,8 +1050,8 @@ mod tests {
         assert_eq!(decode(&chunks_of(&desc, &shards, 1..k + 1)), None);
     }
 
-    /// A chunk's id is its group, its index and its leaf's digest, which a
-    /// publisher's chunks carry.
+    /// A chunk's id is its object header and a digest over its data's leaf and
+    /// the rest of its frame; its memo is its leaf's digest.
     #[test]
     fn test_chunk_id() {
         let (desc, shards) = build_group::<Vec<u8>, _, _>(
@@ -1030,10 +1065,20 @@ mod tests {
         let leaf = leaf_hash(frame.data);
         assert_eq!(frame_leaf_hash(1, &chunk.frame, CONTEXT.len()), Some(leaf));
         assert_eq!(chunk.memo, leaf);
-        assert_eq!(chunk.cached_id[..32], chunk.group);
-        assert_eq!(chunk.cached_id[32..36], 1u32.to_le_bytes());
-        assert_eq!(chunk.cached_id[36..], leaf[..20]);
-        assert_eq!(chunk.cached_id, chunk_id(&chunk.group, 1, &leaf));
+        let head = ChunkHead { group: chunk.group, index: 1 }.encode();
+        let rest = &chunk.frame[..chunk.frame.len() - frame.data.len()];
+        let mut h = Sha256::new();
+        h.update(&leaf);
+        h.update(rest);
+        assert_eq!(chunk.cached_id[..ChunkHead::BYTES], head);
+        assert_eq!(chunk.cached_id[ChunkHead::BYTES..], h.finalize()[..20]);
+        assert_eq!(
+            frame_identity(&chunk.frame, CONTEXT.len()),
+            (frame_content(&leaf, rest), Some(leaf))
+        );
+        assert!(check_frame_leaf(1, &chunk.frame, CONTEXT.len(), &leaf));
+        assert!(!check_frame_leaf(1, &chunk.frame, CONTEXT.len(), &[1; 32]));
+        assert_eq!(GroupId::of_chunk_id(&chunk.cached_id), chunk.group);
     }
 
     /// A body of 10 MiB is a plain group of 640 chunks: more

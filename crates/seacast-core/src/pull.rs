@@ -1,6 +1,6 @@
 use crate::{
     bitmap::{Bitmap, MAX_BITMAP_BITS},
-    collections::InlineVec,
+    collections::{InlineVec, PreallocVec},
     message::{Have, Queued, Want},
     node::SeacastNode,
     state::{GroupBits, PeerSet},
@@ -38,11 +38,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return InlineVec::new();
         }
 
-        let t = self.type_of(&g, catalog);
+        let t = g.type_id;
         let now = env.now();
         let interest = match self.groups.bits(&g, GroupBits::Interest) {
             Some(interest) => interest,
-            None => catalog.own_interest(t, &g),
+            None => catalog.own_interest(&g),
         };
         // Nothing is kept of an offer that names nothing this node wants: state for a
         // group starts with an offer the admission above counts (`offered`, by
@@ -75,7 +75,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
 
         let mine = self.groups.bits(&g, GroupBits::Mine).unwrap_or(Bitmap::EMPTY);
         let wanted = (h.bits & interest).and_not(&mine);
-        let auth = catalog.authenticable(t, &g);
+        let auth = catalog.authenticable(&g);
 
         let mut candidates: InlineVec<Ask, MAX_BITMAP_BITS> = InlineVec::new();
         for i in wanted.iter() {
@@ -164,7 +164,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             if self.expired(&g) {
                 continue;
             }
-            let t = self.type_of(&g, catalog);
+            let t = g.type_id;
             let declared =
                 self.join_recv(peer, t).is_some_and(|j| j.interest == InterestKind::Declared);
             let serve_limit = catalog.params(t).serve_limit;
@@ -190,7 +190,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 Bitmap::EVERY_INDEX
             } else {
                 let wanted = self.groups.bits(&g, GroupBits::Interest);
-                catalog.own_interest(t, &g) | wanted.unwrap_or(Bitmap::EMPTY)
+                catalog.own_interest(&g) | wanted.unwrap_or(Bitmap::EMPTY)
             };
             let budget = self.config.max_served_per_heartbeat;
             // A routed sample request may come to a node with duty that neither holds
@@ -215,10 +215,13 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 }
                 // The peer's probe of our claim: answered whatever it holds, once
                 // for the group (`protocol-v2.md` §4.6 `probe_of_claim`).
+                // While its probe of another index is kept, it is a plain ask.
                 let claimed = self.groups.bits(&g, GroupBits::Mine);
+                let waiting = self.probe_waiting_of.get(&(peer, g)).copied();
                 let flagged = w.probe &&
                     claimed.is_some_and(|mine| mine.has(idx)) &&
-                    !self.pairs.probe_served(&(peer, g));
+                    !self.pairs.probe_served(&(peer, g)) &&
+                    waiting.is_none_or(|j| j == idx);
                 let claimed_by_peer =
                     self.pairs.peer_has(&(peer, g)).map(|e| e.has(idx)).unwrap_or(false);
                 if claimed_by_peer && !flagged {
@@ -230,7 +233,17 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                     continue;
                 }
                 let Some(&mid) = self.known_id.get(&(g, idx)) else {
-                    if standing {
+                    // Claimed, not stored: we are decoding. The first probe per asker and
+                    // group is kept and answered once, when the chunk is stored, in place
+                    // of a standing WANT of that index from the asker (§4.6).
+                    if flagged && waiting.is_none() {
+                        if !self.probe_waiting_of.is_full() &&
+                            self.probe_waiting.insert((g, idx), peer)
+                        {
+                            self.probe_waiting_of.insert((peer, g), idx);
+                            self.standing.remove(&(g, idx), peer);
+                        }
+                    } else if standing && waiting != Some(idx) {
                         self.standing.insert((g, idx), peer);
                     }
                     if routed {
@@ -328,7 +341,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return;
         };
         *self.forwarded.entry_or_default(id) += 1;
-        let want = Want { hops: left, ..Want::standing(t, group, Bitmap::singleton(index)) };
+        let want = Want { hops: left, ..Want::standing(group, Bitmap::singleton(index)) };
         self.enqueue(q, Queued::from_want(want), false, env);
     }
 
@@ -346,7 +359,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             self.standing.remove_key(&(group, index));
             return;
         }
-        let t = self.type_of(&group, catalog);
+        let t = group.type_id;
         let serve_limit = catalog.params(t).serve_limit;
         let now = env.now();
 
@@ -370,9 +383,50 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 let single = node.single_chunk(&group);
                 node.sends.owe_answer(q, group, index, single);
             }
-            node.note_push(q, group, index, now);
+            node.note_push(q, group, index, now, catalog);
         });
         self.standing.remove_key(&(group, index));
+    }
+
+    /// Answers the probes kept for `(group, index)`, now stored, received or
+    /// rebuilt, as `on_want` answers a probe, with its one exemption
+    /// (`protocol-v2.md` §4.6 `serve_waiting_probe`).
+    pub fn serve_waiting_probe<E, C>(
+        &mut self,
+        group: GroupId,
+        index: u32,
+        env: &mut E,
+        catalog: &C,
+    ) where
+        E: RuntimeEnv<B>,
+        C: ObjectCatalog<B>,
+    {
+        if !self.probe_waiting.contains_key(&(group, index)) {
+            return;
+        }
+        let Some(of) = self.resolve_chunk(&group, index).map(|f| (f.group, f.index)) else {
+            return;
+        };
+        let t = group.type_id;
+        let serve_limit = catalog.params(t).serve_limit;
+        let now = env.now();
+        self.for_each(PeerSet::ProbeWaiting(group, index), |node, q| {
+            node.probe_waiting_of.remove(&(q, group));
+            if node.pairs.probe_served(&(q, group)) || node.pairs.served(&(q, group)) >= serve_limit
+            {
+                return;
+            }
+            node.pairs.add_served((q, group));
+            node.pairs.set_probe_served((q, group));
+            node.probe_answers.insert((q, of.0, of.1));
+            let entry = Queued::Chunk { group, index, solicited: true };
+            if !node.enqueue(q, entry, false, env) {
+                let single = node.single_chunk(&group);
+                node.sends.owe_answer(q, group, index, single);
+            }
+            node.note_push(q, group, index, now, catalog);
+        });
+        self.probe_waiting.remove_key(&(group, index));
     }
 
     /// Returns `true` if `peer` may legitimately be asked for `(group, index)`
@@ -437,8 +491,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         // Nothing is asked for before it can be authenticated (`protocol-v2.md` §4.2):
         // the offers wait in the ledger, and the gate's opening retries them.
-        let t = self.type_of(&ask.group, catalog);
-        if !catalog.authenticable(t, &ask.group) {
+        if !catalog.authenticable(&ask.group) {
             return;
         }
         let now = env.now();
@@ -458,7 +511,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return;
         };
         if self.may_ask(ask, pick, env) {
-            let want = Want::pull_ask(self.type_of(&ask.group, catalog), ask);
+            let want = Want::pull_ask(ask);
             self.enqueue(pick, Queued::from_want(want), false, env);
         }
     }
@@ -628,7 +681,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         self.last_resort_armed.insert(k);
         let factor = 1u64.checked_shl(done_len as u32).unwrap_or(u64::MAX);
-        let t = self.type_of(&ask.group, catalog);
+        let t = ask.group.type_id;
         let delay = catalog.params(t).promise * (factor as f64);
         env.schedule_after(delay, TimerEvent::AskParked(ask));
     }
@@ -674,7 +727,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             env.schedule_after(iwant_win + self.config.retry_slack, TimerEvent::AskParked(ask));
             return;
         };
-        let want = Want::pull_ask(self.type_of(&ask.group, catalog), ask);
+        let want = Want::pull_ask(ask);
         if self.may_ask(ask, pick, env) && self.enqueue(pick, Queued::from_want(want), false, env) {
             if self.parked(pick, &ask.group, now) {
                 self.asked_parked.insert(k, pick);
@@ -700,6 +753,35 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.asked_at.remove(&ask);
         self.asked_parked.remove_key(&(group, index));
         self.pairs.clear_offered(&group, index);
+    }
+
+    /// `group`'s count is known now: the offers, asks, tries and promises of
+    /// an index it has not go (`drop_beyond`, `protocol.md` §4.2, §8.2). Every
+    /// ask is of an offered index, so the offers name them all. A tie past the
+    /// count went at its release, before the group could open.
+    pub(crate) fn drop_beyond(&mut self, group: GroupId, n: u32) {
+        let mut beyond = Bitmap::new();
+        for q in self.pairs.offering(&group) {
+            if let Some(bits) = self.pairs.offered(&(q, group)) {
+                beyond |= &bits;
+            }
+        }
+        let beyond = beyond.and_not(&Bitmap::all_bits(n));
+        if beyond.is_empty() {
+            return;
+        }
+        let mut offering = std::mem::replace(&mut self.peer_scratch, PreallocVec::with_capacity(0));
+        offering.clear();
+        for q in self.pairs.offering(&group) {
+            let _ = offering.push(q);
+        }
+        for &q in offering.iter() {
+            self.drop_offers(group, &beyond, q);
+        }
+        self.peer_scratch = offering;
+        for i in beyond.iter() {
+            self.close_promises(group, i, None);
+        }
     }
 
     pub(crate) fn close_promises_of_group(&mut self, group: &GroupId) {

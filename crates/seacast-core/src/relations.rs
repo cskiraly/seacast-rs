@@ -21,7 +21,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let t = join.object_type;
         // The type id is the peer's: nothing is asked of the catalog, or kept, for a
         // type this node does not run.
-        if !catalog.joined_types().contains(&t) || join.colours != catalog.params(t).m {
+        if !catalog.joined_types().contains(&t) ||
+            join.colours != catalog.params(t).m ||
+            join.fork_digest != catalog.our_join(t).fork_digest
+        {
             return;
         }
         let Some(slot) = self.slots.get_mut(peer) else {
@@ -43,14 +46,13 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     where
         C: ObjectCatalog<B>,
     {
-        let t = self.type_of(group, catalog);
+        let t = group.type_id;
         let Some(j) = self.join_recv(peer, t) else {
             return Bitmap::EMPTY;
         };
         match j.interest {
             InterestKind::All => Bitmap::EVERY_INDEX,
             InterestKind::Derived => catalog.derived_interest(
-                t,
                 group,
                 self.groups.get(group).and_then(|r| r.hdr.as_ref()),
                 peer,
@@ -405,8 +407,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             {
                 continue;
             }
-            let tg = self.type_of(&g, catalog);
-            if tg != t || catalog.family(tg, &g) != fam {
+            let tg = g.type_id;
+            if tg != t || catalog.family(&g) != fam {
                 continue;
             }
             let mut bits = Bitmap::new();
@@ -451,6 +453,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             }
             PeerSet::Standing(group, index) => self.standing.word(&(group, index), w),
             PeerSet::Claims(group) => self.claims.word(&group, w),
+            PeerSet::ProbeWaiting(group, index) => self.probe_waiting.word(&(group, index), w),
             PeerSet::Unrelated(t, fam, m) => {
                 self.linked.word(&t, w) &
                     !(self.push_in.family_word(t, fam, m, w) |
@@ -513,7 +516,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
 
     #[inline]
     pub fn is_linked(&self, peer: PeerId, t: TypeId) -> bool {
-        self.join_recv(peer, t).is_some() && self.join_sent(peer, t).is_some()
+        self.in_set(PeerSet::Links(t), peer)
     }
 
     /// Returns peers in `push_in[*][t][fam]` holding `colour` (`in_pushers(T,

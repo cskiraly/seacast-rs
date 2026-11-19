@@ -24,13 +24,12 @@ Questions that need Silver's code read (tcache):
 
 ## Open design questions in the core
 
-- **A group that is not open has the type its first namer gave it.** HAVE and WANT carry their group's type, and the node keeps it (`Group::named_t`) until a chunk opens the group. It is not authenticated: a peer that names a group with a wrong type first makes the node treat the group with that type's parameters, and ignore other peers' messages for it, until a chunk arrives or the record expires. `Policy::type_of_group` remains for a group the node keeps nothing of, and for the groups a chunk projects onto.
 - **One catalog object implements all three traits.** `PayloadCatalog` therefore forwards every `TypeCodec` method to its `SegmentedCodec`. Passing codec, domain and policy to the node as separate arguments would remove the forwarding and change every entry point's signature.
-- **No catalog composes several types.** `SegmentedCodec` and `StandaloneCodec` are each one type's `TypeCodec`; a host with several types dispatches on `ChunkMsg::type_id` itself. A node joins at most `MAX_JOINED_TYPES`.
+- **No catalog composes several types.** `SegmentedCodec` and `StandaloneCodec` are each one type's `TypeCodec`; a host with several types dispatches on the group's `type_id` itself. A node joins at most `MAX_JOINED_TYPES`.
 - **Cost with many types is not measured.** A host with a type per subnet joins up to about 200. `maintain_relations` and the heartbeat's gossip walk every joined type, `joined_types()` returns `MAX_JOINED_TYPES` ids by value, and each connection's record holds three maps sized `max_types`.
 - **A chunk's context is in every chunk.** A type whose context is long (a column's commitments) pays it N times. `protocol-v2.md` sends a header once a group and link; not done here.
 - **A cancelled push leaves an offer owed** through `SendQueues::owe`. Whether the node should send that offer itself was left open.
-- **`on_chunk_head` trusts the host's proof check.** It drops a copy of a chunk held, or of one that waits, on its head alone. A host that leaves the proof to `TypeCodec::check_proof` must not call it. A copy of a chunk that waits is told only by its id, which a segmented chunk's head does not give: such a copy from another peer is read. The entry has one test, with scripted peers.
+- **`on_chunk_head` trusts the host's proof check.** It drops a copy of a chunk held, or of one that waits, on its head alone. A host that leaves the proof to `TypeCodec::check_proof` must not call it. A copy of a chunk that waits is told only by its id, which no chunk's head gives, since the id hashes the frame: such a copy from another peer is read. The entry has one test, with scripted peers.
 - **Capacities follow the types joined** (`CapacityConfig::size_for`, from `TypeParams::max_chunks` and `max_groups_per_slot`). Open points:
   - **Only `max_types`, `max_groups` and `max_stored_chunks` are derived.** `max_owed_pairs`, `max_pairs`, `max_asks`, `max_seen_ids`, `max_deferred_chunks` and `max_ask_peers` also grow with the groups and are still the host's to set.
   - **A group's bitmaps are kept in its record only while they name no index past 63** (`GroupBits`, read and written through `Groups::bits`, `put_bits`, `edit_bits`). One that names a higher index is kept in a row of `max_wide_groups` rows, a row a group. With no row left the write is dropped and the bitmap stays as it was: the node then holds a chunk it does not count as held. Nothing counts or logs it. `CapacityConfig::size_for` takes a type as wide if its `max_chunks` is above 64.
@@ -86,17 +85,33 @@ An experiment behind a cargo feature of `seacast-codec` (README, "Where this dif
   - **`MAX_CODED_BODY` is four times what it was**, so a host that reserves it per group reserves that much more, and a coded group may decompress to that.
 - **`gfni::row` is `#[inline]`** because adding the FFT module stopped it being inlined into `combine`, which slowed recovery. The other kernels' `row` were already out of line and are unchanged.
 
+## The specification's v0.10.2 to v0.10.4 changes
+
+Applied 2026-11-18, the README's first departure lists them. Open:
+
+- **The standalone binding is implemented but for its chunk kinds** (2026-11-18). Kind `0x06` is any type's chunk, with a clear object header and the type's frame compressed (decided: a kind per chunk layout puts the domain's layouts in the binding). A cell's header with the first unsolicited push of its group on a link is left to the type: the node marks the write (`QueueEntry::first_of_group`) and tells `wire_size`, and `encode_entry` lets the type append it. Not done: a cell type (its layout, the header stripped and checked on receive, the id over cell and proof), and the fork's open points (§1.3). The simulator's columns and rows have no cells, and send no header bytes.
+- **The chunk id's content is built on the data's leaf** (decided, after the binding's hash of the body cost each chunk a second pass over its data). `sha256(leaf || the frame before the data)` binds every byte level 1 reads, so ids stay unforgeable; a hash of the data alone would let a copy with the right data and a wrong proof, rejected and marked seen, shut out the honest one. The codec benchmark's `decode_and_reencode` is back near its former time.
+- **`SegmentedCodec::check_proof` trusts a nonzero `memo` as the data's leaf.** `identify` computes it from the bytes; a host that sets `memo` otherwise must set the leaf.
+- **The group carries its type** (`GroupId::type_id`), as the binding's does. `Policy::type_of_group`, the separate types of `Have`, `Want` and `ChunkMsg`, and the type a peer named a group with went; the trait methods that take a group, and `DecodeJob`, no longer take a type beside it.
+- **Hashing the wider `GroupId` moved the simulator's Sampling p99.** With the group hashed by its key alone the summary is byte-identical to before, so the binding's other changes left it as it was; the shift is `fxhash`'s order over the wider key.
+- **The simulator's groups keep their former keys at index 0**, a column's not its block root and column. A cell is carried with its column's group and id on either axis, as the binding's id is.
+- **`Evidence` stays in the node's message types** and `RuntimeEnv::publish_evidence` remains; the wire sends none, as the binding reserves its kind.
+- **The IHAVE limits keep their defaults, 128 frames and 2048 asks a heartbeat**, under the specification's reference values (4096 and 5000). Decided; the values are each node's own.
+- **The simulator's Rows setting moved with `note_push` across axes**: one eager copy and seven repair copies fewer, the same latencies. No other change moved the summary; at the default `SOURCE_OFFERS` the source is as before.
+- **The new rules are tested with scripted peers only** (`crates/seacast-core/tests/limits.rs`): the simulator reaches no dropped group, pull-only source, refused or unwritten probe, departed claimant or probe kept while decoding.
+- **`drop_beyond` takes the indices from the offers.** Every ask, try and promise is of an offered index, so they are covered; a tie past the count goes at its release instead, which comes before the group can open.
+- **`serve_waiting_probe` does not hold to the heartbeat's serving budget**, as the draft's does not; `serve_standing` here does.
+
 ## The specification's v0.10 changes
 
 `informed-diffusion-spec` moved from v0.8 to v0.10.1 (2026-11-15). The README's first departure lists what is applied and what is not. Open on what is applied:
 
-- **The asker's side of the marked probe has no test of its own.** The claimant's side has one in `crates/seacast-core/tests/limits.rs`; the asker's verdict, its kept promise and its probe held in the queue are exercised only by the simulator's row setting, whose summary they left unchanged.
 - **`probe_answers` shares `max_groups` as its capacity** and has no limit test of its own: an asker can add one entry per group it probes, which the per-peer limit on groups bounds.
 - **The simulator's row setting now starts its asks after one second** (`START_DELAY`, decided in §6.3), so its latencies are a second longer than in earlier summaries.
 
 - **The relation upkeep is not run by the simulator**, which writes its relations into the sets at setup. The answered GRAFT, the backoff and the owed messages are covered by one test in `crates/seacast-core/tests/limits.rs`, with one peer; two nodes grafting each other have not been run against each other.
 - **`SendQueues` owes at most `max_queue_entries_per_peer` relation messages a peer**, and drops the newest beyond that.
-- **`PRUNE_BACKOFF` defaults to 12 seconds.** The draft gives it no value, only bounds.
+- **`PRUNE_BACKOFF` defaults to 12 seconds and `FORWARD_LIMIT` to 1.** The draft states both by their bounds; each node's value is its own, so neither is a departure. The 12 seconds have not been checked against the backoff's upper bound (how long a node may stay below its floor once its candidates have refused).
 - **`plan_refused` holds a source's refused pushes** until their group expires, sized by `max_stored_chunks`. Full, a refused push is offered a second time at its acknowledgement.
 
 Open on the floors, the sampler and the rest of §4.1:
@@ -142,7 +157,7 @@ Open on the floors, the sampler and the rest of §4.1:
 
 - **Four leaves at a time on SHA-NI matched the 16-lane AVX-512 kernel on full batches** on the one machine tried (Zen 5), so `sha256/x16.rs` could go there. Not measured on an Intel core, where the SHA-NI rounds may not overlap as well; the 16-lane kernel stays until it is.
 - **`ChunkMsg::memo` is 32 bytes a chunk the node holds**, in every table of chunks. Memory has not been measured with it.
-- **A chunk whose `memo` is zero is hashed at level 2**: one from the wire that the host's proof check did not go through `SegmentedCodec::check_proof` or `ChunkLayout::check_body`. A publisher's own carry their leaf's digest from `build_chunks`, which hashes each leaf a second time after `build_group` built the tree.
+- **A chunk whose `memo` is zero is hashed at level 2**: one a host passed through neither `identify` nor `SegmentedCodec::check_proof`. A publisher's own carry their leaf's digest from `build_chunks`, which hashes each leaf a second time after `build_group` built the tree.
 - **`decode_and_reencode` takes the digest of the K chunks it decodes from only.** A parity chunk given beyond those is computed again and hashed, as the specification's re-encode does, so that every node gives the same verdict. `complete_in_place` does not: it leaves a chunk that is there as it is, so a group whose committed parity is not the code's passes at a node that holds all the data. That was so before the digests were reused.
 - **A slot that changes after its level 1 is not detected by level 2**, since its digest is not recomputed. Before, the full rehash caught it.
 

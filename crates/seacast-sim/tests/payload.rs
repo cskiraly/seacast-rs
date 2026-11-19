@@ -6,13 +6,13 @@ use std::collections::HashMap;
 
 use seacast_codec::{
     MerkleProof, SegmentDescriptor, SegmentedCodec, SnappyBlockCompressor, UNIT, VecBufferPool,
-    build_frame, build_group, build_merkle_layers, chunk_id, group_id, group_key, leaf_hash,
+    build_frame, build_group, build_merkle_layers, chunk_id, frame_identity, group_id, group_key,
     merkle_proof_from_layers, split_frame,
 };
 use seacast_core::{
     Bitmap, BoundedDeferredStore, Bytes32, ChunkMsg, Duty, GroupId, GroupState, InterestKind, Join,
     NodeConfig, NodeId, PeerId, PenaltyReason, PreallocVec, Rpc, RuntimeEnv, SeacastNode, Shape,
-    SplitMix64, TimerEvent, Timestamp, TypeCodec, TypeId, TypeParams, ValidationResult,
+    SplitMix64, TimerEvent, Timestamp, TypeCodec, TypeParams, ValidationResult,
 };
 use seacast_sim::{
     PAYLOAD,
@@ -75,7 +75,7 @@ impl PayloadHost for Blocks {
 }
 
 /// A decode job: group, type, shape, the indices given and their chunks.
-type Job = (GroupId, TypeId, Shape, Bitmap, Vec<ChunkMsg<Vec<u8>>>);
+type Job = (GroupId, Shape, Bitmap, Vec<ChunkMsg<Vec<u8>>>);
 
 #[derive(Default)]
 struct Env {
@@ -92,7 +92,7 @@ impl RuntimeEnv<Vec<u8>> for Env {
     }
     fn schedule_after(&mut self, _delay: f64, _event: TimerEvent) {}
     fn start_decode(&mut self, group: GroupId, job: seacast_core::DecodeJob<'_, Vec<u8>>) {
-        self.to_decode.push((group, job.t, *job.shape, job.given, job.chunks.to_vec()));
+        self.to_decode.push((group, *job.shape, job.given, job.chunks.to_vec()));
     }
     fn deliver(&mut self, group: GroupId, payload: Vec<u8>) {
         self.delivered.push((group, payload));
@@ -105,6 +105,7 @@ impl RuntimeEnv<Vec<u8>> for Env {
 fn join() -> Join {
     Join {
         object_type: PAYLOAD,
+        fork_digest: [0; 4],
         interest: InterestKind::All,
         custody_count: 0,
         duty: Duty::Forward,
@@ -144,7 +145,14 @@ impl World {
     }
 
     fn rpc(&mut self, rpc: Rpc<Vec<u8>>) {
-        self.node.on_rpc(1, rpc, &mut self.env, &mut self.catalog, &mut self.rng, &mut self.store);
+        self.node.on_frame(
+            1,
+            rpc,
+            &mut self.env,
+            &mut self.catalog,
+            &mut self.rng,
+            &mut self.store,
+        );
     }
 
     fn chunk(&mut self, chunk: Chunk) {
@@ -190,9 +198,9 @@ impl World {
             verified += 1;
         }
         // Level 2 away from the node: only the result goes back to it.
-        for (group, t, shape, given, chunks) in std::mem::take(&mut self.env.to_decode) {
+        for (group, shape, given, chunks) in std::mem::take(&mut self.env.to_decode) {
             let mut rebuilt = PreallocVec::with_capacity(shape.n as usize);
-            let object = self.catalog.decode(t, &group, &chunks, &shape, &mut rebuilt);
+            let object = self.catalog.decode(&group, &chunks, &shape, &mut rebuilt);
             self.node.on_decoded(
                 group,
                 given,
@@ -218,11 +226,11 @@ fn chunks(
     (0..leaves.len())
         .map(|i| {
             let frame = build_frame(descriptor, &context, &proofs[i], &leaves[i]);
+            let (content, _) = frame_identity(&frame, CONTEXT_LEN);
             ChunkMsg {
-                type_id: PAYLOAD,
                 group,
                 index: i as u32,
-                cached_id: chunk_id(&group, i as u32, &leaf_hash(&leaves[i])),
+                cached_id: chunk_id(&group, i as u32, &content),
                 frame,
                 memo: [0; 32],
             }

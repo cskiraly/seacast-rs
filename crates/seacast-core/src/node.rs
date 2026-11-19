@@ -97,6 +97,12 @@ pub struct SeacastNode<B> {
 
     // Claims, deferral, probe, and IncrementalDAS repair sampling (`protocol-v2.md` §3, §4.6)
     pub probe_asks: PreallocSet<Ask>,
+    /// As a claimant still decoding: the first marked ask per asker and group
+    /// of an index we claim and have not stored, answered when it is
+    /// (`probe_waiting`, `protocol-v2.md` §4.6). By chunk, and by asker and
+    /// group; an entry is in both or neither.
+    pub probe_waiting: PeerSets<(GroupId, u32)>,
+    pub probe_waiting_of: PreallocMap<(PeerId, GroupId), u32>,
     /// As a claimant: answers to probes, by the chunk's own group and index,
     /// until they are written (`protocol-v2.md` §4.6 `probe_answers`).
     pub probe_answers: PreallocSet<(PeerId, GroupId, u32)>,
@@ -211,6 +217,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             held_groups: PreallocSet::with_capacity(2 * cap.max_groups),
             expiring: PreallocSet::with_capacity(2 * cap.max_groups),
             probe_asks: PreallocSet::with_capacity(cap.max_groups),
+            probe_waiting: PeerSets::with_capacity(cap.max_groups, cap.max_peers),
+            probe_waiting_of: PreallocMap::with_capacity(cap.max_groups),
             probe_answers: PreallocSet::with_capacity(cap.max_groups),
             sampled_from: PreallocMap::with_capacity(cap.max_asks),
             samples_in_flight: PreallocMap::with_capacity(cap.max_groups),
@@ -275,8 +283,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 if let Some(slot) = self.slots.get_mut(peer) {
                     slot.join_sent.insert(t, j);
                 }
-                self.relink(peer, t);
                 self.sends.send_relation(peer, Control::Join(j), env);
+                self.relink(peer, t);
             }
         }
     }
@@ -348,14 +356,33 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.named.retain(|&(q, _), _| q != peer);
 
         // A claim is a connection's: a gone claimant is neither probed nor counted.
+        // Our probe of it, not yet judged, gets no verdict, and our own repair is
+        // reconsidered at the duty's own time, at once if that has passed
+        // (`claims_close`, `protocol-v2.md` §4.6).
         self.claims.remove_peer(peer);
-        for (_, rec) in self.groups.iter_mut() {
-            if rec.probed == Some(peer) {
-                rec.probed = None;
+        let now = env.now();
+        for (&g, rec) in self.groups.iter_mut() {
+            if rec.probed != Some(peer) {
+                continue;
+            }
+            rec.probed = None;
+            if rec.deferred == Some(true) && rec.probe_ok.is_none() {
+                rec.probe_ok = Some(None);
+                if let Some(i) = rec.probe {
+                    self.probe_asks.remove(&Ask::new(g, i));
+                }
+                let at = now.max(rec.duty_at.unwrap_or(now));
+                rec.reconsider_at = Some(at.to_bits());
+                env.schedule_after(at - now, TimerEvent::Reconsider {
+                    group: g,
+                    at_bits: at.to_bits(),
+                });
             }
         }
         self.rsample_asked.retain(|&(_, _, q)| q != peer);
         self.probe_answers.retain(|&(q, _, _)| q != peer);
+        self.probe_waiting.remove_peer(peer);
+        self.probe_waiting_of.retain(|&(q, _), _| q != peer);
         self.plan_refused.retain(|&(q, _, _)| q != peer);
         self.sampled_from.retain(|&(_, q), _| q != peer);
         self.sends.disconnect(peer, env);
@@ -374,8 +401,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     // =========================================================================
 
     /// Handles an incoming standalone `Rpc` from `peer` (`protocol-v2.md` §4
-    /// `on_rpc`).
-    pub fn on_rpc<E, C, R, D>(
+    /// `on_frame`).
+    pub fn on_frame<E, C, R, D>(
         &mut self,
         peer: PeerId,
         rpc: Rpc<B>,
@@ -395,18 +422,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         // A message for an object type not joined on this link is ignored, without
         // penalty (`protocol-v2.md` §2).
         if let Some(f) = rpc.chunk {
-            if self.is_linked(peer, f.type_id) {
+            if self.is_linked(peer, f.group.type_id) {
                 self.on_chunk(peer, f, env, catalog, rng, deferred_store);
-            }
-        }
-        for (t, g) in rpc
-            .haves
-            .iter()
-            .map(|h| (h.object_type, h.group))
-            .chain(rpc.wants.iter().map(|w| (w.object_type, w.group)))
-        {
-            if self.is_linked(peer, t) {
-                self.name_group(peer, g, t);
             }
         }
         // One WANT per group: an offer's asks are bits of one bitmap, so none is left
@@ -414,18 +431,18 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let mut asks: InlineVec<Want, MAX_ENTRY_CONTROL> = InlineVec::new();
         let mut offered = false;
         for h in &rpc.haves {
-            if h.offer && self.linked_for(peer, h.object_type, &h.group, catalog) {
+            if h.offer && self.is_linked(peer, h.group.type_id) {
                 if !offered && !h.bits.is_empty() {
                     offered = true;
                     if let Some(slot) = self.slots.get_mut(peer) {
-                        slot.ihave_rpcs += 1;
+                        slot.ihave_frames += 1;
                     }
                 }
                 for a in self.on_offer(peer, h, env, catalog, rng) {
                     match asks.iter_mut().find(|w| w.group == a.group) {
                         Some(w) => w.bits.set(a.index),
                         None => {
-                            let _ = asks.push(Want::pull_ask(h.object_type, a));
+                            let _ = asks.push(Want::pull_ask(a));
                         }
                     }
                 }
@@ -433,7 +450,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         let mut wants: InlineVec<Want, MAX_ENTRY_CONTROL> = InlineVec::new();
         for w in &rpc.wants {
-            if self.linked_for(peer, w.object_type, &w.group, catalog) {
+            if self.is_linked(peer, w.group.type_id) {
                 let _ = wants.push(*w);
             }
         }
@@ -447,47 +464,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             self.on_prune(peer, pr, env, catalog);
         }
         for h in rpc.haves {
-            if !h.offer && self.linked_for(peer, h.object_type, &h.group, catalog) {
+            if !h.offer && self.is_linked(peer, h.group.type_id) {
                 self.on_holding(peer, h, env, catalog, rng);
             }
         }
         self.respond(peer, &asks, &answers, env);
-    }
-
-    /// Whether a message that names `group` as of type `t` is taken from
-    /// `peer`: both have joined `t` on their link, and the group is of that
-    /// type as far as this node knows.
-    fn linked_for<C>(&self, peer: PeerId, t: TypeId, group: &GroupId, catalog: &C) -> bool
-    where
-        C: ObjectCatalog<B>,
-    {
-        self.is_linked(peer, t) && self.type_of(group, catalog) == t
-    }
-
-    /// `group`'s object type: the one it was opened with, else the one a peer
-    /// named it with, else the policy's answer for a group this node keeps
-    /// nothing of.
-    pub fn type_of<C>(&self, group: &GroupId, catalog: &C) -> TypeId
-    where
-        C: ObjectCatalog<B>,
-    {
-        self.groups
-            .get(group)
-            .and_then(|r| r.t_of.or(r.named_t))
-            .unwrap_or_else(|| catalog.type_of_group(group))
-    }
-
-    /// Keeps the type `peer` named `group` with, while the group is not open
-    /// and the peer may have state kept for it.
-    fn name_group(&mut self, peer: PeerId, group: GroupId, t: TypeId) {
-        if self.expired(&group) ||
-            self.groups.get(&group).is_some_and(|r| r.t_of.is_some() || r.named_t.is_some())
-        {
-            return;
-        }
-        if self.admit_group(peer, &group) {
-            self.groups.rec(group).named_t = Some(t);
-        }
     }
 
     /// Sends one combined response per RPC handled (`protocol.md` §4.1
@@ -544,11 +525,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 self.ask_parked(ask, env, catalog);
             }
             TimerEvent::WindowTimeout { peer, group, index, at_bits } => {
-                self.sends.window_timeout((peer, group, index), at_bits, env);
                 // No holding came in time for a chunk this node published, which
                 // is acknowledged anyway (`protocol-v2.md` §4.11
-                // `window_timeout`). After a holding it is acknowledged already.
-                if self.groups.has_bits(&group, GroupBits::Origin) {
+                // `window_timeout`).
+                if self.sends.window_timeout((peer, group, index), at_bits, env) &&
+                    self.groups.has_bits(&group, GroupBits::Origin)
+                {
                     self.origin_acked(group, index, env, catalog);
                 }
             }
@@ -622,6 +604,13 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.tombstones.contains_key(group)
     }
 
+    /// Whether `group` failed level 2 or 3 (`drop_group`): its chunks are not
+    /// acted on (`protocol-v2.md` §4.6).
+    #[inline]
+    pub fn dropped(&self, group: &GroupId) -> bool {
+        self.groups.get(group).and_then(|r| r.state.as_ref()) == Some(&GroupState::Invalid)
+    }
+
     #[inline]
     pub fn holder_count(&self, group: &GroupId, index: u32) -> usize {
         self.holders.count(&(*group, index))
@@ -631,13 +620,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     /// no bitmap can name: what follows indexes bitmaps with them.
     pub(crate) fn projections<C>(
         catalog: &C,
-        t: TypeId,
         chunk: &ChunkMsg<B>,
     ) -> InlineVec<(GroupId, u32), { crate::collections::MAX_PROJECTED }>
     where
         C: ObjectCatalog<B>,
     {
-        let mut projected = catalog.project(t, chunk);
+        let mut projected = catalog.project(chunk);
         projected.retain(|&(_, index)| (index as usize) < MAX_BITMAP_BITS);
         projected
     }
@@ -660,10 +648,14 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
     }
 
-    /// Counts `peer` as linked for `t` once both JOINs are recorded. A host
-    /// that writes a link's JOINs into its record calls it after.
+    /// Counts `peer` as linked for `t` once both JOINs are recorded and ours is
+    /// queued, not owed (§4.1 `links`). A host that writes a link's JOINs into
+    /// its record calls it after.
     pub fn relink(&mut self, peer: PeerId, t: TypeId) {
-        if self.is_linked(peer, t) {
+        if self.join_recv(peer, t).is_some() &&
+            self.join_sent(peer, t).is_some() &&
+            !self.sends.join_owed(peer, t)
+        {
             self.linked.insert(t, peer);
         }
     }
@@ -682,7 +674,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     #[inline]
     pub fn over_ihave_limits(&self, peer: PeerId) -> bool {
         self.slots.get(peer).is_some_and(|s| {
-            s.ihave_rpcs > self.config.max_ihave_messages ||
+            s.ihave_frames > self.config.max_ihave_messages ||
                 s.ihave_asked >= self.config.max_ihave_length
         })
     }

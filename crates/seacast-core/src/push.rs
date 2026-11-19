@@ -6,8 +6,8 @@ use crate::{
     state::{GroupBits, PeerSet, PushCand},
     traits::{ChunkBuffer, ObjectCatalog, RngSource, RuntimeEnv},
     types::{
-        AnnounceWidth, Colour, Duty, FamilyId, GroupId, GroupState, PeerId, Shape, Timestamp,
-        TypeId,
+        AnnounceWidth, Colour, Duty, FamilyId, GroupId, GroupState, PeerId, Shape, SourceOffers,
+        Timestamp, TypeId,
     },
 };
 
@@ -22,8 +22,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     where
         C: ObjectCatalog<B>,
     {
-        let t = self.type_of(group, catalog);
-        PeerSet::Scope(t, catalog.family(t, group), catalog.params(t).m.max(1))
+        let t = group.type_id;
+        PeerSet::Scope(t, catalog.family(group), catalog.params(t).m.max(1))
     }
 
     /// Sends a holding (`Have` with `offer = false`) on the urgent lane
@@ -76,7 +76,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 .unwrap_or(false);
             (whole, done)
         };
-        Have::holding(self.type_of(&group, catalog), group, bits, whole, done)
+        Have::holding(group, bits, whole, done)
     }
 
     /// Returns what our holding says of `group` (`have_bits(g)` in
@@ -103,16 +103,15 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
         R: RngSource,
     {
-        let t_chunk = catalog.type_of_group(&chunk.group);
-        for (g, i) in Self::projections(catalog, t_chunk, chunk) {
-            if self.expired(&g) {
+        for (g, i) in Self::projections(catalog, chunk) {
+            if self.expired(&g) || self.dropped(&g) {
                 continue;
             }
-            let t = self.type_of(&g, catalog);
-            if catalog.duty_for(t, &g) != Duty::Forward {
+            let t = g.type_id;
+            if catalog.duty_for(&g) != Duty::Forward {
                 continue;
             }
-            let fam = catalog.family(t, &g);
+            let fam = catalog.family(&g);
             let m = catalog.params(t).m.max(1) as u32;
             let c = (i % m) as u16;
             let pushees = self.out_pushees(t, fam, c);
@@ -136,7 +135,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             for &q in targets.iter() {
                 let entry = Queued::Chunk { group: g, index: i, solicited: false };
                 if self.enqueue(q, entry, false, env) {
-                    self.note_push(q, g, i, env.now());
+                    self.note_push(q, g, i, env.now(), catalog);
                 } else {
                     self.owe(q, g, Bitmap::singleton(i), env);
                 }
@@ -242,8 +241,27 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             !has_any_have
     }
 
-    /// Records a chosen push to `peer` (`protocol.md` §5.2 `note_push`).
-    pub fn note_push(&mut self, peer: PeerId, group: GroupId, index: u32, now: Timestamp) {
+    /// Records a chosen push to `peer` under every group the chunk fills, from
+    /// the ids alone (`protocol-v2.md` §4.4 `note_push`, R4): a chunk sent
+    /// through one axis is not offered or repaired to that peer through
+    /// another.
+    pub fn note_push<C>(
+        &mut self,
+        peer: PeerId,
+        group: GroupId,
+        index: u32,
+        now: Timestamp,
+        catalog: &C,
+    ) where
+        C: ObjectCatalog<B>,
+    {
+        self.mark_pushed(peer, group, index, now);
+        for (g2, i2) in catalog.cross(&group, index) {
+            self.mark_pushed(peer, g2, i2, now);
+        }
+    }
+
+    fn mark_pushed(&mut self, peer: PeerId, group: GroupId, index: u32, now: Timestamp) {
         let push_ttl = self.config.push_ttl;
         let mut e = self.pairs.pushed(&(peer, group)).unwrap_or_default();
         if e.is_empty() {
@@ -274,7 +292,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if b.is_empty() {
             return;
         }
-        let offer = Have::offer(self.type_of(&group, catalog), group, b);
+        let offer = Have::offer(group, b);
         if !self.enqueue(peer, Queued::from_have(offer), false, env) {
             self.owe(peer, group, b, env);
         }
@@ -287,12 +305,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         E: RuntimeEnv<B>,
         C: ObjectCatalog<B>,
     {
-        let t = self.type_of(&group, catalog);
+        let t = group.type_id;
         let prm = catalog.params(t);
         if prm.announce_extra != AnnounceWidth::AllJoined {
             return;
         }
-        let fam = catalog.family(t, &group);
+        let fam = catalog.family(&group);
         self.for_each(PeerSet::Unrelated(t, fam, prm.m.max(1)), |node, q| {
             if node.wants_from_me(q, &group, catalog).has(index) {
                 node.announce(q, group, Bitmap::singleton(index), env, catalog);
@@ -313,12 +331,15 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         E: RuntimeEnv<B>,
         C: ObjectCatalog<B>,
     {
-        if let Some(mut e) = self.pairs.pushed(&(peer, group)) {
-            e.clear(index);
-            self.pairs.set_pushed((peer, group), e);
+        let t = group.type_id;
+        // Not counted under any group `note_push` marked.
+        for (g2, i2) in core::iter::once((group, index)).chain(catalog.cross(&group, index)) {
+            if let Some(mut e) = self.pairs.pushed(&(peer, g2)) {
+                e.clear(i2);
+                self.pairs.set_pushed((peer, g2), e);
+            }
         }
-        let t = self.type_of(&group, catalog);
-        let fam = catalog.family(t, &group);
+        let fam = catalog.family(&group);
         let m = catalog.params(t).m.max(1) as u32;
         let c = (index % m) as u16;
         // Owed to a relation peer, or at a source to a peer of the pool the push was
@@ -370,18 +391,18 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return;
         }
         let now = env.now();
-        let t = catalog.type_of_group(&group);
+        let t = group.type_id;
         let n = shape.n;
         if !self.groups.open(group, t) {
             return;
         }
-        let deadline = shards.first().and_then(|f| catalog.deadline(t, &group, catalog.context(f)));
+        let deadline = shards.first().and_then(|f| catalog.deadline(&group, catalog.context(f)));
         let rec = self.groups.rec(group);
         rec.hdr = Some(shape);
         rec.authentic = true;
         rec.deadline = deadline;
         rec.known_at.get_or_insert(now);
-        self.groups.put_bits(group, GroupBits::Interest, catalog.own_interest(t, &group));
+        self.groups.put_bits(group, GroupBits::Interest, catalog.own_interest(&group));
 
         for f in shards {
             self.seen_ids.insert(f.cached_id);
@@ -391,6 +412,17 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.groups.put_bits(group, GroupBits::Mine, Bitmap::all_bits(n));
         self.groups.rec(group).state.replace(GroupState::Complete);
         self.groups.rec(group).stop_pull.replace(true);
+        // A pull-only type's source pushes nothing, so no acknowledgement can come:
+        // its holding names every chunk, and every chunk is offered now
+        // (`offer_at_publish`).
+        if !catalog.params(t).eager {
+            self.groups.put_bits(group, GroupBits::Origin, Bitmap::all_bits(n));
+            self.for_each(self.suppression_scope(&group, catalog), |node, q| {
+                node.send_have(q, group, env, catalog);
+            });
+            self.offer_from_source(group, n, env, catalog);
+            return;
+        }
         self.groups.put_bits(group, GroupBits::Origin, Bitmap::new());
 
         let r = self.config.r;
@@ -413,7 +445,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 break;
             }
             for &p in &targets {
-                self.note_push(p, group, i, now);
+                self.note_push(p, group, i, now, catalog);
             }
         }
 
@@ -449,29 +481,48 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             }
         }
         // The pool's peers not chosen for a chunk are offered it at its
-        // acknowledgement (`origin_acked`).
-    }
-
-    /// Keeps `chunk` for the heartbeat's gossip, if its type is gossiped at
-    /// all: the history is bounded, and a type announced to every joined
-    /// peer would crowd the others out of it.
-    fn put_gossip<C>(&mut self, chunk: &ChunkMsg<B>, catalog: &C)
-    where
-        C: ObjectCatalog<B>,
-    {
-        let t = self.type_of(&chunk.group, catalog);
-        if catalog.params(t).announce_extra == AnnounceWidth::Sample {
-            self.gossip_history.put(chunk);
+        // acknowledgement (`origin_acked`), or now (`SOURCE_OFFERS = PUBLISH`).
+        if self.config.source_offers == SourceOffers::Publish {
+            self.offer_from_source(group, n, env, catalog);
         }
     }
 
-    /// A chunk of a group we publish is known to have arrived somewhere: a
-    /// peer's holding names it, or its first copy's room timed out. It joins
-    /// our holding, and the pool's peers not planned for it are offered it;
-    /// a refused push is owed, and not offered again (`protocol-v2.md` §4.7
-    /// `origin_acked`, `[c3, P4]`).
-    pub fn origin_acked<E, C>(&mut self, group: GroupId, index: u32, env: &mut E, catalog: &C)
+    /// Offers each chunk of a group we publish to its colour's source pool, but
+    /// to the peers it was pushed to: one offer a peer (`offer_at_publish`).
+    fn offer_from_source<E, C>(&mut self, group: GroupId, n: u32, env: &mut E, catalog: &C)
     where
+        E: RuntimeEnv<B>,
+        C: ObjectCatalog<B>,
+    {
+        let t = group.type_id;
+        let fam = catalog.family(&group);
+        let m = catalog.params(t).m.max(1) as u32;
+        // Every pool is within the links.
+        self.for_each(self.links(t), |node, p| {
+            let mut bits = Bitmap::new();
+            for c in 0..m.min(n) {
+                if node.in_set(node.source_pool(t, fam, c as u16), p) {
+                    for i in (c..n).step_by(m as usize) {
+                        bits.set(i);
+                    }
+                }
+            }
+            // `announce` leaves out a push that was made.
+            if !bits.is_empty() {
+                node.announce(p, group, bits, env, catalog);
+            }
+        });
+    }
+
+    /// `SOURCE_OFFERS = PUBLISH`: a chunk of a group we publish is written for
+    /// the first time. It joins our holding (`origin_written`).
+    pub(crate) fn origin_written<E, C>(
+        &mut self,
+        group: GroupId,
+        index: u32,
+        env: &mut E,
+        catalog: &C,
+    ) where
         E: RuntimeEnv<B>,
         C: ObjectCatalog<B>,
     {
@@ -486,8 +537,49 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.for_each(self.suppression_scope(&group, catalog), |node, q| {
             node.send_have(q, group, env, catalog);
         });
-        let t = self.type_of(&group, catalog);
-        let fam = catalog.family(t, &group);
+    }
+
+    /// Keeps `chunk` for the heartbeat's gossip, if its type is gossiped at
+    /// all: the history is bounded, and a type announced to every joined
+    /// peer would crowd the others out of it.
+    fn put_gossip<C>(&mut self, chunk: &ChunkMsg<B>, catalog: &C)
+    where
+        C: ObjectCatalog<B>,
+    {
+        let t = chunk.group.type_id;
+        if catalog.params(t).announce_extra == AnnounceWidth::Sample && !self.dropped(&chunk.group)
+        {
+            self.gossip_history.put(chunk);
+        }
+    }
+
+    /// A chunk of a group we publish is known to have arrived somewhere: a
+    /// peer's holding names it, or its first copy's room timed out. It joins
+    /// our holding, and the pool's peers not planned for it are offered it;
+    /// a refused push is owed, and not offered again (`protocol-v2.md` §4.7
+    /// `origin_acked`, `[c3, P4]`).
+    pub fn origin_acked<E, C>(&mut self, group: GroupId, index: u32, env: &mut E, catalog: &C)
+    where
+        E: RuntimeEnv<B>,
+        C: ObjectCatalog<B>,
+    {
+        // At `PUBLISH` the offers left at publish and the holding grew at the write.
+        if self.config.source_offers == SourceOffers::Publish {
+            return;
+        }
+        let Some(mut orig) = self.groups.bits(&group, GroupBits::Origin) else {
+            return;
+        };
+        if orig.has(index) {
+            return;
+        }
+        orig.set(index);
+        self.groups.put_bits(group, GroupBits::Origin, orig);
+        self.for_each(self.suppression_scope(&group, catalog), |node, q| {
+            node.send_have(q, group, env, catalog);
+        });
+        let t = group.type_id;
+        let fam = catalog.family(&group);
         let c = (index % catalog.params(t).m.max(1) as u32) as u16;
         // `announce` leaves out a push that was made.
         self.for_each(self.source_pool(t, fam, c), |node, p| {
@@ -504,11 +596,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
     {
         let g = chunk.group;
-        let t = self.type_of(&g, catalog);
+        let t = g.type_id;
         if self.config.card13_enabled && self.config.uplink_bps >= self.config.stripe_uplink_bps {
             return self.links(t);
         }
-        let fam = catalog.family(t, &g);
+        let fam = catalog.family(&g);
         let m = catalog.params(t).m.max(1) as u32;
         self.source_pool(t, fam, (chunk.index % m) as u16)
     }

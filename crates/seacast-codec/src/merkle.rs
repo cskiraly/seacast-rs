@@ -158,13 +158,27 @@ pub fn proven_leaf_hash(
     if count == 0 || index >= count || proof.len() > MAX_PROOF_DEPTH {
         return None;
     }
-    let width = tree_width(count as usize);
-    let expected_depth = width.trailing_zeros() as usize;
-    if proof.len() != expected_depth {
-        return None;
-    }
     let leaf = leaf_hash(data);
-    let mut cur = leaf;
+    verify_leaf_path(root, &leaf, index, count, proof).then_some(leaf)
+}
+
+/// Whether `proof` leads from the leaf digest `leaf` at `index` to `root`: the
+/// rest of [`verify_merkle_proof`] once the leaf is hashed.
+pub fn verify_leaf_path(
+    root: &Bytes32,
+    leaf: &Bytes32,
+    index: u32,
+    count: u32,
+    proof: &[Bytes32],
+) -> bool {
+    if count == 0 || index >= count || proof.len() > MAX_PROOF_DEPTH {
+        return false;
+    }
+    let width = tree_width(count as usize);
+    if proof.len() != width.trailing_zeros() as usize {
+        return false;
+    }
+    let mut cur = *leaf;
     let mut idx = index as usize;
     for sibling in proof {
         if idx & 1 == 0 {
@@ -174,7 +188,7 @@ pub fn proven_leaf_hash(
         }
         idx >>= 1;
     }
-    (&cur == root).then_some(leaf)
+    &cur == root
 }
 
 #[cfg(test)]

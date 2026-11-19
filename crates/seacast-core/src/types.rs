@@ -4,13 +4,34 @@ use crate::bitmap::Bitmap;
 /// spec).
 pub type Bytes32 = [u8; 32];
 
-/// 56-byte structured chunk ID (`group (32B) || index (4B LE) || content_id
-/// (20B)`).
-pub type ChunkId = [u8; 56];
+/// 59-byte structured chunk ID (`protocol-v2-bindings.md` §1.3): `group (35B:
+/// type, key, index LE) || index (4B LE) || content (20B)`.
+pub type ChunkId = [u8; 59];
 
-/// Group identifier in diffusion: what a type's codec derives from a chunk's
-/// frame.
-pub type GroupId = Bytes32;
+/// Group identifier in diffusion (`protocol-v2-bindings.md` §1.3): its object
+/// type, a key, and an index under the key, such as a block root and a column.
+/// The type's codec derives it from a chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct GroupId {
+    pub type_id: TypeId,
+    pub key: Bytes32,
+    pub index: u16,
+}
+
+impl GroupId {
+    #[inline]
+    pub const fn new(type_id: TypeId, key: Bytes32, index: u16) -> Self {
+        Self { type_id, key, index }
+    }
+
+    /// The group a chunk id opens with ([`ChunkId`]).
+    #[inline]
+    pub fn of_chunk_id(id: &ChunkId) -> Self {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&id[1..33]);
+        Self { type_id: TypeId(id[0]), key, index: u16::from_le_bytes([id[33], id[34]]) }
+    }
+}
 
 /// Peer identifier in the state machine.
 pub type PeerId = u64;
@@ -44,10 +65,13 @@ pub type NodeId = Bytes32;
 
 /// Object type identifier. The domain assigns the values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct TypeId(pub u16);
+pub struct TypeId(pub u8);
+
+/// The fork at which a node runs a type (`protocol-v2-bindings.md` §1.3).
+pub type ForkDigest = [u8; 4];
 
 /// Relation family key within a type (`Policy::family`).
-pub type FamilyId = u32;
+pub type FamilyId = u16;
 
 /// Colour index (`0..M[T]`, `protocol-v2.md` §1.4).
 pub type Colour = u16;
@@ -117,6 +141,18 @@ pub enum AnnounceWidth {
     Sample,
     /// Do not announce outside the push relation (`NONE`).
     None,
+}
+
+/// When a source offers each chunk to the pool's peers it did not push it to
+/// (`SOURCE_OFFERS`, `protocol-v2.md` §4.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SourceOffers {
+    /// At the chunk's acknowledgement; the holding names the chunks
+    /// acknowledged so far (`ACK`).
+    Ack,
+    /// At publish; the holding grows at each chunk's first write, and an
+    /// acknowledgement does nothing (`PUBLISH`).
+    Publish,
 }
 
 /// Node uplink bandwidth class (`protocol-v2.md` §4.1, `[c17]`).
@@ -412,6 +448,8 @@ pub struct NodeConfig {
     pub window_enabled: bool,
     /// Card 15: Paced heartbeat gossip (`PACED`).
     pub paced_gossip: bool,
+    /// When a source offers its chunks (`SOURCE_OFFERS`).
+    pub source_offers: SourceOffers,
     /// Card 16: Furthest-behind-first target selection with proof guard.
     pub card16_enabled: bool,
     /// Card 17: Fast uplink class uses `R_FAST`.
@@ -573,6 +611,7 @@ impl Default for NodeConfig {
             project_enabled: true,
             window_enabled: true,
             paced_gossip: true,
+            source_offers: SourceOffers::Ack,
             card16_enabled: true,
             card17_enabled: true,
             card13_enabled: true,

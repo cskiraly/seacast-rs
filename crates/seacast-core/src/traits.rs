@@ -248,7 +248,6 @@ impl<B> DeferredStore<B> for BoundedDeferredStore {
 /// The input of a group's level 2 (`RuntimeEnv::start_decode`).
 #[derive(Debug, Clone, Copy)]
 pub struct DecodeJob<'a, B> {
-    pub t: TypeId,
     pub shape: &'a Shape,
     /// The indices of `chunks`: passed back to `SeacastNode::on_decoded`.
     pub given: Bitmap,
@@ -323,7 +322,6 @@ pub trait TypeCodec<B: ChunkBuffer> {
     /// if the group is inconsistent.
     fn decode(
         &mut self,
-        t: TypeId,
         group: &GroupId,
         available: &[ChunkMsg<B>],
         shape: &Shape,
@@ -339,24 +337,21 @@ pub trait TypeCodec<B: ChunkBuffer> {
     }
 
     /// Every `(group, index)` pair a single chunk fills (`T.project(f)`, `R4`).
-    fn project(&self, _t: TypeId, chunk: &ChunkMsg<B>) -> InlineVec<(GroupId, u32), MAX_PROJECTED> {
+    fn project(&self, chunk: &ChunkMsg<B>) -> InlineVec<(GroupId, u32), MAX_PROJECTED> {
         InlineVec::singleton((chunk.group, chunk.index))
     }
 
     /// The other `(group, index)` pairs corresponding to index `i` of `group`,
     /// from IDs alone (`T.cross(g, i)`, `R4`).
-    fn cross(
-        &self,
-        _t: TypeId,
-        _group: &GroupId,
-        _index: u32,
-    ) -> InlineVec<(GroupId, u32), MAX_PROJECTED> {
+    fn cross(&self, _group: &GroupId, _index: u32) -> InlineVec<(GroupId, u32), MAX_PROJECTED> {
         InlineVec::new()
     }
 
     /// Returns the wire size in bytes of `chunk` for the byte congestion window
-    /// (`wire_size(f)`, §4.11).
-    fn wire_size(&self, chunk: &ChunkMsg<B>) -> usize {
+    /// (`wire_size(p, entry)`, §4.11). `first_of_group`: the write is the first
+    /// unsolicited one of the group to its peer, which may carry more
+    /// ([`QueueEntry::first_of_group`](crate::QueueEntry)).
+    fn wire_size(&self, chunk: &ChunkMsg<B>, _first_of_group: bool) -> usize {
         chunk.frame.len()
     }
 }
@@ -370,7 +365,6 @@ pub trait Domain {
     /// for a group that is too old or too early. Never `Pending`.
     fn authenticate(
         &mut self,
-        t: TypeId,
         group: &GroupId,
         header_id: &Bytes32,
         context: &[u8],
@@ -378,21 +372,21 @@ pub trait Domain {
 
     /// Whether the domain commits `group` already: nothing is asked for of a
     /// group before.
-    fn authenticable(&self, t: TypeId, group: &GroupId) -> bool;
+    fn authenticable(&self, group: &GroupId) -> bool;
 
     /// When a group of type `t` with this `context` leaves the domain's
     /// window, on the host's clock: its state and its deferred chunks go then
     /// at the latest, and its tombstone is kept until then. The domain
     /// answers `Ignore` for the group from then on. `None`: the node's
     /// lifetimes alone apply (`GROUP_TTL`, `tombstone_ttl`).
-    fn deadline(&self, _t: TypeId, _group: &GroupId, _context: &[u8]) -> Option<Timestamp> {
+    fn deadline(&self, _group: &GroupId, _context: &[u8]) -> Option<Timestamp> {
         None
     }
 
     /// The id under which a peer is asked for at most one sample: that of the
     /// object the group is part of, where a node samples several groups of
     /// one object (`protocol-v2.md` §4.10 `sampled_from`, I6).
-    fn sample_scope(&self, _t: TypeId, group: &GroupId) -> GroupId {
+    fn sample_scope(&self, group: &GroupId) -> GroupId {
         *group
     }
 
@@ -405,14 +399,11 @@ pub trait Domain {
 /// What this node takes part in and how: its types, interest, duty and
 /// parameters.
 pub trait Policy {
-    /// Returns the `TypeId` for a `GroupId` (`type_of_group(g)`).
-    fn type_of_group(&self, group: &GroupId) -> TypeId;
-
     /// Returns the protocol parameters `TypeParams` for `t` (`T.params`).
     fn params(&self, t: TypeId) -> &TypeParams;
 
     /// The relation family key for `group` (`T.family(g)`).
-    fn family(&self, _t: TypeId, _group: &GroupId) -> FamilyId {
+    fn family(&self, _group: &GroupId) -> FamilyId {
         0
     }
 
@@ -420,7 +411,6 @@ pub trait Policy {
     /// hdr, node_id(p), j)`).
     fn derived_interest(
         &self,
-        _t: TypeId,
         _group: &GroupId,
         _shape: Option<&Shape>,
         _peer: PeerId,
@@ -432,7 +422,7 @@ pub trait Policy {
 
     /// Computes this node's own initial interest in `group`
     /// (`own_interest_bits(g)`).
-    fn own_interest(&self, _t: TypeId, _group: &GroupId) -> Bitmap {
+    fn own_interest(&self, _group: &GroupId) -> Bitmap {
         Bitmap::EVERY_INDEX
     }
 
@@ -484,25 +474,20 @@ pub trait Policy {
     }
 
     /// Returns this node's duty for `group` (`duty_for(g)`).
-    fn duty_for(&self, t: TypeId, _group: &GroupId) -> Duty {
-        self.our_join(t).duty
+    fn duty_for(&self, group: &GroupId) -> Duty {
+        self.our_join(group.type_id).duty
     }
 
     /// Repair rule: whether this node decodes `group` immediately at `K`
     /// (`T.params.DECODE_AT_K(g)`).
-    fn decode_at_k(&self, _t: TypeId, _group: &GroupId) -> bool {
+    fn decode_at_k(&self, _group: &GroupId) -> bool {
         true
     }
 
     /// Repair rule: whether this node decodes `group` after a delay if still
     /// short, and the delay in seconds from `known_at[g]`
     /// (`T.params.DECODE_LATER(g)`).
-    fn decode_later(
-        &mut self,
-        _t: TypeId,
-        _group: &GroupId,
-        _rng: &mut dyn RngSource,
-    ) -> Option<f64> {
+    fn decode_later(&mut self, _group: &GroupId, _rng: &mut dyn RngSource) -> Option<f64> {
         None
     }
 
@@ -510,11 +495,7 @@ pub trait Policy {
     /// pushed/offered (`T.params.REPAIR_TO(g)`). If `None` is returned,
     /// defaults to peers in the push/announce relation or peers with interest
     /// in `group`.
-    fn repair_to(
-        &self,
-        _t: TypeId,
-        _group: &GroupId,
-    ) -> Option<InlineVec<PeerId, MAX_INLINE_PEERS>> {
+    fn repair_to(&self, _group: &GroupId) -> Option<InlineVec<PeerId, MAX_INLINE_PEERS>> {
         None
     }
 

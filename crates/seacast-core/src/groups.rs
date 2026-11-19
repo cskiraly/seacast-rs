@@ -10,7 +10,7 @@ use crate::{
     },
     types::{
         Ask, ChunkId, Duty, GenerationPeerId, GroupId, GroupState, PeerId, Shape, Timestamp,
-        TypeId, ValidationResult,
+        ValidationResult,
     },
 };
 
@@ -40,8 +40,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if known || self.verifying.contains(&mid) {
             if self.accepted_id(&mid, &chunk.group, chunk.index) {
                 // The claimant's copy passes its probe, a duplicate too (§4.6, R5).
-                let t = self.type_of(&chunk.group, catalog);
-                for (g, i) in catalog.project(t, &chunk) {
+                for (g, i) in catalog.project(&chunk) {
                     self.probe_answer(g, i, peer);
                 }
                 self.send_have(peer, chunk.group, env, catalog);
@@ -73,7 +72,6 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     pub fn on_chunk_head<E, C>(
         &mut self,
         peer: PeerId,
-        t: TypeId,
         group: &GroupId,
         index: u32,
         id: Option<&ChunkId>,
@@ -84,7 +82,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         E: RuntimeEnv<B>,
         C: ObjectCatalog<B>,
     {
-        if index as usize >= MAX_BITMAP_BITS || !self.is_linked(peer, t) || self.expired(group) {
+        if index as usize >= MAX_BITMAP_BITS ||
+            !self.is_linked(peer, group.type_id) ||
+            self.expired(group)
+        {
             return false;
         }
         let ask = Ask::new(*group, index);
@@ -113,14 +114,13 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
     {
         let rec = self.groups.get(&chunk.group);
-        if rec.is_some_and(|r| r.t_of.is_some_and(|t| t != chunk.type_id)) || !catalog.check(chunk)
-        {
+        if !catalog.check(chunk) {
             return ValidationResult::Reject;
         }
         if !rec.is_some_and(|r| r.authentic) {
             let header_id = catalog.header_id(chunk);
             let context = catalog.context(chunk);
-            let verdict = catalog.authenticate(chunk.type_id, &chunk.group, &header_id, context);
+            let verdict = catalog.authenticate(&chunk.group, &header_id, context);
             if verdict != ValidationResult::Accept {
                 // A domain's `Pending` is no verdict: the chunk is not taken.
                 return if verdict == ValidationResult::Pending {
@@ -129,7 +129,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                     verdict
                 };
             }
-            let deadline = catalog.deadline(chunk.type_id, &chunk.group, context);
+            let deadline = catalog.deadline(&chunk.group, context);
             let rec = self.groups.rec(chunk.group);
             rec.authentic = true;
             rec.deadline = deadline;
@@ -206,14 +206,13 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             env.penalise(peer, PenaltyReason::InvalidChunkLevel1);
             return;
         }
-        let t = chunk.type_id;
-        let projected = Self::projections(catalog, t, &chunk);
+        let projected = Self::projections(catalog, &chunk);
         for &(g, i) in &projected {
             self.fill(g, i, &chunk, Some(peer), env, catalog);
         }
+        // A dropped or expired axis is not acted on (`protocol-v2.md` §4.6).
         if projected.iter().any(|&(g, _)| {
-            let tg = self.type_of(&g, catalog);
-            catalog.duty_for(tg, &g) == Duty::Forward
+            !self.expired(&g) && !self.dropped(&g) && catalog.duty_for(&g) == Duty::Forward
         }) {
             self.forward(&chunk, peer, env, catalog, rng);
         }
@@ -282,6 +281,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             self.promises.insert(Ask::new(group, index), claimant, at_bits);
         }
         self.serve_standing(group, index, env, catalog);
+        self.serve_waiting_probe(group, index, env, catalog);
 
         let claim = !self.groups.bits(&group, GroupBits::Mine).is_some_and(|mine| mine.has(index));
         self.groups.edit_bits(group, GroupBits::Mine, |mine| mine.set(index));
@@ -305,7 +305,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     {
         // A chunk opens its own group as its type; one it only projects onto, as that
         // group's.
-        let t = if chunk.group == group { chunk.type_id } else { catalog.type_of_group(&group) };
+        let t = group.type_id;
         let header = catalog
             .shape_by_group(&group)
             .or_else(|| (chunk.group == group).then(|| catalog.shape(chunk)).flatten());
@@ -321,12 +321,16 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if header.is_some() {
             rec.hdr = header;
         }
+        if let Some(h) = &header {
+            self.drop_beyond(group, h.n);
+        }
+        let rec = self.groups.rec(group);
         rec.state = Some(GroupState::Collecting);
         rec.known_at.get_or_insert(now);
         rec.last_activity = Some(now);
         // What a sampler declared, or an offer recorded, before the group opened is
         // kept.
-        let own = catalog.own_interest(t, &group);
+        let own = catalog.own_interest(&group);
         self.groups.edit_bits(group, GroupBits::Interest, |interest| *interest |= &own);
         // Holdings that arrived before the group opened count from now on.
         for p in self.pairs.having(&group) {
@@ -368,6 +372,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
         D: DeferredStore<B>,
     {
+        // A group beyond the peer's unknown groups: neither kept nor tied
+        // (`protocol.md` §8.2).
+        if !self.admit_group(peer, &chunk.group) {
+            return;
+        }
         self.tie(peer, &chunk, catalog);
         if self.pending.is_full() || self.pending_ids.len() >= self.pending_ids.capacity() {
             return;
@@ -375,7 +384,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if deferred_store.reserve(peer, &chunk) {
             self.pending_ids.insert(chunk.cached_id);
             let until = catalog
-                .deadline(chunk.type_id, &chunk.group, catalog.context(&chunk))
+                .deadline(&chunk.group, catalog.context(&chunk))
                 .unwrap_or(env.now() + self.config.group_ttl);
             let _ = self.pending.push((until, peer, chunk));
         }
@@ -487,8 +496,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 if self.expired(&g) {
                     continue;
                 }
-                let t = self.type_of(&g, catalog);
-                if !catalog.authenticable(t, &g) {
+                if !catalog.authenticable(&g) {
                     self.drop_tie(p, g, &bits, env, catalog);
                     continue;
                 }
@@ -520,8 +528,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         E: RuntimeEnv<B>,
         C: ObjectCatalog<B>,
     {
-        let t = self.type_of(&group, catalog);
-        let auth = catalog.authenticable(t, &group);
+        let auth = catalog.authenticable(&group);
         for i in bits.iter() {
             self.drop_offer(group, i, peer);
             if auth {
@@ -553,8 +560,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return;
         }
         self.groups.rec(group).stop_pull.replace(true);
-        let t = self.type_of(&group, catalog);
-        if catalog.decode_at_k(t, &group) {
+        let t = group.type_id;
+        if catalog.decode_at_k(&group) {
             self.groups.rec(group).state.replace(GroupState::Decoding);
             if let Some(h) = self.groups.get(&group).and_then(|r| r.hdr.as_ref()).copied() {
                 let held = self.groups.bits(&group, GroupBits::Mine).unwrap_or(Bitmap::EMPTY);
@@ -562,7 +569,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             }
         } else {
             self.groups.rec(group).state.replace(GroupState::Complete);
-            if let Some(later) = catalog.decode_later(t, &group, rng) {
+            if let Some(later) = catalog.decode_later(&group, rng) {
                 let known_at = self
                     .groups
                     .get(&group)
@@ -577,7 +584,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         });
         self.close_promises_of_group(&group);
         if self.groups.get(&group).and_then(|r| r.state.as_ref()) == Some(&GroupState::Decoding) {
-            self.start_decode(group, env, catalog);
+            self.start_decode(group, env);
         }
     }
 
@@ -631,17 +638,15 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     }
 
     /// Hands the host the level 2 of `group` (`RuntimeEnv::start_decode`).
-    pub(crate) fn start_decode<E, C>(&mut self, group: GroupId, env: &mut E, catalog: &C)
+    pub(crate) fn start_decode<E>(&mut self, group: GroupId, env: &mut E)
     where
         E: RuntimeEnv<B>,
-        C: ObjectCatalog<B>,
     {
         let Some((h, given)) = self.decode_inputs(&group) else {
             return;
         };
-        let t = self.type_of(&group, catalog);
         let chunks = self.decode_in_scratch.as_slice();
-        env.start_decode(group, DecodeJob { t, shape: &h, given, chunks });
+        env.start_decode(group, DecodeJob { shape: &h, given, chunks });
     }
 
     /// Level 2 and what follows it, on this thread (`protocol-v2.md` §4.6
@@ -661,12 +666,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let Some((h, given)) = self.decode_inputs(&group) else {
             return;
         };
-        let t = self.type_of(&group, catalog);
         // Taken for the call: `on_decoded` borrows the node.
         let mut out =
             std::mem::replace(&mut self.decode_out_scratch, PreallocVec::with_capacity(0));
         out.clear();
-        let decoded = catalog.decode(t, &group, &self.decode_in_scratch, &h, &mut out);
+        let decoded = catalog.decode(&group, &self.decode_in_scratch, &h, &mut out);
         self.on_decoded(group, given, decoded, out.as_slice(), env, catalog, rng);
         self.decode_out_scratch = out;
     }
@@ -697,7 +701,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let Some(h) = self.groups.get(&group).and_then(|r| r.hdr.as_ref()).cloned() else {
             return;
         };
-        let t = self.type_of(&group, catalog);
+        let t = group.type_id;
         let Some(object) = decoded else {
             self.drop_group(group);
             return;
@@ -715,7 +719,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 let _ = new_indices.push(i);
                 self.store_chunk(group, i, ch.clone(), now);
                 self.groups.edit_bits(group, GroupBits::Rebuilt, |bits| bits.set(i));
-                for (g2, i2) in Self::projections(catalog, t, ch) {
+                // Standing WANTs and a kept probe that waited for it, as `fill` answers
+                // them (§4.5, §4.6).
+                self.serve_standing(group, i, env, catalog);
+                self.serve_waiting_probe(group, i, env, catalog);
+                for (g2, i2) in Self::projections(catalog, ch) {
                     if g2 == group {
                         continue;
                     }
@@ -823,12 +831,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             self.tombstones.insert(group, deadline.unwrap_or(now + self.config.tombstone_ttl));
         }
         let gone = |of: &GroupId| dead.contains(of);
-        let gone_id =
-            |id: &crate::ChunkId| dead.contains(GroupId::try_from(&id[..32]).as_ref().unwrap());
+        let gone_id = |id: &crate::ChunkId| dead.contains(&GroupId::of_chunk_id(id));
 
         self.chunks.retain(|(of, _), _| !gone(of));
         self.known_id.retain(|(of, _), _| !gone(of));
-        // A chunk id opens with its group's id.
+        // A chunk id carries its group after its type.
         self.seen_ids.retain(|id| !gone_id(id));
         self.verifying.retain(|id| !gone_id(id));
         self.serve_count.retain(|(_, id), _| !gone_id(id));
@@ -875,6 +882,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
 
         self.probe_asks.retain(|ask| !gone(&ask.group));
         self.probe_answers.retain(|(_, of, _)| !gone(of));
+        self.probe_waiting.retain_keys(|(of, _)| !gone(of));
+        self.probe_waiting_of.retain(|(_, of), _| !gone(of));
         self.plan_refused.retain(|(_, of, _)| !gone(of));
         self.rsample_asked.retain(|(of, _, _)| !gone(of));
         self.rsamples.retain(|of, _| !gone(of));

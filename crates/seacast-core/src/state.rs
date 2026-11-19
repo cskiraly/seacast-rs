@@ -184,7 +184,7 @@ pub struct Peer {
     /// Chunks the peer is listed for across `offers`.
     pub listed_count: usize,
     // This heartbeat: offers taken, asks made of them, chunks served.
-    pub ihave_rpcs: usize,
+    pub ihave_frames: usize,
     pub ihave_asked: usize,
     pub(crate) served_now: usize,
     /// Groups the peer has ties on, and groups it has named.
@@ -203,7 +203,7 @@ impl Peer {
             join_sent: PreallocMap::with_capacity(max_types),
             relation_count: PreallocMap::with_capacity(max_types),
             listed_count: 0,
-            ihave_rpcs: 0,
+            ihave_frames: 0,
             ihave_asked: 0,
             served_now: 0,
             tie_count: 0,
@@ -218,7 +218,7 @@ impl Peer {
         self.join_sent.clear();
         self.relation_count.clear();
         self.listed_count = 0;
-        self.ihave_rpcs = 0;
+        self.ihave_frames = 0;
         self.ihave_asked = 0;
         self.served_now = 0;
         self.tie_count = 0;
@@ -249,6 +249,9 @@ pub enum PeerSet {
     Standing(GroupId, u32),
     /// The peers that claim a whole group.
     Claims(GroupId),
+    /// The askers whose probe of our claim waits for a chunk we have not
+    /// stored.
+    ProbeWaiting(GroupId, u32),
 }
 
 /// A candidate of a push, with what `choose_push` orders it by.
@@ -380,9 +383,6 @@ enum KeptBits {
 pub struct Group {
     /// The group's object type: set when the group is opened.
     pub t_of: Option<TypeId>,
-    /// The type a peer's holding, offer or ask gave the group before it was
-    /// opened.
-    pub named_t: Option<TypeId>,
     /// The group's index count and threshold, from its header.
     pub hdr: Option<Shape>,
     /// Whether the domain has authenticated the group: asked once, not once a
@@ -407,8 +407,16 @@ pub struct Group {
     pub waited: Option<bool>,
     pub probe: Option<u32>,
     pub probed: Option<PeerId>,
-    /// The probe's verdict, once: whether the claimant's own copy came.
-    pub probe_ok: Option<bool>,
+    /// The probe settled, once (`settle_probe`): `Some(Some(ok))` its verdict,
+    /// whether the claimant's own copy came; `Some(None)` no verdict, the
+    /// probe not written in time or the claimant gone.
+    pub probe_ok: Option<Option<bool>>,
+    /// Whether the probe's WANT was written: its promise and the verdict's
+    /// wait start there (`probe_sent`).
+    pub probe_sent: bool,
+    /// The duty's own time when the claim deferred it: a probe with no
+    /// verdict returns the duty to it (`duty_at`).
+    pub duty_at: Option<Timestamp>,
     pub rsample_step: Option<usize>,
     pub rsample_final: Option<bool>,
 }
@@ -763,6 +771,10 @@ const OFFER_AT: u8 = 1 << 3;
 const PARK: u8 = 1 << 4;
 /// As a claimant: the peer's probe of the group has been answered.
 const PROBE_SERVED: u8 = 1 << 5;
+/// An unsolicited chunk of the group has been written to the peer. Not kept
+/// alone: a pair that holds nothing else goes, and the next push is a first
+/// one again.
+const FIRST_WRITTEN: u8 = 1 << 6;
 
 #[derive(Debug, Clone, Copy)]
 struct Pair {
@@ -1062,6 +1074,20 @@ impl Pairs {
             .map(|(&key, _)| key)
     }
 
+    /// Whether an unsolicited chunk of the group has been written to the peer
+    /// ([`QueueEntry::first_of_group`](crate::QueueEntry)).
+    pub fn first_written(&self, key: &PairKey) -> bool {
+        self.recs.get(key).is_some_and(|pair| pair.flags & FIRST_WRITTEN != 0)
+    }
+
+    /// Records that an unsolicited chunk of the group was written to the peer,
+    /// where the table has room for the pair.
+    pub fn set_first_written(&mut self, key: PairKey) {
+        if let Some(pair) = self.rec(key) {
+            pair.flags |= FIRST_WRITTEN;
+        }
+    }
+
     pub fn park(&self, key: &PairKey) -> Option<Timestamp> {
         let pair = self.recs.get(key).filter(|pair| pair.flags & PARK != 0)?;
         Some(pair.park)
@@ -1170,7 +1196,7 @@ mod tests {
     #[test]
     fn wide_bitmaps_take_a_row() {
         let mut groups = Groups::with_capacity(4, 1);
-        let (a, b) = ([1; 32], [2; 32]);
+        let (a, b) = (GroupId::new(TypeId(0), [1; 32], 0), GroupId::new(TypeId(0), [2; 32], 0));
         let narrow = Bitmap::from_indices([0, 63]);
         let wide = Bitmap::from_indices([0, 64, 1023]);
 

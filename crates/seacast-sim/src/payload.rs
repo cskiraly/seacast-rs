@@ -81,28 +81,26 @@ where
 
     fn decode(
         &mut self,
-        t: TypeId,
         group: &GroupId,
         available: &[Chunk<B>],
         shape: &Shape,
         out_rebuilt: &mut PreallocVec<Chunk<B>>,
     ) -> Option<B> {
-        self.codec.decode(t, group, available, shape, out_rebuilt)
+        self.codec.decode(group, available, shape, out_rebuilt)
     }
 
     fn producible(&self, t: TypeId, shape: &Shape, held: &Bitmap) -> Bitmap {
         self.codec.producible(t, shape, held)
     }
 
-    fn wire_size(&self, chunk: &Chunk<B>) -> usize {
-        self.codec.wire_size(chunk)
+    fn wire_size(&self, chunk: &Chunk<B>, first_of_group: bool) -> usize {
+        self.codec.wire_size(chunk, first_of_group)
     }
 }
 
 impl<Host: PayloadHost, Pool, B> Domain for PayloadCatalog<Host, Pool, B> {
     fn authenticate(
         &mut self,
-        _t: TypeId,
         group: &GroupId,
         header_id: &Bytes32,
         context: &[u8],
@@ -110,20 +108,16 @@ impl<Host: PayloadHost, Pool, B> Domain for PayloadCatalog<Host, Pool, B> {
         self.host.authenticate(group, header_id, context)
     }
 
-    fn authenticable(&self, _t: TypeId, group: &GroupId) -> bool {
+    fn authenticable(&self, group: &GroupId) -> bool {
         self.host.authenticable(group)
     }
 
-    fn deadline(&self, _t: TypeId, group: &GroupId, context: &[u8]) -> Option<Timestamp> {
+    fn deadline(&self, group: &GroupId, context: &[u8]) -> Option<Timestamp> {
         self.host.deadline(group, context)
     }
 }
 
 impl<Host: PayloadHost, Pool, B> Policy for PayloadCatalog<Host, Pool, B> {
-    fn type_of_group(&self, _group: &GroupId) -> TypeId {
-        PAYLOAD
-    }
-
     fn params(&self, _t: TypeId) -> &TypeParams {
         &self.params
     }
