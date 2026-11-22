@@ -3,36 +3,36 @@
 
 use core::arch::x86_64::*;
 
-use super::{linear_tables, nibble_tables};
+use super::{Caches, Kernel, linear_tables, nibble_tables};
 
 /// A constant's products with the sixteen low nibbles, then with the sixteen
 /// high ones.
-pub(super) type Coeff = [u8; 32];
+type Coeff = [u8; 32];
 
 /// Bytes a vector holds: `row` handles whole vectors only.
 const WIDTH: usize = 32;
 
 #[inline]
-pub(super) fn coeff(c: u8) -> Coeff {
+fn coeff(c: u8) -> Coeff {
     nibble_tables(c)
 }
 
 /// The map linear over `GF(2)` that takes bit `j` of a byte to `images[j]`, in
 /// place of a product.
 #[inline]
-pub(super) fn linear(images: [u8; 8]) -> Coeff {
+fn linear(images: [u8; 8]) -> Coeff {
     linear_tables(images)
 }
 
 /// `dst[i] = sum_j coeffs[j] * srcs[j][at + i]` over the whole vectors of
 /// `dst`. Returns the bytes written, the caller's to finish.
-pub(super) fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -> usize {
+#[target_feature(enable = "avx2")]
+fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -> usize {
     let whole = dst.len() / WIDTH * WIDTH;
     assert_eq!(coeffs.len(), srcs.len());
     assert!(srcs.iter().all(|src| src.len() >= at + whole));
-    // SAFETY: the module is compiled only with `avx2` enabled. Every load is below
-    // `at + whole` of a source, checked above, or inside a 32-byte coefficient,
-    // and every store below `whole` of `dst`.
+    // SAFETY: every load is below `at + whole` of a source, checked above, or
+    // inside a 32-byte coefficient, and every store below `whole` of `dst`.
     unsafe {
         let nibble = _mm256_set1_epi8(0x0f);
         let mut off = 0;
@@ -79,7 +79,7 @@ pub(super) fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -
 /// `c * x`.
 ///
 /// # Safety
-/// Needs `avx2`, which the module is compiled only with.
+/// Needs `avx2`.
 #[inline(always)]
 unsafe fn mul(low: __m256i, high: __m256i, x: __m256i) -> __m256i {
     unsafe {
@@ -93,12 +93,12 @@ unsafe fn mul(low: __m256i, high: __m256i, x: __m256i) -> __m256i {
 
 /// `g ^= c * h`, then `h ^= g`, over the whole vectors of `g`: both in one pass
 /// over the two. Returns the bytes done, the caller's to finish.
-pub(super) fn butterfly(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+#[target_feature(enable = "avx2")]
+fn butterfly(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
     let whole = g.len() / WIDTH * WIDTH;
     assert!(h.len() >= whole);
-    // SAFETY: the module is compiled only with `avx2` enabled. Every load and
-    // store is below `whole` of `g` and `h`, checked above, or inside the 32-byte
-    // coefficient.
+    // SAFETY: every load and store is below `whole` of `g` and `h`, checked above,
+    // or inside the 32-byte coefficient.
     unsafe {
         let low = _mm256_broadcastsi128_si256(_mm_loadu_si128(c.as_ptr().cast()));
         let high = _mm256_broadcastsi128_si256(_mm_loadu_si128(c.as_ptr().add(16).cast()));
@@ -114,7 +114,8 @@ pub(super) fn butterfly(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
 }
 
 /// The reverse of [`butterfly`]: `h ^= g`, then `g ^= c * h`.
-pub(super) fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+#[target_feature(enable = "avx2")]
+fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
     let whole = g.len() / WIDTH * WIDTH;
     assert!(h.len() >= whole);
     // SAFETY: as in `butterfly`.
@@ -136,18 +137,12 @@ pub(super) fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
 /// constant is `(c[0] h0 + c[1] h1, c[2] h0 + c[3] h1)`, each `c` a [`linear`]
 /// map. Returns the
 /// bytes done of each plane.
-pub(super) fn butterfly2(
-    c: &[Coeff; 4],
-    g0: &mut [u8],
-    g1: &mut [u8],
-    h0: &mut [u8],
-    h1: &mut [u8],
-) -> usize {
+#[target_feature(enable = "avx2")]
+fn butterfly2(c: &[Coeff; 4], g0: &mut [u8], g1: &mut [u8], h0: &mut [u8], h1: &mut [u8]) -> usize {
     let whole = g0.len() / WIDTH * WIDTH;
     assert!(g1.len() >= whole && h0.len() >= whole && h1.len() >= whole);
-    // SAFETY: the module is compiled only with `avx2` enabled. Every load and
-    // store is below `whole` of a plane, checked above, or inside a 32-byte
-    // coefficient.
+    // SAFETY: every load and store is below `whole` of a plane, checked above, or
+    // inside a 32-byte coefficient.
     unsafe {
         let low = c.map(|c| _mm256_broadcastsi128_si256(_mm_loadu_si128(c.as_ptr().cast())));
         let high =
@@ -174,7 +169,8 @@ pub(super) fn butterfly2(
 }
 
 /// The reverse of [`butterfly2`].
-pub(super) fn butterfly2_back(
+#[target_feature(enable = "avx2")]
+fn butterfly2_back(
     c: &[Coeff; 4],
     g0: &mut [u8],
     g1: &mut [u8],
@@ -209,4 +205,85 @@ pub(super) fn butterfly2_back(
         }
     }
     whole
+}
+
+/// `h ^= g`.
+#[target_feature(enable = "avx2")]
+fn xor(g: &[u8], h: &mut [u8]) {
+    for (h, &g) in h.iter_mut().zip(g) {
+        *h ^= g;
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Avx2;
+
+static CACHES: Caches<Avx2> = Caches::new();
+
+// SAFETY, every call below: the kernel is used only where `supported` holds.
+impl Kernel for Avx2 {
+    type Coeff = Coeff;
+
+    const FFT_FROM_HALF_ROWS: usize = 3;
+    const GATHER: bool = true;
+
+    fn supported() -> bool {
+        is_x86_feature_detected!("avx2")
+    }
+
+    fn caches() -> &'static Caches<Self> {
+        &CACHES
+    }
+
+    #[inline]
+    fn coeff(c: u8) -> Coeff {
+        coeff(c)
+    }
+
+    #[inline]
+    fn linear(images: [u8; 8]) -> Coeff {
+        linear(images)
+    }
+
+    #[inline]
+    fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -> usize {
+        unsafe { row(coeffs, srcs, at, dst) }
+    }
+
+    #[inline]
+    fn xor(g: &[u8], h: &mut [u8]) {
+        unsafe { xor(g, h) }
+    }
+
+    #[inline]
+    fn butterfly(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+        unsafe { butterfly(c, g, h) }
+    }
+
+    #[inline]
+    fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+        unsafe { butterfly_back(c, g, h) }
+    }
+
+    #[inline]
+    fn butterfly2(
+        c: &[Coeff; 4],
+        g0: &mut [u8],
+        g1: &mut [u8],
+        h0: &mut [u8],
+        h1: &mut [u8],
+    ) -> usize {
+        unsafe { butterfly2(c, g0, g1, h0, h1) }
+    }
+
+    #[inline]
+    fn butterfly2_back(
+        c: &[Coeff; 4],
+        g0: &mut [u8],
+        g1: &mut [u8],
+        h0: &mut [u8],
+        h1: &mut [u8],
+    ) -> usize {
+        unsafe { butterfly2_back(c, g0, g1, h0, h1) }
+    }
 }

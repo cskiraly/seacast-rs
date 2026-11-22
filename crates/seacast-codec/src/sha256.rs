@@ -1,3 +1,7 @@
+#[cfg(target_arch = "aarch64")]
+use std::arch::is_aarch64_feature_detected;
+use std::sync::LazyLock;
+
 use seacast_core::Bytes32;
 
 pub(crate) const K: [u32; 64] = [
@@ -15,83 +19,94 @@ const H0: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
 ];
 
-#[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
+#[cfg(target_arch = "aarch64")]
 mod aarch64;
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "sha",
-    target_feature = "sse4.1",
-    target_feature = "ssse3"
-))]
+#[cfg(target_arch = "x86_64")]
+mod x16;
+#[cfg(target_arch = "x86_64")]
 mod x86;
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
-mod x16;
+/// Messages the sixteen-lane arm hashes at once.
+const LANES: usize = 16;
 
-#[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
-use aarch64::{STREAMS, compress, compress_many};
-#[cfg(not(any(
-    all(target_arch = "aarch64", target_feature = "sha2"),
-    all(
-        target_arch = "x86_64",
-        target_feature = "sha",
-        target_feature = "sse4.1",
-        target_feature = "ssse3"
-    )
-)))]
-use portable as compress;
+/// `sha256(prefix || data[lane])` for [`LANES`] `data` of one length.
+type Lanes = unsafe fn(u8, &[&[u8]; LANES]) -> [Bytes32; LANES];
 
-/// Messages [`compress_many`] is given at once, at most: one, where the
-/// compression is the portable one.
-#[cfg(not(any(
-    all(target_arch = "aarch64", target_feature = "sha2"),
-    all(
-        target_arch = "x86_64",
-        target_feature = "sha",
-        target_feature = "sse4.1",
-        target_feature = "ssse3"
-    )
-)))]
-const STREAMS: usize = 1;
+/// The compression the CPU has instructions for, chosen once.
+#[derive(Clone, Copy)]
+struct Arm {
+    compress: unsafe fn(&mut [u32; 8], &[u8]),
+    compress_streams: unsafe fn(&mut [[u32; 8]], &[&[u8]]),
+    /// Messages `compress_streams` gains from at once. It is not called for
+    /// one.
+    streams: usize,
+    lanes: Option<Lanes>,
+}
 
-/// [`compress`] for each of `states` over its own `blocks`.
-#[cfg(not(any(
-    all(target_arch = "aarch64", target_feature = "sha2"),
-    all(
-        target_arch = "x86_64",
-        target_feature = "sha",
-        target_feature = "sse4.1",
-        target_feature = "ssse3"
-    )
-)))]
-fn compress_many<const S: usize>(states: &mut [[u32; 8]; S], blocks: [&[u8]; S]) {
-    for (state, blocks) in states.iter_mut().zip(blocks) {
-        compress(state, blocks);
+const PORTABLE: Arm =
+    Arm { compress: portable, compress_streams: portable_streams, streams: 1, lanes: None };
+
+static ARM: LazyLock<Arm> = LazyLock::new(Arm::detect);
+
+impl Arm {
+    fn detect() -> Self {
+        #[allow(unused_mut)]
+        let mut arm = PORTABLE;
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("sha") &&
+                is_x86_feature_detected!("sse4.1") &&
+                is_x86_feature_detected!("ssse3")
+            {
+                arm.compress = x86::compress;
+                if is_x86_feature_detected!("avx") {
+                    arm.compress_streams = x86::compress_streams;
+                    arm.streams = x86::STREAMS;
+                }
+            }
+            if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+                arm.lanes = Some(x16::sha256_prefixed);
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        if is_aarch64_feature_detected!("sha2") {
+            arm.compress = aarch64::compress;
+            arm.compress_streams = aarch64::compress_streams;
+            arm.streams = aarch64::STREAMS;
+        }
+        arm
+    }
+
+    /// Absorb `blocks`, a whole number of 64-byte blocks, into `state`.
+    #[inline]
+    fn compress(&self, state: &mut [u32; 8], blocks: &[u8]) {
+        // SAFETY: `detect` keeps an arm only where the CPU has its instructions.
+        unsafe { (self.compress)(state, blocks) }
+    }
+
+    /// [`Self::compress`] for each of `states` over its own `blocks`, all the
+    /// same whole number of 64-byte blocks.
+    #[inline]
+    fn compress_streams(&self, states: &mut [[u32; 8]], blocks: &[&[u8]]) {
+        // SAFETY: as in `compress`.
+        unsafe { (self.compress_streams)(states, blocks) }
     }
 }
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "sha",
-    target_feature = "sse4.1",
-    target_feature = "ssse3"
-))]
-use x86::{STREAMS, compress, compress_many};
+
+#[inline]
+fn compress(state: &mut [u32; 8], blocks: &[u8]) {
+    ARM.compress(state, blocks)
+}
+
+fn portable_streams(states: &mut [[u32; 8]], blocks: &[&[u8]]) {
+    for (state, blocks) in states.iter_mut().zip(blocks) {
+        portable(state, blocks);
+    }
+}
 
 /// Absorb `blocks`, a whole number of 64-byte blocks, into `state`. The
-/// reference for the hardware arms, and the arm of a target with no SHA
+/// reference for the hardware arms, and the arm of a CPU with no SHA
 /// instructions.
-#[cfg_attr(
-    any(
-        all(target_arch = "aarch64", target_feature = "sha2"),
-        all(
-            target_arch = "x86_64",
-            target_feature = "sha",
-            target_feature = "sse4.1",
-            target_feature = "ssse3"
-        )
-    ),
-    allow(dead_code)
-)]
 pub(crate) fn portable(state: &mut [u32; 8], blocks: &[u8]) {
     let (blocks, rest) = blocks.as_chunks::<64>();
     debug_assert!(rest.is_empty());
@@ -159,39 +174,43 @@ pub(crate) fn sha256_pair(prefix: u8, left: &Bytes32, right: &Bytes32) -> Bytes3
 /// segment for one, on their own. What is left of the inputs goes a few at a
 /// time where the target has that.
 pub(crate) fn sha256_prefixed_many<T: AsRef<[u8]>>(prefix: u8, inputs: &[T], out: &mut [Bytes32]) {
+    prefixed_many(&ARM, prefix, inputs, out)
+}
+
+fn prefixed_many<T: AsRef<[u8]>>(arm: &Arm, prefix: u8, inputs: &[T], out: &mut [Bytes32]) {
     assert_eq!(inputs.len(), out.len());
-    #[allow(unused_mut)]
     let mut at = 0;
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
-    while at + x16::LANES <= inputs.len() {
+    while at + LANES <= inputs.len() {
+        let Some(lanes) = arm.lanes else { break };
         let len = |lane: usize| inputs[at + lane].as_ref().len();
         // The length two of the first three share, and a lane that has it to
         // stand in for one that has not.
         let like = if len(0) == len(1) || len(0) == len(2) { 0 } else { 1 };
-        let batch: [&[u8]; x16::LANES] = std::array::from_fn(|lane| {
+        let batch: [&[u8]; LANES] = std::array::from_fn(|lane| {
             inputs[at + if len(lane) == len(like) { lane } else { like }].as_ref()
         });
-        let digests = x16::sha256_prefixed(prefix, &batch);
+        // SAFETY: `Arm::detect` keeps `lanes` only where the CPU has its instructions.
+        let digests = unsafe { lanes(prefix, &batch) };
         for (lane, digest) in digests.iter().enumerate() {
             out[at + lane] = match len(lane) == len(like) {
                 true => *digest,
                 false => one(prefix, inputs[at + lane].as_ref()),
             };
         }
-        at += x16::LANES;
+        at += LANES;
     }
     // What does not fill such a batch: runs of one length, a few at a time.
     while at < inputs.len() {
         let len = inputs[at].as_ref().len();
-        let run = (inputs[at..].iter().take(STREAMS))
+        let run = (inputs[at..].iter().take(arm.streams))
             .take_while(|input| input.as_ref().len() == len)
             .count();
         let input = |s: usize| inputs[at + s].as_ref();
         let out = &mut out[at..at + run];
         match run {
-            4 => fill(out, &prefixed::<4>(prefix, std::array::from_fn(input))),
-            3 => fill(out, &prefixed::<3>(prefix, std::array::from_fn(input))),
-            2 => fill(out, &prefixed::<2>(prefix, std::array::from_fn(input))),
+            4 => fill(out, &prefixed::<4>(arm, prefix, std::array::from_fn(input))),
+            3 => fill(out, &prefixed::<3>(arm, prefix, std::array::from_fn(input))),
+            2 => fill(out, &prefixed::<2>(arm, prefix, std::array::from_fn(input))),
             _ => out[0] = one(prefix, input(0)),
         }
         at += run;
@@ -204,7 +223,7 @@ pub(crate) fn sha256_prefixed_many<T: AsRef<[u8]>>(prefix: u8, inputs: &[T], out
 /// The prefix shifts the data by a byte against the blocks: the first block and
 /// what follows the last whole one are staged, with the padding, and the blocks
 /// between are read where they lie.
-fn prefixed<const S: usize>(prefix: u8, data: [&[u8]; S]) -> [[u32; 8]; S] {
+fn prefixed<const S: usize>(arm: &Arm, prefix: u8, data: [&[u8]; S]) -> [[u32; 8]; S] {
     let len = data[0].len();
     assert!(data.iter().all(|d| d.len() == len));
     // Ends the message in `staged`, which holds its last `filled` bytes: the
@@ -226,19 +245,19 @@ fn prefixed<const S: usize>(prefix: u8, data: [&[u8]; S]) -> [[u32; 8]; S] {
             blocks = finish(staged, 1 + len);
         }
     }
-    compress_many(&mut states, core::array::from_fn(|s| &staged[s][..64 * blocks]));
+    arm.compress_streams(&mut states, &staged.each_ref().map(|staged| &staged[..64 * blocks]));
     if len < 63 {
         return states;
     }
     let whole = (len - 63) / 64 * 64;
-    compress_many(&mut states, core::array::from_fn(|s| &data[s][63..63 + whole]));
+    arm.compress_streams(&mut states, &data.map(|data| &data[63..63 + whole]));
     let rest = len - 63 - whole;
     staged = [[0u8; 128]; S];
     for (staged, data) in staged.iter_mut().zip(data) {
         staged[..rest].copy_from_slice(&data[63 + whole..]);
         blocks = finish(staged, rest);
     }
-    compress_many(&mut states, core::array::from_fn(|s| &staged[s][..64 * blocks]));
+    arm.compress_streams(&mut states, &staged.each_ref().map(|staged| &staged[..64 * blocks]));
     states
 }
 
@@ -329,7 +348,8 @@ mod tests {
 
     /// Batches of equal lengths, an odd input in the middle of one and at the
     /// start of another, and a tail, short and long enough to be a batch,
-    /// against one message at a time.
+    /// against one message at a time: the arm in use, with and without its
+    /// lanes, and the portable one.
     #[test]
     fn test_sha256_prefixed_many_matches_one_at_a_time() {
         let byte = |i: usize| (i.wrapping_mul(2654435761) >> 13) as u8;
@@ -339,12 +359,14 @@ mod tests {
                     (0..count).map(|i| (0..len).map(|j| byte(i * 1009 + j)).collect()).collect();
                 inputs[20].push(7);
                 inputs[32].push(9);
-                let mut out = vec![[0u8; 32]; inputs.len()];
-                sha256_prefixed_many(0x00, &inputs, &mut out);
-                for (input, digest) in inputs.iter().zip(&out) {
-                    let mut message = vec![0x00];
-                    message.extend_from_slice(input);
-                    assert_eq!(*digest, sha256(&message), "length {len}, {count} inputs");
+                for arm in [PORTABLE, *ARM, Arm { lanes: None, ..*ARM }] {
+                    let mut out = vec![[0u8; 32]; inputs.len()];
+                    prefixed_many(&arm, 0x00, &inputs, &mut out);
+                    for (input, digest) in inputs.iter().zip(&out) {
+                        let mut message = vec![0x00];
+                        message.extend_from_slice(input);
+                        assert_eq!(*digest, sha256(&message), "length {len}, {count} inputs");
+                    }
                 }
             }
         }

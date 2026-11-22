@@ -5,10 +5,10 @@
 
 use core::arch::x86_64::*;
 
-use super::TABLES;
+use super::{Caches, Kernel, TABLES};
 
 /// The bit matrix of a multiplication, as `GF2P8AFFINEQB` reads it.
-pub(super) type Coeff = u64;
+type Coeff = u64;
 
 /// Bytes a vector holds: `row` handles whole vectors only.
 const WIDTH: usize = 64;
@@ -42,14 +42,14 @@ static MATRIX: [u64; 256] = {
 };
 
 #[inline]
-pub(super) fn coeff(c: u8) -> Coeff {
+fn coeff(c: u8) -> Coeff {
     MATRIX[c as usize]
 }
 
 /// The map linear over `GF(2)` that takes bit `j` of a byte to `images[j]`, in
 /// place of a product.
 #[inline]
-pub(super) fn linear(images: [u8; 8]) -> Coeff {
+fn linear(images: [u8; 8]) -> Coeff {
     // Bit `i` of byte `j` goes to bit `j` of byte `7 - i`: the transpose of the 8
     // by 8 bits, its bytes reversed.
     let mut x = u64::from_le_bytes(images);
@@ -65,13 +65,13 @@ pub(super) fn linear(images: [u8; 8]) -> Coeff {
 /// `dst[i] = sum_j coeffs[j] * srcs[j][at + i]` over the whole vectors of
 /// `dst`. Returns the bytes written, the caller's to finish.
 #[inline]
-pub(super) fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -> usize {
+#[target_feature(enable = "gfni,avx512f")]
+fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -> usize {
     let whole = dst.len() / WIDTH * WIDTH;
     assert_eq!(coeffs.len(), srcs.len());
     assert!(srcs.iter().all(|src| src.len() >= at + whole));
-    // SAFETY: the module is compiled only with `gfni` and `avx512f` enabled. Every
-    // load is below `at + whole` of a source, checked above, and every store
-    // below `whole` of `dst`.
+    // SAFETY: every load is below `at + whole` of a source, checked above, and
+    // every store below `whole` of `dst`.
     unsafe {
         let mut off = 0;
         // Four vectors a pass: four independent sums, and each source read in one run.
@@ -108,11 +108,11 @@ pub(super) fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -
 
 /// `g ^= c * h`, then `h ^= g`, over the whole vectors of `g`: both in one pass
 /// over the two. Returns the bytes done, the caller's to finish.
-pub(super) fn butterfly(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+#[target_feature(enable = "gfni,avx512f")]
+fn butterfly(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
     let whole = g.len() / WIDTH * WIDTH;
     assert!(h.len() >= whole);
-    // SAFETY: the module is compiled only with `gfni` and `avx512f` enabled. Every
-    // load and store is below `whole` of `g` and `h`, checked above.
+    // SAFETY: every load and store is below `whole` of `g` and `h`, checked above.
     unsafe {
         let m = _mm512_set1_epi64(*c as i64);
         for off in (0..whole).step_by(WIDTH) {
@@ -130,7 +130,8 @@ pub(super) fn butterfly(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
 }
 
 /// The reverse of [`butterfly`]: `h ^= g`, then `g ^= c * h`.
-pub(super) fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+#[target_feature(enable = "gfni,avx512f")]
+fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
     let whole = g.len() / WIDTH * WIDTH;
     assert!(h.len() >= whole);
     // SAFETY: as in `butterfly`.
@@ -152,17 +153,11 @@ pub(super) fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
 /// constant is `(c[0] h0 + c[1] h1, c[2] h0 + c[3] h1)`, each `c` a [`linear`]
 /// map. Returns the
 /// bytes done of each plane.
-pub(super) fn butterfly2(
-    c: &[Coeff; 4],
-    g0: &mut [u8],
-    g1: &mut [u8],
-    h0: &mut [u8],
-    h1: &mut [u8],
-) -> usize {
+#[target_feature(enable = "gfni,avx512f")]
+fn butterfly2(c: &[Coeff; 4], g0: &mut [u8], g1: &mut [u8], h0: &mut [u8], h1: &mut [u8]) -> usize {
     let whole = g0.len() / WIDTH * WIDTH;
     assert!(g1.len() >= whole && h0.len() >= whole && h1.len() >= whole);
-    // SAFETY: the module is compiled only with `gfni` and `avx512f` enabled. Every
-    // load and store is below `whole` of a plane, checked above.
+    // SAFETY: every load and store is below `whole` of a plane, checked above.
     unsafe {
         let m = c.map(|c| _mm512_set1_epi64(c as i64));
         for off in (0..whole).step_by(WIDTH) {
@@ -189,7 +184,8 @@ pub(super) fn butterfly2(
 }
 
 /// The reverse of [`butterfly2`].
-pub(super) fn butterfly2_back(
+#[target_feature(enable = "gfni,avx512f")]
+fn butterfly2_back(
     c: &[Coeff; 4],
     g0: &mut [u8],
     g1: &mut [u8],
@@ -232,7 +228,8 @@ pub(super) fn butterfly2_back(
 /// for all the rows. Returns the bytes written of each.
 ///
 /// `G` is a constant so that the sums stay in registers: up to eight rows.
-pub(super) fn rows<const G: usize>(
+#[target_feature(enable = "gfni,avx512f")]
+fn rows<const G: usize>(
     coeffs: &[Coeff],
     srcs: &[&[u8]],
     from: usize,
@@ -244,10 +241,9 @@ pub(super) fn rows<const G: usize>(
     assert!(dsts.len() == G && coeffs.len() == G * cols);
     assert!(srcs.iter().all(|src| src.len() >= from + whole));
     assert!(dsts.iter().all(|dst| dst.len() >= at + whole));
-    // SAFETY: the module is compiled only with `gfni` and `avx512f` enabled. Every
-    // load is below `from + whole` of a source and every store below `at +
-    // whole` of a destination, checked above; `coeffs` holds an entry per row and
-    // source.
+    // SAFETY: every load is below `from + whole` of a source and every store
+    // below `at + whole` of a destination, checked above; `coeffs` holds an entry
+    // per row and source.
     unsafe {
         for off in (0..whole).step_by(2 * WIDTH) {
             let mut acc = [[_mm512_setzero_si512(); 2]; G];
@@ -269,4 +265,97 @@ pub(super) fn rows<const G: usize>(
         }
     }
     whole
+}
+
+/// `h ^= g`.
+#[target_feature(enable = "gfni,avx512f")]
+fn xor(g: &[u8], h: &mut [u8]) {
+    for (h, &g) in h.iter_mut().zip(g) {
+        *h ^= g;
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Gfni;
+
+static CACHES: Caches<Gfni> = Caches::new();
+
+// SAFETY, every call below: the kernel is used only where `supported` holds.
+impl Kernel for Gfni {
+    type Coeff = Coeff;
+
+    const FFT_FROM_HALF_ROWS: usize = 8;
+    const GATHER: bool = false;
+
+    fn supported() -> bool {
+        is_x86_feature_detected!("gfni") && is_x86_feature_detected!("avx512f")
+    }
+
+    fn caches() -> &'static Caches<Self> {
+        &CACHES
+    }
+
+    #[inline]
+    fn coeff(c: u8) -> Coeff {
+        coeff(c)
+    }
+
+    #[inline]
+    fn linear(images: [u8; 8]) -> Coeff {
+        linear(images)
+    }
+
+    #[inline]
+    fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -> usize {
+        unsafe { row(coeffs, srcs, at, dst) }
+    }
+
+    #[inline]
+    fn rows<const G: usize>(
+        coeffs: &[Coeff],
+        srcs: &[&[u8]],
+        from: usize,
+        at: usize,
+        len: usize,
+        dsts: &mut [&mut [u8]],
+    ) -> usize {
+        unsafe { rows::<G>(coeffs, srcs, from, at, len, dsts) }
+    }
+
+    #[inline]
+    fn xor(g: &[u8], h: &mut [u8]) {
+        unsafe { xor(g, h) }
+    }
+
+    #[inline]
+    fn butterfly(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+        unsafe { butterfly(c, g, h) }
+    }
+
+    #[inline]
+    fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+        unsafe { butterfly_back(c, g, h) }
+    }
+
+    #[inline]
+    fn butterfly2(
+        c: &[Coeff; 4],
+        g0: &mut [u8],
+        g1: &mut [u8],
+        h0: &mut [u8],
+        h1: &mut [u8],
+    ) -> usize {
+        unsafe { butterfly2(c, g0, g1, h0, h1) }
+    }
+
+    #[inline]
+    fn butterfly2_back(
+        c: &[Coeff; 4],
+        g0: &mut [u8],
+        g1: &mut [u8],
+        h0: &mut [u8],
+        h1: &mut [u8],
+    ) -> usize {
+        unsafe { butterfly2_back(c, g0, g1, h0, h1) }
+    }
 }

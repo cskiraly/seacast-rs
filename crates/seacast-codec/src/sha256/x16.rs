@@ -9,9 +9,7 @@ use core::arch::x86_64::*;
 
 use seacast_core::Bytes32;
 
-use super::{H0, K};
-
-pub(crate) const LANES: usize = 16;
+use super::{H0, K, LANES};
 
 /// Block `b` of `prefix || data`, padded as SHA-256 pads it.
 fn block(prefix: u8, data: &[u8], b: usize, blocks: usize, out: &mut [u8; 64]) {
@@ -36,6 +34,7 @@ fn block(prefix: u8, data: &[u8], b: usize, blocks: usize, out: &mut [u8; 64]) {
 }
 
 /// `sha256(prefix || data[lane])` for sixteen `data` of one length.
+#[target_feature(enable = "avx512f,avx512bw")]
 pub(crate) fn sha256_prefixed(prefix: u8, data: &[&[u8]; LANES]) -> [Bytes32; LANES] {
     let len = data[0].len();
     assert!(data.iter().all(|d| d.len() == len));
@@ -44,8 +43,7 @@ pub(crate) fn sha256_prefixed(prefix: u8, data: &[&[u8]; LANES]) -> [Bytes32; LA
     // to index.
     let mut staged = [[0u8; 64]; LANES];
     let mut words = [[0u32; LANES]; 8];
-    // SAFETY: the module is compiled only with `avx512f` and `avx512bw` enabled.
-    // The gathers index `staged`, at most its last word; the stores fill
+    // SAFETY: the gathers index `staged`, at most its last word; the stores fill
     // `words`, a row each.
     unsafe {
         let xor3 = |a, b, c| _mm512_ternarylogic_epi32::<0x96>(a, b, c);

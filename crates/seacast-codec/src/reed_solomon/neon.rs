@@ -3,30 +3,30 @@
 
 use core::arch::aarch64::*;
 
-use super::{linear_tables, nibble_tables};
+use super::{Caches, Kernel, linear_tables, nibble_tables};
 
 /// A constant's products with the sixteen low nibbles, then with the sixteen
 /// high ones.
-pub(super) type Coeff = [u8; 32];
+type Coeff = [u8; 32];
 
 /// Bytes a vector holds: `row` handles whole vectors only.
 const WIDTH: usize = 16;
 
 #[inline]
-pub(super) fn coeff(c: u8) -> Coeff {
+fn coeff(c: u8) -> Coeff {
     nibble_tables(c)
 }
 
 /// The map linear over `GF(2)` that takes bit `j` of a byte to `images[j]`, in
 /// place of a product.
 #[inline]
-pub(super) fn linear(images: [u8; 8]) -> Coeff {
+fn linear(images: [u8; 8]) -> Coeff {
     linear_tables(images)
 }
 
 /// `dst[i] = sum_j coeffs[j] * srcs[j][at + i]` over the whole vectors of
 /// `dst`. Returns the bytes written, the caller's to finish.
-pub(super) fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -> usize {
+fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -> usize {
     let whole = dst.len() / WIDTH * WIDTH;
     assert_eq!(coeffs.len(), srcs.len());
     assert!(srcs.iter().all(|src| src.len() >= at + whole));
@@ -103,7 +103,7 @@ unsafe fn mul_add(low: uint8x16_t, high: uint8x16_t, x: uint8x16_t, sum: uint8x1
 /// each.
 ///
 /// `G` is a constant so that the sums stay in registers: up to eight rows.
-pub(super) fn rows<const G: usize>(
+fn rows<const G: usize>(
     coeffs: &[Coeff],
     srcs: &[&[u8]],
     from: usize,
@@ -147,7 +147,7 @@ pub(super) fn rows<const G: usize>(
 
 /// `g ^= c * h`, then `h ^= g`, over the whole vectors of `g`: both in one pass
 /// over the two. Returns the bytes done, the caller's to finish.
-pub(super) fn butterfly(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+fn butterfly(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
     let whole = g.len() / WIDTH * WIDTH;
     assert!(h.len() >= whole);
     // SAFETY: NEON is baseline on aarch64. Every load and store is below `whole`
@@ -166,7 +166,7 @@ pub(super) fn butterfly(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
 }
 
 /// The reverse of [`butterfly`]: `h ^= g`, then `g ^= c * h`.
-pub(super) fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
     let whole = g.len() / WIDTH * WIDTH;
     assert!(h.len() >= whole);
     // SAFETY: as in `butterfly`.
@@ -187,13 +187,7 @@ pub(super) fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
 /// constant is `(c[0] h0 + c[1] h1, c[2] h0 + c[3] h1)`, each `c` a [`linear`]
 /// map. Returns the
 /// bytes done of each plane.
-pub(super) fn butterfly2(
-    c: &[Coeff; 4],
-    g0: &mut [u8],
-    g1: &mut [u8],
-    h0: &mut [u8],
-    h1: &mut [u8],
-) -> usize {
+fn butterfly2(c: &[Coeff; 4], g0: &mut [u8], g1: &mut [u8], h0: &mut [u8], h1: &mut [u8]) -> usize {
     let whole = g0.len() / WIDTH * WIDTH;
     assert!(g1.len() >= whole && h0.len() >= whole && h1.len() >= whole);
     // SAFETY: NEON is baseline on aarch64. Every load and store is below `whole`
@@ -217,7 +211,7 @@ pub(super) fn butterfly2(
 }
 
 /// The reverse of [`butterfly2`].
-pub(super) fn butterfly2_back(
+fn butterfly2_back(
     c: &[Coeff; 4],
     g0: &mut [u8],
     g1: &mut [u8],
@@ -242,4 +236,95 @@ pub(super) fn butterfly2_back(
         }
     }
     whole
+}
+
+/// `h ^= g`.
+fn xor(g: &[u8], h: &mut [u8]) {
+    for (h, &g) in h.iter_mut().zip(g) {
+        *h ^= g;
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct Neon;
+
+static CACHES: Caches<Neon> = Caches::new();
+
+impl Kernel for Neon {
+    type Coeff = Coeff;
+
+    const FFT_FROM_HALF_ROWS: usize = 4;
+    const GATHER: bool = true;
+
+    fn supported() -> bool {
+        true
+    }
+
+    fn caches() -> &'static Caches<Self> {
+        &CACHES
+    }
+
+    #[inline]
+    fn coeff(c: u8) -> Coeff {
+        coeff(c)
+    }
+
+    #[inline]
+    fn linear(images: [u8; 8]) -> Coeff {
+        linear(images)
+    }
+
+    #[inline]
+    fn row(coeffs: &[Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -> usize {
+        row(coeffs, srcs, at, dst)
+    }
+
+    #[inline]
+    fn rows<const G: usize>(
+        coeffs: &[Coeff],
+        srcs: &[&[u8]],
+        from: usize,
+        at: usize,
+        len: usize,
+        dsts: &mut [&mut [u8]],
+    ) -> usize {
+        rows::<G>(coeffs, srcs, from, at, len, dsts)
+    }
+
+    #[inline]
+    fn xor(g: &[u8], h: &mut [u8]) {
+        xor(g, h)
+    }
+
+    #[inline]
+    fn butterfly(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+        butterfly(c, g, h)
+    }
+
+    #[inline]
+    fn butterfly_back(c: &Coeff, g: &mut [u8], h: &mut [u8]) -> usize {
+        butterfly_back(c, g, h)
+    }
+
+    #[inline]
+    fn butterfly2(
+        c: &[Coeff; 4],
+        g0: &mut [u8],
+        g1: &mut [u8],
+        h0: &mut [u8],
+        h1: &mut [u8],
+    ) -> usize {
+        butterfly2(c, g0, g1, h0, h1)
+    }
+
+    #[inline]
+    fn butterfly2_back(
+        c: &[Coeff; 4],
+        g0: &mut [u8],
+        g1: &mut [u8],
+        h0: &mut [u8],
+        h1: &mut [u8],
+    ) -> usize {
+        butterfly2_back(c, g0, g1, h0, h1)
+    }
 }

@@ -11,7 +11,7 @@
 //! and that plus `h` on the high one. The data are the values on `V_K`'s
 //! points `0..K`, the parity the values on `K ^ (0..K)`.
 
-use super::{MUL, STRIP, TABLES, kernel};
+use super::{Kernel, MUL, STRIP, TABLES};
 
 /// `SKEW[i][x]` is `W_i(x)`.
 static SKEW: [[u8; 256]; 7] = {
@@ -41,22 +41,13 @@ static SKEW: [[u8; 256]; 7] = {
     out
 };
 
-/// `h ^= g`: either butterfly with a zero twiddle, which is where `beta` is in
-/// `V_(k-1)`, the leftmost blocks of the data's transform.
-#[inline]
-fn xor(g: &[u8], h: &mut [u8]) {
-    for (h, &g) in h.iter_mut().zip(g) {
-        *h ^= g;
-    }
-}
-
 /// `g ^= w * h`, then `h ^= g`.
 #[inline]
-fn butterfly(w: u8, g: &mut [u8], h: &mut [u8]) {
+fn butterfly<K: Kernel>(w: u8, g: &mut [u8], h: &mut [u8]) {
     if w == 0 {
-        return xor(g, h);
+        return K::xor(g, h);
     }
-    let done = kernel::butterfly(&kernel::coeff(w), g, h);
+    let done = K::butterfly(&K::coeff(w), g, h);
     let products = &MUL[w as usize];
     for (g, h) in g[done..].iter_mut().zip(&mut h[done..]) {
         *g ^= products[*h as usize];
@@ -66,11 +57,11 @@ fn butterfly(w: u8, g: &mut [u8], h: &mut [u8]) {
 
 /// The reverse of [`butterfly`]: `h ^= g`, then `g ^= w * h`.
 #[inline]
-fn butterfly_back(w: u8, g: &mut [u8], h: &mut [u8]) {
+fn butterfly_back<K: Kernel>(w: u8, g: &mut [u8], h: &mut [u8]) {
     if w == 0 {
-        return xor(g, h);
+        return K::xor(g, h);
     }
-    let done = kernel::butterfly_back(&kernel::coeff(w), g, h);
+    let done = K::butterfly_back(&K::coeff(w), g, h);
     let products = &MUL[w as usize];
     for (g, h) in g[done..].iter_mut().zip(&mut h[done..]) {
         *h ^= *g;
@@ -80,22 +71,22 @@ fn butterfly_back(w: u8, g: &mut [u8], h: &mut [u8]) {
 
 /// The values on `beta ^ V_k`, `block`'s `2^k` slots of `STRIP` bytes, to the
 /// coefficients; `len` bytes of each slot are in use.
-fn inverse(block: &mut [u8], len: usize, k: u32, beta: usize) {
+fn inverse<K: Kernel>(block: &mut [u8], len: usize, k: u32, beta: usize) {
     if k == 0 {
         return;
     }
     let half = 1usize << (k - 1);
     let (low, high) = block.split_at_mut(half * STRIP);
-    inverse(low, len, k - 1, beta);
-    inverse(high, len, k - 1, beta ^ half);
+    inverse::<K>(low, len, k - 1, beta);
+    inverse::<K>(high, len, k - 1, beta ^ half);
     let w = SKEW[k as usize - 1][beta];
     for (g, h) in low.as_chunks_mut::<STRIP>().0.iter_mut().zip(high.as_chunks_mut::<STRIP>().0) {
-        butterfly_back(w, &mut g[..len], &mut h[..len]);
+        butterfly_back::<K>(w, &mut g[..len], &mut h[..len]);
     }
 }
 
 /// The reverse of [`inverse`].
-fn forward(block: &mut [u8], len: usize, k: u32, beta: usize) {
+fn forward<K: Kernel>(block: &mut [u8], len: usize, k: u32, beta: usize) {
     if k == 0 {
         return;
     }
@@ -103,16 +94,16 @@ fn forward(block: &mut [u8], len: usize, k: u32, beta: usize) {
     let (low, high) = block.split_at_mut(half * STRIP);
     let w = SKEW[k as usize - 1][beta];
     for (g, h) in low.as_chunks_mut::<STRIP>().0.iter_mut().zip(high.as_chunks_mut::<STRIP>().0) {
-        butterfly(w, &mut g[..len], &mut h[..len]);
+        butterfly::<K>(w, &mut g[..len], &mut h[..len]);
     }
-    forward(low, len, k - 1, beta);
-    forward(high, len, k - 1, beta ^ half);
+    forward::<K>(low, len, k - 1, beta);
+    forward::<K>(high, len, k - 1, beta ^ half);
 }
 
 /// Writes the chunks `rows` of the `(k, 2k)` code of the data segments `srcs`,
 /// `k = srcs.len()` a power of two up to 128, into `dsts`. Every row is in
 /// `k..2k` and every segment the same length.
-pub(super) fn parity(srcs: &[&[u8]], rows: &[usize], dsts: &mut [&mut [u8]]) {
+pub(super) fn parity<K: Kernel>(srcs: &[&[u8]], rows: &[usize], dsts: &mut [&mut [u8]]) {
     let k = srcs.len();
     assert!(k.is_power_of_two() && k <= 128 && rows.len() == dsts.len());
     let size = srcs[0].len();
@@ -125,8 +116,8 @@ pub(super) fn parity(srcs: &[&[u8]], rows: &[usize], dsts: &mut [&mut [u8]]) {
         for (slot, src) in work.as_chunks_mut::<STRIP>().0.iter_mut().zip(srcs) {
             slot[..len].copy_from_slice(&src[at..at + len]);
         }
-        inverse(&mut work, len, bits, 0);
-        forward(&mut work, len, bits, k);
+        inverse::<K>(&mut work, len, bits, 0);
+        forward::<K>(&mut work, len, bits, k);
         for (&r, dst) in rows.iter().zip(dsts.iter_mut()) {
             dst[at..at + len].copy_from_slice(&work[(r - k) * STRIP..][..len]);
         }
