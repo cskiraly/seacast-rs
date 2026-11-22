@@ -5,11 +5,11 @@ use core::arch::x86_64::*;
 use super::K;
 
 /// Absorb `blocks`, a whole number of 64-byte blocks, into `state`.
+#[target_feature(enable = "sha,sse4.1,ssse3")]
 pub(crate) fn compress(state: &mut [u32; 8], blocks: &[u8]) {
     let (blocks, rest) = blocks.as_chunks::<64>();
     debug_assert!(rest.is_empty());
-    // SAFETY: the module is compiled only with `sha`, `sse4.1` and `ssse3` enabled,
-    // and every load and store is unaligned, inside `state`, `K` or a 64-byte
+    // SAFETY: every load and store is unaligned, inside `state`, `K` or a 64-byte
     // block.
     unsafe {
         let swap = _mm_set_epi64x(0x0c0d0e0f08090a0b, 0x0405060700010203);
@@ -29,13 +29,15 @@ pub(crate) fn compress(state: &mut [u32; 8], blocks: &[u8]) {
             for i in 0..16 {
                 // Four rounds per step: the schedule's next four words from the last sixteen.
                 if i >= 4 {
-                    let tail = _mm_alignr_epi8(m[(i + 3) % 4], m[(i + 2) % 4], 4);
-                    let head = _mm_add_epi32(_mm_sha256msg1_epu32(m[i % 4], m[(i + 1) % 4]), tail);
-                    m[i % 4] = _mm_sha256msg2_epu32(head, m[(i + 3) % 4]);
+                    let tail = _mm_alignr_epi8(m[3], m[2], 4);
+                    let head = _mm_add_epi32(_mm_sha256msg1_epu32(m[0], m[1]), tail);
+                    m[0] = _mm_sha256msg2_epu32(head, m[3]);
                 }
-                let wk = _mm_add_epi32(m[i % 4], _mm_loadu_si128(K.as_ptr().add(4 * i).cast()));
+                let wk = _mm_add_epi32(m[0], _mm_loadu_si128(K.as_ptr().add(4 * i).cast()));
                 cdgh = _mm_sha256rnds2_epu32(cdgh, abef, wk);
                 abef = _mm_sha256rnds2_epu32(abef, cdgh, _mm_shuffle_epi32(wk, 0x0E));
+                // The oldest four words first: by position, so that they stay in registers.
+                m = [m[1], m[2], m[3], m[0]];
             }
             abef = _mm_add_epi32(abef, abef_in);
             cdgh = _mm_add_epi32(cdgh, cdgh_in);
@@ -52,7 +54,11 @@ pub(crate) fn compress(state: &mut [u32; 8], blocks: &[u8]) {
 /// same whole number of 64-byte blocks. The rounds of one message wait on each
 /// other and those of different messages do not, so several go through in the
 /// time of one.
-pub(crate) fn compress_many<const S: usize>(states: &mut [[u32; 8]; S], blocks: [&[u8]; S]) {
+///
+/// With `avx` for its three-operand encoding, which spares the copies that more
+/// states than registers cost.
+#[target_feature(enable = "sha,sse4.1,ssse3,avx")]
+fn compress_many<const S: usize>(states: &mut [[u32; 8]; S], blocks: [&[u8]; S]) {
     let count = blocks[0].len() / 64;
     assert!(blocks.iter().all(|b| b.len() == 64 * count));
     // SAFETY: as in `compress`; every block read is inside its slice, checked
@@ -107,3 +113,20 @@ pub(crate) fn compress_many<const S: usize>(states: &mut [[u32; 8]; S], blocks: 
 
 /// Messages [`compress_many`] is given at once, at most: more gain nothing.
 pub(crate) const STREAMS: usize = 4;
+
+/// [`compress`] for each of `states` over its own `blocks`: together, up to
+/// [`STREAMS`] of them.
+#[target_feature(enable = "sha,sse4.1,ssse3,avx")]
+pub(crate) fn compress_streams(states: &mut [[u32; 8]], blocks: &[&[u8]]) {
+    assert_eq!(states.len(), blocks.len());
+    match states.len() {
+        4 => compress_many::<4>(states.try_into().unwrap(), blocks.try_into().unwrap()),
+        3 => compress_many::<3>(states.try_into().unwrap(), blocks.try_into().unwrap()),
+        2 => compress_many::<2>(states.try_into().unwrap(), blocks.try_into().unwrap()),
+        _ => {
+            for (state, blocks) in states.iter_mut().zip(blocks) {
+                compress(state, blocks);
+            }
+        }
+    }
+}

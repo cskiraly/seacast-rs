@@ -4,51 +4,167 @@
 //!
 //! Encoding and decoding are both "each output segment is a fixed combination
 //! of input segments" ([`combine`]). The combination of one stretch of one
-//! output is the kernel, chosen per target: [`gfni`], [`avx2`], [`neon`] or
-//! [`portable`]. The parity of a `(K, 2K)` code with `K` a power of two has a
-//! second path, [`fft`], which gives the same bytes.
+//! output is the [`Kernel`], chosen once from what the CPU has: [`gfni`],
+//! [`avx2`], [`neon`] or [`portable`]. The parity of a `(K, 2K)` code with `K`
+//! a power of two has a second path, [`fft`], which gives the same bytes.
 //!
 //! A code of more than [`MAX_NARROW_CHUNKS`] chunks is over `GF(2^16)`
 //! ([`gf16`]), with segments of whole blocks of [`WIDE_BLOCK`] bytes: every
 //! function here takes either.
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    not(all(target_feature = "gfni", target_feature = "avx512f"))
-))]
+/// Calls `$check::<K>()` for every kernel the CPU has instructions for.
+#[cfg(test)]
+macro_rules! each_kernel {
+    ($check:ident) => {{
+        use crate::reed_solomon::portable::Portable;
+        $check::<Portable>();
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::reed_solomon::{Kernel, avx2::Avx2, gfni::Gfni};
+            if Avx2::supported() {
+                $check::<Avx2>();
+            }
+            if Gfni::supported() {
+                $check::<Gfni>();
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        $check::<crate::reed_solomon::neon::Neon>();
+    }};
+}
+
+#[cfg(target_arch = "x86_64")]
 mod avx2;
 mod fft;
 mod gf16;
-#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"))]
+#[cfg(target_arch = "x86_64")]
 mod gfni;
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[cfg(target_arch = "aarch64")]
 mod neon;
-#[cfg(not(any(
-    all(target_arch = "x86_64", target_feature = "avx2"),
-    all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"),
-    all(target_arch = "aarch64", target_feature = "neon")
-)))]
+#[cfg(any(test, not(target_arch = "aarch64")))]
 mod portable;
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    not(all(target_feature = "gfni", target_feature = "avx512f"))
-))]
-use avx2 as kernel;
-#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"))]
-use gfni as kernel;
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-use neon as kernel;
-#[cfg(not(any(
-    all(target_arch = "x86_64", target_feature = "avx2"),
-    all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"),
-    all(target_arch = "aarch64", target_feature = "neon")
-)))]
-use portable as kernel;
+/// The combination of one stretch of bytes, for one set of instructions. A
+/// kernel is used only where [`Kernel::supported`] holds.
+trait Kernel: Copy + 'static {
+    /// A constant in the form the kernel multiplies by.
+    type Coeff: Copy + Send + Sync + 'static;
+
+    /// Twice the parity rows, for each level of the transform, from which
+    /// [`fft`] is ahead of the matrix: more where the matrix takes several rows
+    /// a pass.
+    const FFT_FROM_HALF_ROWS: usize;
+
+    /// Whether [`combine`] copies a strip of the sources side by side before it
+    /// reads them: where a row is a pass over them. A kernel that takes several
+    /// rows a pass reads them too few times to gain.
+    const GATHER: bool;
+
+    fn supported() -> bool;
+    fn caches() -> &'static Caches<Self>;
+
+    fn coeff(c: u8) -> Self::Coeff;
+    /// The map linear over `GF(2)` that takes bit `j` of a byte to `images[j]`,
+    /// in place of a product.
+    fn linear(images: [u8; 8]) -> Self::Coeff;
+
+    /// `dst[i] = sum_j coeffs[j] * srcs[j][at + i]` over the bytes the kernel
+    /// takes. Returns the bytes written, the caller's to finish.
+    fn row(coeffs: &[Self::Coeff], srcs: &[&[u8]], at: usize, dst: &mut [u8]) -> usize;
+
+    /// [`Kernel::row`] for `G` rows at once, row `g` with the coefficients
+    /// `coeffs[g * cols..][..cols]`: from `from` of the sources to `at` of the
+    /// destinations, `len` bytes. Returns the bytes written of each: none where
+    /// the kernel takes a row a pass.
+    fn rows<const G: usize>(
+        _coeffs: &[Self::Coeff],
+        _srcs: &[&[u8]],
+        _from: usize,
+        _at: usize,
+        _len: usize,
+        _dsts: &mut [&mut [u8]],
+    ) -> usize {
+        0
+    }
+
+    /// `h ^= g`.
+    fn xor(g: &[u8], h: &mut [u8]);
+
+    /// `g ^= c * h`, then `h ^= g`. Returns the bytes done.
+    fn butterfly(c: &Self::Coeff, g: &mut [u8], h: &mut [u8]) -> usize;
+    /// `h ^= g`, then `g ^= c * h`.
+    fn butterfly_back(c: &Self::Coeff, g: &mut [u8], h: &mut [u8]) -> usize;
+    /// [`Kernel::butterfly`] over the two planes of `GF(2^16)` symbols.
+    fn butterfly2(
+        c: &[Self::Coeff; 4],
+        g0: &mut [u8],
+        g1: &mut [u8],
+        h0: &mut [u8],
+        h1: &mut [u8],
+    ) -> usize;
+    fn butterfly2_back(
+        c: &[Self::Coeff; 4],
+        g0: &mut [u8],
+        g1: &mut [u8],
+        h0: &mut [u8],
+        h1: &mut [u8],
+    ) -> usize;
+}
+
+/// What is built once for a kernel, in its form of a constant.
+struct Caches<K: Kernel> {
+    /// [`parity_matrix`] of `(k, 2k)`, the one shape the protocol codes with.
+    parity: [OnceLock<Matrix<K>>; 129],
+    wide: LazyLock<gf16::Tables<K>>,
+}
+
+impl<K: Kernel> Caches<K> {
+    const fn new() -> Self {
+        Self { parity: [const { OnceLock::new() }; 129], wide: LazyLock::new(gf16::Tables::new) }
+    }
+}
+
+/// The codec over the kernel the CPU has instructions for, chosen once.
+#[allow(clippy::type_complexity)]
+struct Code {
+    parity_rows: fn(&[&[u8]], usize, &[usize], &mut [&mut [u8]]),
+    reconstruct_into: fn(usize, usize, &[u32], &[&[u8]], &mut [u8]) -> Option<()>,
+    complete_data_in_place:
+        fn(usize, usize, &mut [u8], &[u8], &dyn Fn(usize) -> bool) -> Option<()>,
+    invert: fn(usize, &[u8]) -> Option<Vec<u8>>,
+}
+
+impl Code {
+    fn of<K: Kernel>() -> Self {
+        assert!(K::supported());
+        Self {
+            parity_rows: parity_rows::<K>,
+            reconstruct_into: reconstruct_into::<K>,
+            complete_data_in_place: complete_data_in_place::<K>,
+            invert: invert::<K>,
+        }
+    }
+
+    fn detect() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if gfni::Gfni::supported() {
+                return Self::of::<gfni::Gfni>();
+            }
+            if avx2::Avx2::supported() {
+                return Self::of::<avx2::Avx2>();
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        return Self::of::<neon::Neon>();
+        #[cfg(not(target_arch = "aarch64"))]
+        Self::of::<portable::Portable>()
+    }
+}
+
+static CODE: LazyLock<Code> = LazyLock::new(Code::detect);
 
 const POLY: u16 = 0x11d;
 
@@ -192,15 +308,15 @@ const STRIP: usize = 1024;
 
 /// A matrix of `GF(2^8)` constants, row-major, with each in the form the kernel
 /// multiplies by.
-struct Matrix {
+struct Matrix<K: Kernel> {
     cols: usize,
     bytes: Vec<u8>,
-    coeffs: Vec<kernel::Coeff>,
+    coeffs: Vec<K::Coeff>,
 }
 
-impl Matrix {
+impl<K: Kernel> Matrix<K> {
     fn new(cols: usize, bytes: Vec<u8>) -> Self {
-        let coeffs = bytes.iter().map(|&c| kernel::coeff(c)).collect();
+        let coeffs = bytes.iter().map(|&c| K::coeff(c)).collect();
         Self { cols, bytes, coeffs }
     }
 
@@ -210,7 +326,7 @@ impl Matrix {
 }
 
 /// `dsts[r] = sum_j m[r][j] * srcs[j]`, every segment the same length.
-fn combine(m: &Matrix, srcs: &[&[u8]], dsts: &mut [&mut [u8]]) {
+fn combine<K: Kernel>(m: &Matrix<K>, srcs: &[&[u8]], dsts: &mut [&mut [u8]]) {
     let Some(size) = dsts.first().map(|dst| dst.len()) else {
         return;
     };
@@ -220,7 +336,7 @@ fn combine(m: &Matrix, srcs: &[&[u8]], dsts: &mut [&mut [u8]]) {
     // Segments of one buffer lie a multiple of the cache's way apart, or nearly,
     // and a strip of each then falls in the same few sets. Read once per
     // row, they evict each other; copied side by side first, they do not.
-    let gather = GATHER && dsts.len() > 2;
+    let gather = K::GATHER && dsts.len() > 2;
     let mut work = vec![0u8; if gather { m.cols * STRIP } else { 0 }];
     for at in (0..size).step_by(STRIP) {
         let end = (at + STRIP).min(size);
@@ -238,7 +354,7 @@ fn combine(m: &Matrix, srcs: &[&[u8]], dsts: &mut [&mut [u8]]) {
         let grouped = grouped_rows(m, srcs, from, at, end, dsts);
         for (r, dst) in dsts.iter_mut().enumerate().skip(grouped) {
             let dst = &mut dst[at..end];
-            let done = kernel::row(&m.coeffs[r * m.cols..][..m.cols], srcs, from, dst);
+            let done = K::row(&m.coeffs[r * m.cols..][..m.cols], srcs, from, dst);
             scalar_row(m.row(r), srcs, from + done, &mut dst[done..]);
         }
     }
@@ -247,12 +363,8 @@ fn combine(m: &Matrix, srcs: &[&[u8]], dsts: &mut [&mut [u8]]) {
 /// [`combine`] over `at..end` of every destination, from `from` of every
 /// source, by the kernel that takes several rows a pass: eight while there
 /// are, then four, then two. Returns the rows done: the rest are the caller's.
-#[cfg(any(
-    all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"),
-    all(target_arch = "aarch64", target_feature = "neon")
-))]
-fn grouped_rows(
-    m: &Matrix,
+fn grouped_rows<K: Kernel>(
+    m: &Matrix<K>,
     srcs: &[&[u8]],
     from: usize,
     at: usize,
@@ -265,14 +377,14 @@ fn grouped_rows(
             let group = &mut dsts[r..r + size];
             let coeffs = &m.coeffs[r * m.cols..][..size * m.cols];
             let done = match size {
-                8 => kernel::rows::<8>(coeffs, srcs, from, at, end - at, group),
-                4 => kernel::rows::<4>(coeffs, srcs, from, at, end - at, group),
-                _ => kernel::rows::<2>(coeffs, srcs, from, at, end - at, group),
+                8 => K::rows::<8>(coeffs, srcs, from, at, end - at, group),
+                4 => K::rows::<4>(coeffs, srcs, from, at, end - at, group),
+                _ => K::rows::<2>(coeffs, srcs, from, at, end - at, group),
             };
             // What is left of the strip, a row at a time.
             for (g, dst) in group.iter_mut().enumerate() {
                 let (from, dst) = (from + done, &mut dst[at + done..end]);
-                let done = kernel::row(&m.coeffs[(r + g) * m.cols..][..m.cols], srcs, from, dst);
+                let done = K::row(&m.coeffs[(r + g) * m.cols..][..m.cols], srcs, from, dst);
                 scalar_row(m.row(r + g), srcs, from + done, &mut dst[done..]);
             }
             r += size;
@@ -281,44 +393,10 @@ fn grouped_rows(
     r
 }
 
-#[cfg(not(any(
-    all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"),
-    all(target_arch = "aarch64", target_feature = "neon")
-)))]
-fn grouped_rows(
-    _: &Matrix,
-    _: &[&[u8]],
-    _: usize,
-    _: usize,
-    _: usize,
-    _: &mut [&mut [u8]],
-) -> usize {
-    0
-}
-
-/// Twice the parity rows, for each level of the transform, from which
-/// [`fft`] is ahead of the matrix: more where the matrix takes several rows a
-/// pass.
-#[cfg(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"))]
-const FFT_FROM_HALF_ROWS: usize = 8;
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-const FFT_FROM_HALF_ROWS: usize = 4;
-#[cfg(not(any(
-    all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"),
-    all(target_arch = "aarch64", target_feature = "neon")
-)))]
-const FFT_FROM_HALF_ROWS: usize = 3;
-
-/// Whether [`combine`] copies a strip of the sources side by side before it
-/// reads them: where a row is a pass over them. The kernel that takes several
-/// rows a pass reads them too few times to gain.
-const GATHER: bool =
-    !cfg!(all(target_arch = "x86_64", target_feature = "gfni", target_feature = "avx512f"));
-
 /// Rows `k..n` of the systematic generator over the points `0..n`: row `r`
 /// holds the Lagrange basis polynomials of the points `0..k`, evaluated at `r`.
 /// Addition being XOR, the difference of two points is their XOR.
-fn parity_matrix(k: usize, n: usize) -> Matrix {
+fn parity_bytes(k: usize, n: usize) -> Vec<u8> {
     assert!(k >= 1 && k <= n && n <= 256);
     let product = |r: usize, skip: usize| {
         (0..k).filter(|&j| j != skip).fold(1u8, |acc, j| GF256.mul(acc, (r ^ j) as u8))
@@ -332,26 +410,23 @@ fn parity_matrix(k: usize, n: usize) -> Matrix {
             (0..k).map(|c| GF256.mul(GF256.mul(all, GF256.inv((r ^ c) as u8)), denominators[c])),
         );
     }
-    Matrix::new(k, bytes)
+    bytes
 }
 
-/// [`parity_matrix`] of `(k, 2k)`, the one shape the protocol codes with, built
-/// once per `k`.
-fn cached_parity_matrix(k: usize) -> &'static Matrix {
-    static CACHE: [OnceLock<Matrix>; 129] = [const { OnceLock::new() }; 129];
-    CACHE[k].get_or_init(|| parity_matrix(k, 2 * k))
+fn parity_matrix<K: Kernel>(k: usize, n: usize) -> Matrix<K> {
+    Matrix::new(k, parity_bytes(k, n))
 }
 
 /// The parity matrix of `(k, n)`: borrowed from the cache when it is there.
-enum Parity {
-    Cached(&'static Matrix),
-    Built(Matrix),
+enum Parity<K: Kernel> {
+    Cached(&'static Matrix<K>),
+    Built(Matrix<K>),
 }
 
-impl std::ops::Deref for Parity {
-    type Target = Matrix;
+impl<K: Kernel> std::ops::Deref for Parity<K> {
+    type Target = Matrix<K>;
 
-    fn deref(&self) -> &Matrix {
+    fn deref(&self) -> &Matrix<K> {
         match self {
             Parity::Cached(m) => m,
             Parity::Built(m) => m,
@@ -359,9 +434,9 @@ impl std::ops::Deref for Parity {
     }
 }
 
-fn parity_of(k: usize, n: usize) -> Parity {
+fn parity_of<K: Kernel>(k: usize, n: usize) -> Parity<K> {
     if n == 2 * k {
-        Parity::Cached(cached_parity_matrix(k))
+        Parity::Cached(K::caches().parity[k].get_or_init(|| parity_matrix(k, n)))
     } else {
         Parity::Built(parity_matrix(k, n))
     }
@@ -373,14 +448,14 @@ fn parity_of(k: usize, n: usize) -> Parity {
 /// The top `k x k` submatrix is the identity matrix, and the bottom `(n - k) x
 /// k` submatrix is the parity encoding matrix `V_parity * V_data^{-1}`.
 pub fn build_systematic_matrix(k: usize, n: usize) -> Vec<Vec<u8>> {
-    let parity = parity_matrix(k, n);
+    let parity = parity_bytes(k, n);
     let identity = (0..k).map(|r| (0..k).map(|c| u8::from(r == c)).collect());
-    identity.chain((0..n - k).map(|r| parity.row(r).to_vec())).collect()
+    identity.chain(parity.chunks_exact(k).map(<[u8]>::to_vec)).collect()
 }
 
 /// The inverse of the `size x size` matrix `a`, row-major, by Gauss–Jordan
 /// elimination, if it has one.
-fn invert(size: usize, a: &[u8]) -> Option<Vec<u8>> {
+fn invert<K: Kernel>(size: usize, a: &[u8]) -> Option<Vec<u8>> {
     assert_eq!(a.len(), size * size);
     // `[a | identity]`, reduced until it is `[identity | inverse]`.
     let width = 2 * size;
@@ -408,9 +483,9 @@ fn invert(size: usize, a: &[u8]) -> Option<Vec<u8>> {
                 continue;
             }
             // `row += factor * pivot_row`, through the kernel, which cannot write a source.
-            let coeffs = [kernel::coeff(1), kernel::coeff(factor)];
+            let coeffs = [K::coeff(1), K::coeff(factor)];
             let srcs = [&row[..], &pivot_row[..]];
-            let done = kernel::row(&coeffs, &srcs, 0, &mut updated);
+            let done = K::row(&coeffs, &srcs, 0, &mut updated);
             scalar_row(&[1, factor], &srcs, done, &mut updated[done..]);
             row.copy_from_slice(&updated);
         }
@@ -421,7 +496,7 @@ fn invert(size: usize, a: &[u8]) -> Option<Vec<u8>> {
 /// Inverts a `k x k` matrix over `GF(2^8)` using Gauss–Jordan elimination.
 pub fn invert_matrix(mat: &[Vec<u8>]) -> Vec<Vec<u8>> {
     let k = mat.len();
-    let inverse = invert(k, &mat.concat()).expect("singular matrix in GF(2^8)");
+    let inverse = (CODE.invert)(k, &mat.concat()).expect("singular matrix in GF(2^8)");
     inverse.chunks_exact(k.max(1)).map(<[u8]>::to_vec).collect()
 }
 
@@ -429,26 +504,30 @@ pub fn invert_matrix(mat: &[Vec<u8>]) -> Vec<Vec<u8>> {
 /// (`srcs.len() <= row < n`), of the data segments `srcs` into `dsts`. Every
 /// segment is the same length.
 pub fn rs_parity_rows(srcs: &[&[u8]], n: usize, rows: &[usize], dsts: &mut [&mut [u8]]) {
+    (CODE.parity_rows)(srcs, n, rows, dsts)
+}
+
+fn parity_rows<K: Kernel>(srcs: &[&[u8]], n: usize, rows: &[usize], dsts: &mut [&mut [u8]]) {
     let k = srcs.len();
     assert!(k >= 1 && rows.len() == dsts.len() && rows.iter().all(|r| (k..n).contains(r)));
     if n > MAX_NARROW_CHUNKS {
         assert!(gf16::takes(k, n, srcs[0].len()));
-        return gf16::parity(srcs, rows, dsts);
+        return gf16::parity::<K>(srcs, rows, dsts);
     }
     // The transform costs the same whatever the rows asked for, the matrix a
     // pass over the data for each: the transform from a number of rows that
     // grows with its depth.
-    let enough = rows.len() >= FFT_FROM_HALF_ROWS * k.max(1).ilog2() as usize / 2;
+    let enough = rows.len() >= K::FFT_FROM_HALF_ROWS * k.max(1).ilog2() as usize / 2;
     let fft = n == 2 * k && k.is_power_of_two() && enough;
     if fft && !srcs[0].is_empty() {
-        return fft::parity(srcs, rows, dsts);
+        return fft::parity::<K>(srcs, rows, dsts);
     }
-    let parity = parity_of(k, n);
+    let parity = parity_of::<K>(k, n);
     if rows.iter().copied().eq(k..n) {
         return combine(&parity, srcs, dsts);
     }
     let picked = rows.iter().flat_map(|&r| parity.row(r - k)).copied().collect();
-    combine(&Matrix::new(k, picked), srcs, dsts);
+    combine(&Matrix::<K>::new(k, picked), srcs, dsts);
 }
 
 /// Computes `k` parity chunks of length `segment_size` from `k` equal-sized
@@ -476,7 +555,11 @@ pub fn rs_parity(padded_data_segs: &[Vec<u8>], parity_count: usize) -> Vec<Vec<u
 /// polynomial of `s` at `c`: the product of `c - t` over the others held, over
 /// that of `s - t`. No difference is zero, so the products are sums of
 /// logarithms.
-fn solve_missing(k: usize, n: usize, indices: &[u32]) -> Option<(Vec<usize>, Option<Matrix>)> {
+fn solve_missing<K: Kernel>(
+    k: usize,
+    n: usize,
+    indices: &[u32],
+) -> Option<(Vec<usize>, Option<Matrix<K>>)> {
     if k == 0 || n > 256 || k > n || indices.len() != k {
         return None;
     }
@@ -525,6 +608,16 @@ pub fn rs_reconstruct_into(
     chunks: &[&[u8]],
     data: &mut [u8],
 ) -> Option<()> {
+    (CODE.reconstruct_into)(k, n, indices, chunks, data)
+}
+
+fn reconstruct_into<K: Kernel>(
+    k: usize,
+    n: usize,
+    indices: &[u32],
+    chunks: &[&[u8]],
+    data: &mut [u8],
+) -> Option<()> {
     if k == 0 || chunks.len() != k || !data.len().is_multiple_of(k) {
         return None;
     }
@@ -533,9 +626,9 @@ pub fn rs_reconstruct_into(
         return None;
     }
     if n > MAX_NARROW_CHUNKS {
-        return reconstruct_wide(k, n, indices, chunks, data);
+        return reconstruct_wide::<K>(k, n, indices, chunks, data);
     }
-    let (missing, solve) = solve_missing(k, n, indices)?;
+    let (missing, solve) = solve_missing::<K>(k, n, indices)?;
     let mut dsts = Vec::with_capacity(missing.len());
     for (c, segment) in data.chunks_exact_mut(size.max(1)).enumerate() {
         match indices.iter().position(|&index| index as usize == c) {
@@ -550,7 +643,7 @@ pub fn rs_reconstruct_into(
 }
 
 /// [`rs_reconstruct_into`] over `GF(2^16)`.
-fn reconstruct_wide(
+fn reconstruct_wide<K: Kernel>(
     k: usize,
     n: usize,
     indices: &[u32],
@@ -577,7 +670,7 @@ fn reconstruct_wide(
             at => segment.copy_from_slice(chunks[at]),
         }
     }
-    gf16::restore(k, size, &known, &wanted, &mut dsts)
+    gf16::restore::<K>(k, size, &known, &wanted, &mut dsts)
 }
 
 /// Fills in every chunk of the `(k, n)` code that is missing, where the chunks
@@ -622,6 +715,16 @@ pub fn rs_complete_data_in_place(
     parity: &[u8],
     have: impl Fn(usize) -> bool,
 ) -> Option<()> {
+    (CODE.complete_data_in_place)(k, n, data, parity, &have)
+}
+
+fn complete_data_in_place<K: Kernel>(
+    k: usize,
+    n: usize,
+    data: &mut [u8],
+    parity: &[u8],
+    have: &dyn Fn(usize) -> bool,
+) -> Option<()> {
     if k == 0 || k > n || n > MAX_WIDE_CHUNKS || !data.len().is_multiple_of(k) {
         return None;
     }
@@ -656,9 +759,9 @@ pub fn rs_complete_data_in_place(
             let r = r as usize;
             (r, &parity[(r - k) * size..][..size])
         }));
-        return gf16::restore(k, size, &known, &wanted, &mut dsts);
+        return gf16::restore::<K>(k, size, &known, &wanted, &mut dsts);
     }
-    let (_, solve) = solve_missing(k, n, &indices)?;
+    let (_, solve) = solve_missing::<K>(k, n, &indices)?;
     let (mut srcs, mut dsts) = (Vec::with_capacity(k), Vec::with_capacity(missing_data));
     for (c, segment) in data.chunks_exact_mut(size).enumerate() {
         if have(c) {
@@ -753,10 +856,9 @@ mod tests {
 
     /// The transform against the matrix: every `k` it takes, lengths around
     /// every vector width and strip, all the parity rows and some of them.
-    #[test]
-    fn test_fft_parity_is_the_matrix_one() {
+    fn fft_parity_is_the_matrix_one<K: Kernel>() {
         for k in [1usize, 2, 4, 8, 16, 32, 64, 128] {
-            let matrix = parity_matrix(k, 2 * k);
+            let matrix = parity_matrix::<K>(k, 2 * k);
             for size in [1, 15, 16, 17, 63, 64, 65, 255, 1023, 1024, 1025, 2500] {
                 let data: Vec<Vec<u8>> = (0..k).map(|i| bytes(size, (k * 13 + i) as u64)).collect();
                 let srcs: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
@@ -772,13 +874,72 @@ mod tests {
                     let mut parity = vec![vec![0x5au8; size]; rows.len()];
                     let mut dsts: Vec<&mut [u8]> =
                         parity.iter_mut().map(Vec::as_mut_slice).collect();
-                    fft::parity(&srcs, &rows, &mut dsts);
+                    fft::parity::<K>(&srcs, &rows, &mut dsts);
                     for (r, row) in rows.iter().zip(&parity) {
                         assert!(row == &expected[r - k], "k {k} size {size} row {r}");
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_fft_parity_is_the_matrix_one() {
+        each_kernel!(fft_parity_is_the_matrix_one);
+    }
+
+    /// The parity, by the matrix and by the transform, and the data back from
+    /// the parity alone and from a mix, over both fields: the bytes the table
+    /// gives, at lengths around every vector width and strip.
+    fn kernel_gives_the_tables_bytes<K: Kernel>() {
+        let (code, table) = (Code::of::<K>(), Code::of::<portable::Portable>());
+        for (k, size) in [(7, 0), (7, 65), (7, 2500), (16, 1025), (128, 1088), (200, 1088)] {
+            let n = 2 * k;
+            let data = bytes(k * size, (k * 17 + size) as u64);
+            let srcs: Vec<&[u8]> = data.chunks_exact(size.max(1)).take(k).collect();
+            let srcs = if size == 0 { vec![&[][..]; k] } else { srcs };
+            let rows: Vec<usize> = (k..n).collect();
+            let parity_by = |code: &Code, rows: &[usize]| {
+                let mut parity = vec![0x5au8; rows.len() * size];
+                let mut dsts: Vec<&mut [u8]> = match size {
+                    0 => rows.iter().map(|_| &mut [][..]).collect(),
+                    _ => parity.chunks_exact_mut(size).collect(),
+                };
+                (code.parity_rows)(&srcs, n, rows, &mut dsts);
+                parity
+            };
+            let parity = parity_by(&table, &rows);
+            assert!(parity_by(&code, &rows) == parity, "parity ({k}, {n}) size {size}");
+            assert!(
+                parity_by(&code, &rows[1..3]) == parity[size..3 * size],
+                "two rows ({k}, {n}) size {size}"
+            );
+
+            let indices: Vec<u32> = (k as u32..n as u32).collect();
+            let chunks: Vec<&[u8]> = match size {
+                0 => vec![&[][..]; k],
+                _ => parity.chunks_exact(size).collect(),
+            };
+            let mut back = vec![0x5au8; k * size];
+            assert_eq!((code.reconstruct_into)(k, n, &indices, &chunks, &mut back), Some(()));
+            assert!(back == data, "reconstruct ({k}, {n}) size {size}");
+
+            let have = |i: usize| !i.is_multiple_of(3);
+            let mut holed = data.clone();
+            for c in (0..k).filter(|&c| !have(c)) {
+                holed[c * size..][..size].fill(0x5a);
+            }
+            let done = (code.complete_data_in_place)(k, n, &mut holed, &parity, &have);
+            assert_eq!(done, Some(()));
+            assert!(holed == data, "complete ({k}, {n}) size {size}");
+        }
+        let matrix = parity_bytes(13, 13 + 13);
+        assert_eq!((code.invert)(13, &matrix), (table.invert)(13, &matrix));
+    }
+
+    #[test]
+    fn test_every_kernel_gives_the_tables_bytes() {
+        each_kernel!(kernel_gives_the_tables_bytes);
     }
 
     /// Any `k` chunks give the data back: every mix of data and parity chunks,

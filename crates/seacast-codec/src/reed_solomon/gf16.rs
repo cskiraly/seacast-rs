@@ -23,11 +23,9 @@
 //! this basis, so the derivative of the basis polynomial `j` is the sum over
 //! the bits `b` of `j` of the basis polynomial `j - 2^b`.
 
-use std::sync::LazyLock;
-
 use seacast_core::MAX_BITMAP_BITS;
 
-use super::kernel;
+use super::Kernel;
 
 /// The points of the largest code: twice the power of two from its `k` up.
 const POINTS: usize = 2 * (MAX_BITMAP_BITS / 2).next_power_of_two();
@@ -64,12 +62,12 @@ const SLOT: usize = 2 * PLANE;
 /// A constant as the kernels multiply by it: the product with `(x0, x1)` is
 /// `(c[0] x0 + c[1] x1, c[2] x0 + c[3] x1)`, each `c` linear over `GF(2)`.
 #[derive(Clone, Copy)]
-struct Coeff {
+struct Coeff<K: Kernel> {
     log: u16,
-    kernel: [kernel::Coeff; 4],
+    kernel: [K::Coeff; 4],
 }
 
-struct Tables {
+pub(super) struct Tables<K: Kernel> {
     /// The element of every logarithm, and the logarithm of every element but
     /// zero.
     exp: Vec<u16>,
@@ -77,10 +75,10 @@ struct Tables {
     /// `W_i(beta)` at `beta | (2^i - 1)`, for `beta` a multiple of `2^(i + 1)`:
     /// the constant of the butterflies of a block of `2^(i + 1)` points from
     /// `beta`. `None` is zero.
-    twiddle: Vec<Option<Coeff>>,
+    twiddle: Vec<Option<Coeff<K>>>,
 }
 
-impl Tables {
+impl<K: Kernel> Tables<K> {
     /// `a * b`, `b` not zero and given by its logarithm.
     #[inline]
     fn mul_log(&self, a: u16, log_b: u16) -> u16 {
@@ -97,7 +95,7 @@ impl Tables {
     }
 
     /// The constant of logarithm `log`.
-    fn coeff(&self, log: u16) -> Coeff {
+    fn coeff(&self, log: u16) -> Coeff<K> {
         // Bit `j` of a symbol is bit `j % 8` of plane `j / 8`.
         let mut images = [[0u8; 8]; 4];
         for j in 0..16 {
@@ -105,50 +103,43 @@ impl Tables {
             images[j / 8][j % 8] = product as u8;
             images[2 + j / 8][j % 8] = (product >> 8) as u8;
         }
-        Coeff { log, kernel: images.map(kernel::linear) }
+        Coeff { log, kernel: images.map(K::linear) }
     }
-}
 
-static GF16: LazyLock<Tables> = LazyLock::new(|| {
-    let mut plain = vec![0u16; 1 << 16];
-    let mut power = 1u32;
-    for i in 0..ORDER {
-        plain[power as usize] = i as u16;
-        power <<= 1;
-        if power >> 16 != 0 {
-            power ^= POLYNOMIAL;
+    pub(super) fn new() -> Self {
+        let mut plain = vec![0u16; 1 << 16];
+        let mut power = 1u32;
+        for i in 0..ORDER {
+            plain[power as usize] = i as u16;
+            power <<= 1;
+            if power >> 16 != 0 {
+                power ^= POLYNOMIAL;
+            }
         }
-    }
-    let (mut exp, mut log) = (vec![0u16; ORDER], vec![0u16; 1 << 16]);
-    for x in 1..=u16::MAX {
-        let element = (0..16).filter(|i| x >> i & 1 == 1).fold(0u16, |acc, i| acc ^ CANTOR[i]);
-        log[x as usize] = plain[element as usize];
-        exp[plain[element as usize] as usize] = x;
-    }
-    let mut tables = Tables { exp, log, twiddle: vec![None; POINTS] };
+        let (mut exp, mut log) = (vec![0u16; ORDER], vec![0u16; 1 << 16]);
+        for x in 1..=u16::MAX {
+            let element = (0..16).filter(|i| x >> i & 1 == 1).fold(0u16, |acc, i| acc ^ CANTOR[i]);
+            log[x as usize] = plain[element as usize];
+            exp[plain[element as usize] as usize] = x;
+        }
+        let mut tables = Tables { exp, log, twiddle: vec![None; POINTS] };
 
-    // `s_i`, the product of `x - u` over `V_i`: `s_(i+1)(x) = s_i(x) . (s_i(x) +
-    // s_i(2^i))`. In this basis `s_i(2^i)` is one: `s_i` is `W_i`, and its linear
-    // coefficient stays one.
-    let mut s: Vec<u16> = (0..POINTS as u16).collect();
-    for i in 0..LEVELS {
-        assert_eq!(s[1 << i], 1);
-        for beta in (0..POINTS).step_by(2 << i) {
-            let w = s[beta];
-            tables.twiddle[beta | ((1 << i) - 1)] =
-                (w != 0).then(|| tables.coeff(tables.log[w as usize]));
+        // `s_i`, the product of `x - u` over `V_i`: `s_(i+1)(x) = s_i(x) . (s_i(x) +
+        // s_i(2^i))`. In this basis `s_i(2^i)` is one: `s_i` is `W_i`, and its linear
+        // coefficient stays one.
+        let mut s: Vec<u16> = (0..POINTS as u16).collect();
+        for i in 0..LEVELS {
+            assert_eq!(s[1 << i], 1);
+            for beta in (0..POINTS).step_by(2 << i) {
+                let w = s[beta];
+                tables.twiddle[beta | ((1 << i) - 1)] =
+                    (w != 0).then(|| tables.coeff(tables.log[w as usize]));
+            }
+            for value in &mut s {
+                *value = tables.mul(*value, *value ^ 1);
+            }
         }
-        for value in &mut s {
-            *value = tables.mul(*value, *value ^ 1);
-        }
-    }
-    tables
-});
-
-#[inline]
-fn xor(g: &[u8], h: &mut [u8]) {
-    for (h, &g) in h.iter_mut().zip(g) {
-        *h ^= g;
+        tables
     }
 }
 
@@ -183,13 +174,19 @@ fn store(slot: &[u8], dst: &mut [u8]) {
 
 /// `g ^= w * h`, then `h ^= g`. No constant is `w = 0`.
 #[inline]
-fn butterfly(t: &Tables, w: Option<&Coeff>, g: &mut [u8], h: &mut [u8], len: usize) {
+fn butterfly<K: Kernel>(
+    t: &Tables<K>,
+    w: Option<&Coeff<K>>,
+    g: &mut [u8],
+    h: &mut [u8],
+    len: usize,
+) {
     let ((g0, g1), (h0, h1)) = (planes(g, len), planes(h, len));
     let Some(w) = w else {
-        xor(g0, h0);
-        return xor(g1, h1);
+        K::xor(g0, h0);
+        return K::xor(g1, h1);
     };
-    let done = kernel::butterfly2(&w.kernel, g0, g1, h0, h1);
+    let done = K::butterfly2(&w.kernel, g0, g1, h0, h1);
     for i in done..len {
         let product = t.mul_log(h0[i] as u16 | (h1[i] as u16) << 8, w.log);
         g0[i] ^= product as u8;
@@ -201,13 +198,19 @@ fn butterfly(t: &Tables, w: Option<&Coeff>, g: &mut [u8], h: &mut [u8], len: usi
 
 /// The reverse of [`butterfly`]: `h ^= g`, then `g ^= w * h`.
 #[inline]
-fn butterfly_back(t: &Tables, w: Option<&Coeff>, g: &mut [u8], h: &mut [u8], len: usize) {
+fn butterfly_back<K: Kernel>(
+    t: &Tables<K>,
+    w: Option<&Coeff<K>>,
+    g: &mut [u8],
+    h: &mut [u8],
+    len: usize,
+) {
     let ((g0, g1), (h0, h1)) = (planes(g, len), planes(h, len));
     let Some(w) = w else {
-        xor(g0, h0);
-        return xor(g1, h1);
+        K::xor(g0, h0);
+        return K::xor(g1, h1);
     };
-    let done = kernel::butterfly2_back(&w.kernel, g0, g1, h0, h1);
+    let done = K::butterfly2_back(&w.kernel, g0, g1, h0, h1);
     for i in done..len {
         h0[i] ^= g0[i];
         h1[i] ^= g1[i];
@@ -220,7 +223,13 @@ fn butterfly_back(t: &Tables, w: Option<&Coeff>, g: &mut [u8], h: &mut [u8], len
 /// `slot *= c`, given `w = c + 1`: a butterfly from a zero `g` leaves `h + w *
 /// h` in `h`. `None` is `c = 1`.
 #[inline]
-fn scale(t: &Tables, w: Option<&Coeff>, slot: &mut [u8], len: usize, zero: &mut [u8; SLOT]) {
+fn scale<K: Kernel>(
+    t: &Tables<K>,
+    w: Option<&Coeff<K>>,
+    slot: &mut [u8],
+    len: usize,
+    zero: &mut [u8; SLOT],
+) {
     if w.is_some() {
         let (z0, z1) = planes(zero, len);
         z0.fill(0);
@@ -231,7 +240,7 @@ fn scale(t: &Tables, w: Option<&Coeff>, slot: &mut [u8], len: usize, zero: &mut 
 
 /// The values on `beta ^ V_k`, `block`'s `2^k` slots, to the coefficients;
 /// `len` bytes of each plane are in use.
-fn inverse(t: &Tables, block: &mut [u8], len: usize, k: u32, beta: usize) {
+fn inverse<K: Kernel>(t: &Tables<K>, block: &mut [u8], len: usize, k: u32, beta: usize) {
     if k == 0 {
         return;
     }
@@ -248,7 +257,7 @@ fn inverse(t: &Tables, block: &mut [u8], len: usize, k: u32, beta: usize) {
 }
 
 /// The reverse of [`inverse`].
-fn forward(t: &Tables, block: &mut [u8], len: usize, k: u32, beta: usize) {
+fn forward<K: Kernel>(t: &Tables<K>, block: &mut [u8], len: usize, k: u32, beta: usize) {
     if k == 0 {
         return;
     }
@@ -281,14 +290,14 @@ fn point(k: usize, index: usize) -> usize {
 /// Writes the parity chunks `rows` of the data segments `srcs` into `dsts`.
 /// Every row is from `srcs.len()` up and every segment the same length, whole
 /// blocks.
-pub(super) fn parity(srcs: &[&[u8]], rows: &[usize], dsts: &mut [&mut [u8]]) {
+pub(super) fn parity<K: Kernel>(srcs: &[&[u8]], rows: &[usize], dsts: &mut [&mut [u8]]) {
     let k = srcs.len();
     let size = srcs[0].len();
     assert!(rows.len() == dsts.len() && rows.iter().all(|&r| r >= k && takes(k, r + 1, size)));
     assert!(srcs.iter().all(|src| src.len() == size) && dsts.iter().all(|dst| dst.len() == size));
     let m = k.next_power_of_two();
     let bits = m.trailing_zeros();
-    let t = &*GF16;
+    let t = &*K::caches().wide;
     let mut work = vec![0u8; m * SLOT];
     for at in (0..size).step_by(SLOT) {
         let bytes = SLOT.min(size - at);
@@ -310,7 +319,7 @@ pub(super) fn parity(srcs: &[&[u8]], rows: &[usize], dsts: &mut [&mut [u8]]) {
 /// indices distinct, none of them wanted, every chunk `size` bytes.
 ///
 /// `None`, with nothing written, if `known` or `wanted` is not that.
-pub(super) fn restore(
+pub(super) fn restore<K: Kernel>(
     k: usize,
     size: usize,
     known: &[(usize, &[u8])],
@@ -349,7 +358,7 @@ pub(super) fn restore(
 
     // The logarithm of the product of `x - e` over the points not known but `x`:
     // that of `P(x)` at a point known, of `P'(x)` at the others.
-    let t = &*GF16;
+    let t = &*K::caches().wide;
     let erased: Vec<usize> = (0..n).filter(|&p| !is_known[p]).collect();
     let log = |x: usize| {
         let sum: usize = erased.iter().filter(|&&e| e != x).map(|&e| t.log[x ^ e] as usize).sum();
@@ -360,13 +369,13 @@ pub(super) fn restore(
         let c = t.exp[log];
         (c != 1).then(|| t.coeff(t.log[(c ^ 1) as usize]))
     };
-    let scale_in: Vec<(usize, &[u8], Option<Coeff>)> = (known.iter())
+    let scale_in: Vec<_> = (known.iter())
         .map(|&(index, chunk)| {
             let p = point(k, index);
             (p, chunk, scaler(log(p)))
         })
         .collect();
-    let scale_out: Vec<(usize, Option<Coeff>)> = (wanted.iter())
+    let scale_out: Vec<_> = (wanted.iter())
         .map(|&index| {
             let p = point(k, index);
             (p, scaler((ORDER - log(p)) % ORDER))
@@ -396,8 +405,8 @@ pub(super) fn restore(
             d1.fill(0);
             for b in (0..bits).filter(|b| j >> b & 1 == 0) {
                 let (s0, s1) = planes(&mut above[((1 << b) - 1) * SLOT..][..SLOT], len);
-                xor(s0, d0);
-                xor(s1, d1);
+                K::xor(s0, d0);
+                K::xor(s1, d1);
             }
         }
 
@@ -413,7 +422,11 @@ pub(super) fn restore(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{super::portable::Portable, *};
+
+    fn field() -> &'static Tables<Portable> {
+        &Portable::caches().wide
+    }
 
     fn bytes(len: usize, seed: u64) -> Vec<u8> {
         let mut state = seed;
@@ -431,11 +444,11 @@ mod tests {
     }
 
     fn inv(a: u16) -> u16 {
-        GF16.exp[(ORDER - GF16.log[a as usize] as usize) % ORDER]
+        field().exp[(ORDER - field().log[a as usize] as usize) % ORDER]
     }
 
     fn mul(a: u16, b: u16) -> u16 {
-        GF16.mul(a, b)
+        field().mul(a, b)
     }
 
     #[test]
@@ -451,7 +464,7 @@ mod tests {
         // Every element but zero has a logarithm, and one is the unit.
         let mut seen = vec![false; 1 << 16];
         assert!(
-            GF16.exp.iter().all(|&x| x != 0 && !std::mem::replace(&mut seen[x as usize], true))
+            field().exp.iter().all(|&x| x != 0 && !std::mem::replace(&mut seen[x as usize], true))
         );
         assert_eq!(mul(1, 0xbeef), 0xbeef);
         // The basis: `CANTOR[i]^2 + CANTOR[i] = CANTOR[i - 1]`.
@@ -462,8 +475,7 @@ mod tests {
 
     /// The parity is the polynomial's value at its point: by Lagrange's formula
     /// over the points `m..2m`, the data and the zeros.
-    #[test]
-    fn test_parity_is_the_polynomial() {
+    fn parity_is_the_polynomial<K: Kernel>() {
         for k in [129usize, 200, 256, 300] {
             let m = k.next_power_of_two();
             for size in [64, 128, 192, 1024, 1088, 2560] {
@@ -471,7 +483,7 @@ mod tests {
                 let srcs: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
                 let rows = [k, k + 1, 2 * k - 1, k + 77];
                 let mut out = vec![vec![0x5au8; size]; rows.len()];
-                parity(
+                parity::<K>(
                     &srcs,
                     &rows,
                     &mut out.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>(),
@@ -498,8 +510,7 @@ mod tests {
 
     /// The parity is what `leo_encode` of Leopard-RS gives for the same data: a
     /// hash of all of it and the first bytes, from a build of the reference.
-    #[test]
-    fn test_parity_is_leopards() {
+    fn parity_is_leopards<K: Kernel>() {
         let cases: [(usize, usize, u64, [u8; 8]); 6] = [
             (129, 64, 0x38c7ccf495b5e0e0, [0xd6, 0x5f, 0xfe, 0x6f, 0x4e, 0x28, 0xee, 0xc8]),
             (200, 192, 0x5f3e056561c1b1c7, [0xaa, 0x3e, 0x44, 0x67, 0x5f, 0xbc, 0x5c, 0xb2]),
@@ -513,7 +524,11 @@ mod tests {
             let srcs: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
             let rows: Vec<usize> = (k..2 * k).collect();
             let mut out = vec![vec![0u8; size]; k];
-            parity(&srcs, &rows, &mut out.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>());
+            parity::<K>(
+                &srcs,
+                &rows,
+                &mut out.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>(),
+            );
             assert_eq!(out[0][..8], first, "k {k} size {size}");
             // FNV-1a.
             let fnv = out
@@ -525,14 +540,17 @@ mod tests {
     }
 
     /// Any `k` chunks give every other chunk back.
-    #[test]
-    fn test_restore_from_any_chunks() {
+    fn restore_from_any_chunks<K: Kernel>() {
         for (k, size) in [(129usize, 64), (257, 128), (300, 1088), (512, 192)] {
             let data: Vec<Vec<u8>> = (0..k).map(|i| bytes(size, (k + i) as u64)).collect();
             let srcs: Vec<&[u8]> = data.iter().map(Vec::as_slice).collect();
             let rows: Vec<usize> = (k..2 * k).collect();
             let mut coded = vec![vec![0u8; size]; k];
-            parity(&srcs, &rows, &mut coded.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>());
+            parity::<K>(
+                &srcs,
+                &rows,
+                &mut coded.iter_mut().map(Vec::as_mut_slice).collect::<Vec<_>>(),
+            );
             let all: Vec<&[u8]> =
                 srcs.iter().copied().chain(coded.iter().map(Vec::as_slice)).collect();
             let picks: [&dyn Fn(usize) -> bool; 4] =
@@ -544,7 +562,7 @@ mod tests {
                 let known: Vec<(usize, &[u8])> = held.iter().map(|&i| (i, all[i])).collect();
                 let wanted: Vec<usize> = (0..2 * k).filter(|i| !held.contains(i)).collect();
                 let mut out = vec![vec![0xa5u8; size]; wanted.len()];
-                let restored = restore(
+                let restored = restore::<K>(
                     k,
                     size,
                     &known,
@@ -563,19 +581,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_restore_refuses_bad_chunks() {
+    fn restore_refuses_bad_chunks<K: Kernel>() {
         let (k, size) = (130usize, 64);
         let chunk = vec![1u8; size];
         let known: Vec<(usize, &[u8])> = (0..k).map(|i| (i + 5, &chunk[..])).collect();
         let mut out = vec![0u8; size];
         let mut run = |known: &[(usize, &[u8])], wanted: usize| {
-            restore(k, size, known, &[wanted], &mut [&mut out[..]])
+            restore::<K>(k, size, known, &[wanted], &mut [&mut out[..]])
         };
         assert_eq!(run(&known, 0), Some(()));
         // A chunk wanted that is known, too few chunks, one twice, one past the code.
         assert_eq!(run(&known, 5), None);
-        assert_eq!(restore(k, size, &known, &[0, 0], &mut [&mut [0u8; 64], &mut [0u8; 64]]), None);
+        assert_eq!(
+            restore::<K>(k, size, &known, &[0, 0], &mut [&mut [0u8; 64], &mut [0u8; 64]]),
+            None
+        );
         assert_eq!(run(&known[1..], 0), None);
         let mut twice = known.clone();
         twice[3] = twice[4];
@@ -583,6 +603,26 @@ mod tests {
         let mut past = known.clone();
         past[0].0 = 2 * k;
         assert_eq!(run(&past, 0), None);
-        assert_eq!(restore(k, 63, &known, &[0], &mut [&mut out[..63]]), None);
+        assert_eq!(restore::<K>(k, 63, &known, &[0], &mut [&mut out[..63]]), None);
+    }
+
+    #[test]
+    fn test_parity_is_the_polynomial() {
+        each_kernel!(parity_is_the_polynomial);
+    }
+
+    #[test]
+    fn test_parity_is_leopards() {
+        each_kernel!(parity_is_leopards);
+    }
+
+    #[test]
+    fn test_restore_from_any_chunks() {
+        each_kernel!(restore_from_any_chunks);
+    }
+
+    #[test]
+    fn test_restore_refuses_bad_chunks() {
+        each_kernel!(restore_refuses_bad_chunks);
     }
 }

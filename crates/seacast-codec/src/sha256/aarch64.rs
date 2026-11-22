@@ -5,11 +5,11 @@ use core::arch::aarch64::*;
 use super::K;
 
 /// Absorb `blocks`, a whole number of 64-byte blocks, into `state`.
+#[target_feature(enable = "sha2")]
 pub(crate) fn compress(state: &mut [u32; 8], blocks: &[u8]) {
     let (blocks, rest) = blocks.as_chunks::<64>();
     debug_assert!(rest.is_empty());
-    // SAFETY: the module is compiled only with `sha2` enabled, and every load and
-    // store is inside `state`, `K` or a 64-byte block.
+    // SAFETY: every load and store is inside `state`, `K` or a 64-byte block.
     unsafe {
         let mut abcd = vld1q_u32(state.as_ptr());
         let mut efgh = vld1q_u32(state.as_ptr().add(4));
@@ -41,7 +41,8 @@ pub(crate) fn compress(state: &mut [u32; 8], blocks: &[u8]) {
 /// same whole number of 64-byte blocks. The rounds of one message wait on each
 /// other and those of different messages do not, so several go through in the
 /// time of one.
-pub(crate) fn compress_many<const S: usize>(states: &mut [[u32; 8]; S], blocks: [&[u8]; S]) {
+#[target_feature(enable = "sha2")]
+fn compress_many<const S: usize>(states: &mut [[u32; 8]; S], blocks: [&[u8]; S]) {
     let count = blocks[0].len() / 64;
     assert!(blocks.iter().all(|b| b.len() == 64 * count));
     // SAFETY: as in `compress`; every block read is inside its slice, checked
@@ -85,3 +86,20 @@ pub(crate) fn compress_many<const S: usize>(states: &mut [[u32; 8]; S], blocks: 
 
 /// Messages [`compress_many`] is given at once, at most.
 pub(crate) const STREAMS: usize = 4;
+
+/// [`compress`] for each of `states` over its own `blocks`: together, up to
+/// [`STREAMS`] of them.
+#[target_feature(enable = "sha2")]
+pub(crate) fn compress_streams(states: &mut [[u32; 8]], blocks: &[&[u8]]) {
+    assert_eq!(states.len(), blocks.len());
+    match states.len() {
+        4 => compress_many::<4>(states.try_into().unwrap(), blocks.try_into().unwrap()),
+        3 => compress_many::<3>(states.try_into().unwrap(), blocks.try_into().unwrap()),
+        2 => compress_many::<2>(states.try_into().unwrap(), blocks.try_into().unwrap()),
+        _ => {
+            for (state, blocks) in states.iter_mut().zip(blocks) {
+                compress(state, blocks);
+            }
+        }
+    }
+}
