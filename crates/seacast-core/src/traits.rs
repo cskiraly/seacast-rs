@@ -267,6 +267,13 @@ pub trait RuntimeEnv<B: ChunkBuffer> {
     /// `SeacastNode::next_to_send` for it until that gives nothing.
     fn wake_writer(&mut self, _peer: PeerId) {}
 
+    /// Whether `peer`'s writer has an unfinished write on its transport
+    /// (`protocol.md` §7.1 `writing(p)`, `protocol-v2.md` §4.11). While true,
+    /// the window's waiter line passes `peer` over without taking its place.
+    fn is_writing(&self, _peer: PeerId) -> bool {
+        false
+    }
+
     /// Level 2 of `group` is due (`start(decode_group, g)`). The host runs
     /// `TypeCodec::decode` on `job`, on any thread, and passes the result to
     /// `SeacastNode::on_decoded`. `job` borrows the node's scratch: the host

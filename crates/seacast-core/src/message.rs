@@ -136,6 +136,9 @@ pub struct ChunkMsg<B> {
     /// What the type's codec keeps of the chunk from its level 1 for its level
     /// 2; zero until the codec sets it. The node does not read it.
     pub memo: Bytes32,
+    /// Compressed wire length of `frame` in bytes when known; zero falls back
+    /// to `frame.len()` in `wire_size`.
+    pub wire_len: u32,
 }
 
 /// `Evidence`: fraud-proof object published when a group fails Level 2

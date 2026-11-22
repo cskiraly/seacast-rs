@@ -55,10 +55,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             if open {
                 self.holders.insert((h.group, i), peer);
             }
-            // Our answer to the peer's probe goes whatever it holds (§4.6, R5).
-            if !self.probe_answers.contains(&(peer, h.group, i)) {
-                self.sends.window_release(peer, h.group, i, env);
-            }
+            self.sends.window_release(peer, h.group, i, env);
             // A copy of a chunk we publish exists elsewhere (§4.7).
             if self.groups.has_bits(&h.group, GroupBits::Origin) {
                 self.origin_acked(h.group, i, env, catalog);

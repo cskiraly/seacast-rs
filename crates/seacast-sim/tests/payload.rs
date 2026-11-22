@@ -232,6 +232,7 @@ fn chunks(
                 cached_id: chunk_id(&group, i as u32, &content),
                 frame,
                 memo: [0; 32],
+                wire_len: 0,
             }
         })
         .collect()

@@ -1,6 +1,6 @@
 use crate::{
     bitmap::{Bitmap, MAX_BITMAP_BITS, MAX_CHUNKS},
-    collections::{InlineVec, PreallocVec},
+    collections::{InlineVec, MAX_PROJECTED, PreallocVec},
     message::ChunkMsg,
     node::SeacastNode,
     state::GroupBits,
@@ -207,14 +207,27 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return;
         }
         let projected = Self::projections(catalog, &chunk);
+        // A second id for an index already received on an axis is only
+        // acknowledged there (`fill`), not forwarded; one held only as rebuilt
+        // is still forwarded (`protocol-v2.md` §4.2).
+        let mut new_axes: InlineVec<(GroupId, u32), MAX_PROJECTED> = InlineVec::new();
+        for &(g, i) in &projected {
+            if !self.groups.bits(&g, GroupBits::Received).is_some_and(|b| b.has(i)) {
+                let _ = new_axes.push((g, i));
+            }
+        }
         for &(g, i) in &projected {
             self.fill(g, i, &chunk, Some(peer), env, catalog);
         }
         // A dropped or expired axis is not acted on (`protocol-v2.md` §4.6).
-        if projected.iter().any(|&(g, _)| {
-            !self.expired(&g) && !self.dropped(&g) && catalog.duty_for(&g) == Duty::Forward
-        }) {
-            self.forward(&chunk, peer, env, catalog, rng);
+        let mut acting: InlineVec<(GroupId, u32), MAX_PROJECTED> = InlineVec::new();
+        for &(g, i) in &new_axes {
+            if !self.expired(&g) && !self.dropped(&g) {
+                let _ = acting.push((g, i));
+            }
+        }
+        if acting.iter().any(|&(g, _)| catalog.duty_for(&g) == Duty::Forward) {
+            self.forward(&chunk, peer, &acting, env, catalog, rng);
         }
         for (g, _) in projected {
             self.check_completion(g, env, catalog, rng);

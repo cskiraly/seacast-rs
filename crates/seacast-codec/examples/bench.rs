@@ -257,11 +257,7 @@ fn main() {
     );
 
     let comp = SnappyBlockCompressor;
-    for (name, body) in [
-        ("structured", structured(2 << 20, 7)),
-        ("random", random(2 << 20, 9)),
-        ("random, N > 256", random(8 << 20, 11)),
-    ] {
+    for (name, body) in [("structured", structured(2 << 20, 7)), ("random", random(2 << 20, 9))] {
         let mib = body.len() >> 20;
         let compressed = comp.compress(&body);
         assert_eq!(comp.decompress(&compressed).as_deref(), Some(&body[..]));

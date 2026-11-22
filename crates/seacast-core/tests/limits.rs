@@ -22,6 +22,10 @@ struct Env {
     /// `RetryOffer` timers armed, and penalties reported.
     retries: usize,
     penalties: usize,
+    /// Peers whose writer is currently mid-write (`RuntimeEnv::is_writing`).
+    writing: Vec<PeerId>,
+    /// Peers woken by `RuntimeEnv::wake_writer`.
+    woken: Vec<PeerId>,
 }
 
 impl RuntimeEnv<Vec<u8>> for Env {
@@ -32,6 +36,12 @@ impl RuntimeEnv<Vec<u8>> for Env {
         if matches!(event, TimerEvent::RetryOffer(_)) {
             self.retries += 1;
         }
+    }
+    fn wake_writer(&mut self, peer: PeerId) {
+        self.woken.push(peer);
+    }
+    fn is_writing(&self, peer: PeerId) -> bool {
+        self.writing.contains(&peer)
     }
     fn start_decode(&mut self, _group: GroupId, _job: seacast_core::DecodeJob<'_, Vec<u8>>) {}
     fn deliver(&mut self, _group: GroupId, _object: Vec<u8>) {
@@ -255,7 +265,7 @@ fn chunk(group: GroupId, index: u32, root: BlockRoot) -> Chunk {
     cached_id[39] = root[0];
     let mut frame = root.to_vec();
     frame.extend_from_slice(&[index as u8; 8]);
-    ChunkMsg { group, index, frame, cached_id, memo: [0; 32] }
+    ChunkMsg { group, index, frame, cached_id, memo: [0; 32], wire_len: 0 }
 }
 
 fn peer_join(interest: InterestKind) -> Join {
@@ -291,7 +301,14 @@ impl World {
     ) -> Self {
         let mut world = Self {
             node: SeacastNode::new(config),
-            env: Env { now: 1.0, delivered: 0, retries: 0, penalties: 0 },
+            env: Env {
+                now: 1.0,
+                delivered: 0,
+                retries: 0,
+                penalties: 0,
+                writing: Vec::new(),
+                woken: Vec::new(),
+            },
             catalog,
             rng: SplitMix64::new(7),
             store: BoundedDeferredStore::default(),
@@ -2032,4 +2049,139 @@ fn the_first_push_of_a_group_to_a_peer_is_marked() {
     let sent = world.drain(1);
     assert!(sent.iter().any(|e| e.solicited && e.chunk.is_some()));
     assert!(sent.iter().all(|e| !e.first_of_group));
+}
+
+/// A second copy under an unseen id for an index already received on an axis
+/// is acknowledged there and not forwarded; one held only as rebuilt is still
+/// forwarded (`protocol-v2.md` §4.2, §4.4).
+#[test]
+fn a_second_id_for_a_received_index_is_not_forwarded() {
+    let mut world = World::new(Catalog::new(4, 2), 3, InterestKind::All);
+    for peer in 1..=3 {
+        world.node.push_out.insert((peer, TYPE, 0, 0));
+    }
+    let g = group(1);
+    let first = chunk(g, 0, [1; 32]);
+    world.rpc(1, chunk_rpc(first.clone()));
+    assert!(world.drain(2).iter().any(|e| e.chunk.is_some()));
+    assert!(world.drain(3).iter().any(|e| e.chunk.is_some()));
+    world.drain(1);
+    // Clear gossip history by shifting it out.
+    for _ in 0..4 {
+        world.node.gossip_history.shift();
+    }
+
+    // Second copy with a different unseen id: acknowledged to sender, not
+    // forwarded to peer 3, and not added to gossip history.
+    let mut second = first.clone();
+    second.cached_id[58] ^= 0xff;
+    world.rpc(2, chunk_rpc(second));
+    let acks = world.drain(2);
+    assert!(acks.iter().any(|e| e.haves.iter().any(|h| !h.offer && h.group == g && h.bits.has(0))));
+    assert!(world.drain(3).is_empty());
+    assert!(world.node.gossip_history.gossip_group_bits().is_empty());
+
+    // Now test an index held only as rebuilt: open g2 with chunk 1, decode to
+    // rebuild chunk 0, drain, then receive chunk 0 under an unseen id.
+    let g2 = group(2);
+    let c1 = chunk(g2, 1, [2; 32]);
+    world.rpc(1, chunk_rpc(c1.clone()));
+    let c0_rebuilt = chunk(g2, 0, [2; 32]);
+    let rebuilt = [c0_rebuilt.clone(), c1];
+    let (env, catalog, rng) = (&mut world.env, &mut world.catalog, &mut world.rng);
+    world.node.on_decoded(g2, Some(vec![0]), &rebuilt, env, catalog, rng);
+    for peer in 1..=3 {
+        world.drain(peer);
+    }
+    for _ in 0..4 {
+        world.node.gossip_history.shift();
+    }
+    assert!(world.node.groups.bits(&g2, GroupBits::Rebuilt).is_some_and(|b| b.has(0)));
+    assert!(!world.node.groups.bits(&g2, GroupBits::Received).is_some_and(|b| b.has(0)));
+
+    let mut c0_net = c0_rebuilt;
+    c0_net.cached_id[58] ^= 0xaa;
+    world.rpc(1, chunk_rpc(c0_net));
+    // Forwarded to peer 2 or 3 (not skipped because it was rebuilt only).
+    let forwarded = world.drain(2).iter().any(|e| e.chunk.is_some() || !e.haves.is_empty()) ||
+        world.drain(3).iter().any(|e| e.chunk.is_some() || !e.haves.is_empty());
+    assert!(forwarded);
+    assert!(!world.node.gossip_history.gossip_group_bits().is_empty());
+}
+
+/// A writer mid-write keeps its place in the window's waiter line without
+/// stalling writers behind it, and `write_waits` wakes the next writer that can
+/// write only while room is free (`protocol-v2.md` §4.11, `protocol.md` §7.1).
+#[test]
+fn the_window_line_skips_a_writer_mid_write() {
+    let config = NodeConfig { chunk_bytes: 32, ..NodeConfig::default() };
+    let window = config.window_bytes();
+    let mut world = World::with_config(config, Catalog::new(4, 4), 3, InterestKind::All);
+    let g = group(1);
+    let mut c = chunk(g, 0, [0; 32]);
+    c.frame = vec![0u8; window];
+    world.node.chunks.insert((g, 0), c);
+    for peer in 1..=3 {
+        assert!(world.node.enqueue(
+            peer,
+            Queued::Chunk { group: g, index: 0, solicited: false },
+            false,
+            &mut world.env,
+        ));
+    }
+
+    // Peer 1 fills the window; peers 2 and 3 join the waiter line in order.
+    assert!(matches!(
+        world.node.next_to_send(1, &mut world.env, &world.catalog),
+        DispatchOutcome::Send(_)
+    ));
+    assert!(matches!(
+        world.node.next_to_send(2, &mut world.env, &world.catalog),
+        DispatchOutcome::Wait
+    ));
+    assert!(matches!(
+        world.node.next_to_send(3, &mut world.env, &world.catalog),
+        DispatchOutcome::Wait
+    ));
+
+    // Peer 2 is mid-write when window is full: write_waits wakes nobody.
+    world.env.writing.push(2);
+    world.env.woken.clear();
+    world.node.write_waits(2, &mut world.env);
+    assert!(world.env.woken.is_empty());
+
+    // Freeing peer 1's room skips peer 2 and wakes peer 3.
+    world.node.sends.window_release(1, g, 0, &mut world.env);
+    assert_eq!(world.env.woken, vec![3]);
+
+    // Peer 3 acquires room while peer 2 keeps its place in line.
+    assert!(matches!(
+        world.node.next_to_send(3, &mut world.env, &world.catalog),
+        DispatchOutcome::Send(_)
+    ));
+
+    // Peer 2 finishes its write and peer 3's room frees: peer 2 is woken.
+    world.env.writing.clear();
+    world.env.woken.clear();
+    world.node.sends.window_release(3, g, 0, &mut world.env);
+    assert_eq!(world.env.woken, vec![2]);
+
+    // Peer 2 becomes mid-write again while room is free: write_waits wakes
+    // peer 3 if peer 3 is waiting behind it.
+    assert!(world.node.enqueue(
+        3,
+        Queued::Chunk { group: g, index: 0, solicited: false },
+        false,
+        &mut world.env,
+    ));
+    // Re-queue peer 3 into the waiter line behind peer 2 (window has room,
+    // front is peer 2 since writing is cleared, so peer 3 waits).
+    assert!(matches!(
+        world.node.next_to_send(3, &mut world.env, &world.catalog),
+        DispatchOutcome::Wait
+    ));
+    world.env.writing.push(2);
+    world.env.woken.clear();
+    world.node.write_waits(2, &mut world.env);
+    assert_eq!(world.env.woken, vec![3]);
 }

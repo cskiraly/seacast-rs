@@ -38,6 +38,7 @@ macro_rules! each_kernel {
 #[cfg(target_arch = "x86_64")]
 mod avx2;
 mod fft;
+#[allow(dead_code)]
 mod gf16;
 #[cfg(target_arch = "x86_64")]
 mod gfni;

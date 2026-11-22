@@ -8,7 +8,7 @@ use crate::{
         MerkleProof, MerkleTree, build_merkle_layers, leaf_hash, merkle_proof_from_layers,
         proven_leaf_hash, tree_width, verify_leaf_path,
     },
-    reed_solomon::{WIDE_BLOCK, rs_complete_in_place, rs_parity_rows, rs_reconstruct_into},
+    reed_solomon::{rs_complete_in_place, rs_parity_rows, rs_reconstruct_into},
     sha256::{Sha256, sha256_prefixed_many},
     snappy,
     wire::ChunkHead,
@@ -22,10 +22,9 @@ pub const UNIT: usize = 16 * 1024;
 /// `[c6]`).
 pub const MAX_CHUNKS: u32 = 256;
 
-/// Maximum chunks of a coded group. One of more than [`MAX_CHUNKS`] is coded
-/// over `GF(2^16)`, with a segment size of whole [`WIDE_BLOCK`]s. Not in the
-/// specification, where a body past `MAX_CHUNKS / 2` segments goes plain.
-pub const MAX_CODED_CHUNKS: u32 = MAX_PLAIN_CHUNKS as u32;
+/// Maximum chunks of a coded group (`MAX_CHUNKS`, `protocol.md` §1 `[c6]`). A
+/// body past `MAX_CHUNKS / 2` segments goes plain.
+pub const MAX_CODED_CHUNKS: u32 = MAX_CHUNKS;
 
 /// Maximum plain (uncoded) chunks supported by a group (`MAX_BITMAP_BITS =
 /// 512`).
@@ -180,11 +179,7 @@ impl SegmentDescriptor {
         }
         match self.version {
             2 => {
-                self.encoding == 1 &&
-                    self.count <= MAX_CODED_CHUNKS &&
-                    self.count as u64 == 2 * k as u64 &&
-                    (self.count <= MAX_CHUNKS ||
-                        self.segment_size.is_multiple_of(WIDE_BLOCK as u32))
+                self.encoding == 1 && self.count <= MAX_CHUNKS && self.count as u64 == 2 * k as u64
             }
             1 => self.encoding == 0 && self.count == k && (self.count as usize) <= MAX_PLAIN_CHUNKS,
             _ => false,
@@ -326,20 +321,14 @@ where
     Comp: Compressor,
 {
     assert!(!body.is_empty(), "body must not be empty");
-    let mut k = body.len().div_ceil(UNIT);
-    let coded = 2 * k <= MAX_CODED_CHUNKS as usize;
+    let k = body.len().div_ceil(UNIT);
+    let coded = 2 * k <= MAX_CHUNKS as usize;
     // Coded, the compressed bytes are padded in place to `k` whole segments: the
     // Reed–Solomon input as it stands, with no copy per segment.
     let mut compressed = if coded { compressor.compress(body) } else { Vec::new() };
     let total = if coded { compressed.len() } else { body.len() };
     assert!(total > 0, "the compressor returned nothing");
-    let mut size = total.div_ceil(k);
-    // Past `MAX_CHUNKS` a segment is whole blocks of the wide code. The longer
-    // segment can leave fewer of them.
-    if coded && 2 * k > MAX_CHUNKS as usize {
-        size = size.next_multiple_of(WIDE_BLOCK);
-        k = total.div_ceil(size);
-    }
+    let size = total.div_ceil(k);
     let mut parity = Vec::new();
     if coded {
         compressed.resize(k * size, 0);
@@ -448,6 +437,7 @@ where
                 cached_id: chunk_id(&group, shard.index, &content),
                 frame: pool.alloc_from_slice(&frame),
                 memo: leaf,
+                wire_len: 0,
             }
         })
         .collect()
@@ -678,6 +668,7 @@ where
                 cached_id: chunk_id(&group, idx, &content),
                 frame: pool.alloc_from_slice(&frame),
                 memo: tree.leaf(i),
+                wire_len: 0,
             };
             let _ = out_rebuilt.push(msg);
         }
@@ -773,9 +764,7 @@ mod tests {
             state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             (state >> 56) as u8
         };
-        // The last two are past `MAX_CHUNKS`: coded over `GF(2^16)`.
-        for len in [1, 1000, UNIT, UNIT + 1, 7 * UNIT + 99, 128 * UNIT, 128 * UNIT + 1, 300 * UNIT]
-        {
+        for len in [1, 1000, UNIT, UNIT + 1, 7 * UNIT + 99, 128 * UNIT] {
             for compressible in [false, true] {
                 let body: Vec<u8> = (0..len)
                     .map(|i| if compressible { (i / 7 % 13) as u8 } else { noise() })
@@ -784,7 +773,6 @@ mod tests {
                 assert!(desc.is_valid() && desc.version == 2, "{len} bytes");
                 let (k, n) = (desc.k() as usize, desc.n() as usize);
                 assert_eq!((shards.len(), n), (n, 2 * k));
-                assert!(compressible || len <= 128 * UNIT || n > MAX_CHUNKS as usize);
                 let subsets: [Vec<usize>; 4] = [
                     (0..k).collect(),
                     (k..n).collect(),
@@ -887,7 +875,7 @@ mod tests {
     fn test_decode_in_place() {
         let mut pool = VecBufferPool;
         let comp = SnappyBlockCompressor;
-        for len in [1, UNIT + 1, 7 * UNIT + 99, 128 * UNIT, 300 * UNIT] {
+        for len in [1, UNIT + 1, 7 * UNIT + 99, 128 * UNIT] {
             let body: Vec<u8> = (0..len).map(|i| (i / 5 % 17) as u8 ^ (i >> 9) as u8).collect();
             let (desc, shards) = build_group::<Vec<u8>, _, _>(&body, &mut pool, &comp);
             let (k, n, size) = (desc.k() as usize, desc.n() as usize, desc.segment_size as usize);
@@ -1017,5 +1005,16 @@ mod tests {
             decode_and_reencode(&available[1..], CONTEXT.len(), &mut pool, &comp, &mut rebuilt,),
             None
         );
+        // A coded descriptor past `MAX_CHUNKS` is rejected (`protocol.md` §1).
+        let wide_coded = SegmentDescriptor {
+            version: 2,
+            hash_id: 0,
+            encoding: 1,
+            count: MAX_CHUNKS + 2,
+            segment_size: UNIT as u32,
+            total_length: ((MAX_CHUNKS / 2 + 1) as u64) * (UNIT as u64),
+            root: [0; 32],
+        };
+        assert!(!wide_coded.is_valid());
     }
 }

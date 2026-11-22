@@ -89,12 +89,13 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             .unwrap_or(Bitmap::EMPTY)
     }
 
-    /// Forwards a verified chunk along each projected `(group, index)` axis
+    /// Forwards a verified chunk along each `(group, index)` axis in `axes`
     /// where we have `FORWARD` duty (`protocol-v2.md` §4.4 `forward`).
     pub fn forward<E, C, R>(
         &mut self,
         chunk: &ChunkMsg<B>,
         from_peer: PeerId,
+        axes: &[(GroupId, u32)],
         env: &mut E,
         catalog: &C,
         rng: &mut R,
@@ -103,7 +104,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
         R: RngSource,
     {
-        for (g, i) in Self::projections(catalog, chunk) {
+        for &(g, i) in axes {
             if self.expired(&g) || self.dropped(&g) {
                 continue;
             }

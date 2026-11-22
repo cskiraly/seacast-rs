@@ -118,6 +118,7 @@ mod tests {
             frame: frame.clone(),
             cached_id: [0; 59],
             memo: [0; 32],
+            wire_len: 0,
         };
         let mut codec = StandaloneCodec { context_len: 4, max_data: 64 };
         assert!(codec.check(&chunk));

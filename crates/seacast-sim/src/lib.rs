@@ -754,6 +754,7 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                     frame: SimBlob { byte_len: cfg.chunk_size, tag: (i as u64) + 1 },
                     cached_id: sim_chunk_id(&g, i, &digest),
                     memo: [0; 32],
+                    wire_len: 0,
                 });
             }
             canonical_chunks.insert(g, g_chunks);
@@ -784,6 +785,7 @@ pub fn run_simulation(cfg: SimConfig) -> SimReport {
                         frame: SimBlob { byte_len: 2096, tag: ((col as u64) << 16) | (row as u64) },
                         cached_id: sim_chunk_id(&g, row, &[0; 32]),
                         memo: [0; 32],
+                        wire_len: 0,
                     });
                 }
                 canonical_chunks.insert(g, g_chunks);

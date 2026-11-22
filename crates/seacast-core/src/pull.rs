@@ -145,16 +145,18 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     /// Handles incoming `Want` asks from `peer` (`protocol-v2.md` §4.5
     /// `on_want`), returning deduplicated `(group, index)` answers with
     /// zero heap allocation.
-    pub fn on_want<E, C>(
+    pub fn on_want<E, C, R>(
         &mut self,
         peer: PeerId,
         wants: &[Want],
         env: &mut E,
         catalog: &C,
+        rng: &mut R,
     ) -> InlineVec<(GroupId, u32), MAX_BITMAP_BITS>
     where
         E: RuntimeEnv<B>,
         C: ObjectCatalog<B>,
+        R: RngSource,
     {
         let mut answers: InlineVec<(GroupId, u32), MAX_BITMAP_BITS> = InlineVec::new();
         let mut seen_mids: InlineVec<ChunkId, MAX_BITMAP_BITS> = InlineVec::new();
@@ -247,7 +249,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                         self.standing.insert((g, idx), peer);
                     }
                     if routed {
-                        self.route_want(peer, t, g, idx, w.hops, env, catalog);
+                        self.route_want(peer, t, g, idx, w.hops, env, catalog, rng);
                     }
                     continue;
                 };
@@ -289,10 +291,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     /// Passes a routed sample request this node cannot answer one step on: to
     /// a link that serves the index, or, where none does and steps are left,
     /// to a forwarding link (`protocol-v2.md` §4.5 `route_want`). At the limit
-    /// or without a route it says nothing: the sampler's wait moves it on. The
-    /// link is the one of the largest keyed hash, as in `announcers`.
+    /// or without a route it says nothing: the sampler's wait moves it on.
     #[allow(clippy::too_many_arguments)]
-    fn route_want<E, C>(
+    fn route_want<E, C, R>(
         &mut self,
         peer: PeerId,
         t: TypeId,
@@ -301,9 +302,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         hops: u8,
         env: &mut E,
         catalog: &C,
+        rng: &mut R,
     ) where
         E: RuntimeEnv<B>,
         C: ObjectCatalog<B>,
+        R: RngSource,
     {
         // By node: a connection's end does not reset the count.
         let Some(id) = self.slots.get(peer).map(|s| s.node_id) else {
@@ -319,22 +322,17 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return;
         }
         let now = env.now();
-        // Of those that serve the index, else of those that pass it on, the one a
-        // hash under the node's secret puts first.
-        let key = self.config.order_key;
-        let order = |q: &PeerId| fxhash::hash64(&(key, group, index, *q));
-        let serves = |q: &PeerId| {
-            self.join_recv(*q, t).is_some_and(|j| j.interest != InterestKind::Declared) &&
-                self.interest_of_peer(*q, &group, catalog).has(index) &&
-                !self.parked(*q, &group, now)
-        };
-        let others = || self.peers_of(self.links(t)).filter(|&q| q != peer);
         let mut left = 0;
-        let mut pick = others().filter(serves).max_by_key(order);
+        let mut pick = self.choose_one(self.links(t), rng, |q| {
+            q != peer &&
+                self.join_recv(q, t).is_some_and(|j| j.interest != InterestKind::Declared) &&
+                self.interest_of_peer(q, &group, catalog).has(index) &&
+                !self.parked(q, &group, now)
+        });
         if pick.is_none() && hops > 1 {
-            let passes =
-                |q: &PeerId| self.join_recv(*q, t).is_some_and(|j| j.duty == Duty::Forward);
-            pick = others().filter(passes).max_by_key(order);
+            pick = self.choose_one(self.links(t), rng, |q| {
+                q != peer && self.join_recv(q, t).is_some_and(|j| j.duty == Duty::Forward)
+            });
             left = hops - 1;
         }
         let Some(q) = pick else {
@@ -587,16 +585,21 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     }
 
     /// Where `q` stands among the announcers of `ask`, smaller first: the offer
-    /// list in its order, then the others in an order no peer can arrange, by a
-    /// hash of the ask and the peer under the node's secret, larger first
-    /// (`protocol.md` §6.1).
+    /// list in its order, then the others by HMAC-SHA-256 of the ask and peer
+    /// under `NodeConfig::order_key`, larger first (`protocol.md` §6.1).
     fn announcer_rank(&self, ask: Ask, q: PeerId) -> (u64, u64, u64) {
         let listed = self.offers.get(&ask).and_then(|list| list.iter().position(|&p| p == q));
         match listed {
             Some(at) => (0, at as u64, 0),
             None => {
-                let key = self.config.order_key;
-                (1, !fxhash::hash64(&(key, ask.group, ask.index, q)), !q)
+                let mut msg = [0u8; 47];
+                msg[0] = ask.group.type_id.0;
+                msg[1..33].copy_from_slice(&ask.group.key);
+                msg[33..35].copy_from_slice(&ask.group.index.to_le_bytes());
+                msg[35..39].copy_from_slice(&ask.index.to_le_bytes());
+                msg[39..47].copy_from_slice(&q.to_le_bytes());
+                let score = crate::hmac::hmac_sha256_u64(&self.config.order_key, &msg);
+                (1, !score, !q)
             }
         }
     }

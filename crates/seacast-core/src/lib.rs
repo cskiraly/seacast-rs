@@ -19,6 +19,7 @@ pub mod bitmap;
 pub mod collections;
 pub mod gossip;
 pub mod groups;
+mod hmac;
 pub mod message;
 pub mod node;
 pub mod pull;
@@ -190,6 +191,7 @@ mod tests {
                     frame,
                     cached_id,
                     memo: [0; 32],
+                    wire_len: 0,
                 });
             }
             Some(pool.alloc_from_slice(&[0xAA; 16]))
@@ -272,6 +274,7 @@ mod tests {
             frame: pool_tmp.alloc_from_slice(&[10, 20, 30, 40]),
             cached_id: id0,
             memo: [0; 32],
+            wire_len: 0,
         };
         let mut id1 = [0u8; 59];
         id1[1..33].copy_from_slice(&group.key);
@@ -282,6 +285,7 @@ mod tests {
             frame: pool_tmp.alloc_from_slice(&[50, 60, 70, 80]),
             cached_id: id1,
             memo: [0; 32],
+            wire_len: 0,
         };
 
         // A peer's messages count once it has joined the type on the link

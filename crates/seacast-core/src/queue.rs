@@ -238,6 +238,32 @@ impl SendQueues {
         self.owed_answers.drop_group(group);
     }
 
+    /// The first peer in the waiter line whose writer can write (`protocol.md`
+    /// §7.1 `front`).
+    fn front<B: ChunkBuffer, E: RuntimeEnv<B>>(&self, env: &E) -> Option<PeerId> {
+        self.waiters.iter().copied().find(|&q| !env.is_writing(q))
+    }
+
+    /// Wakes the first writer in line that can write, if the window has room
+    /// (`protocol-v2.md` §4.11 `wake_front`).
+    pub fn wake_front<B: ChunkBuffer, E: RuntimeEnv<B>>(&self, env: &mut E) {
+        if self.in_flight >= self.config.window_bytes() {
+            return;
+        }
+        if let Some(q) = self.front(env) {
+            env.wake_writer(q);
+        }
+    }
+
+    /// `peer`'s write has not completed (`protocol-v2.md` §4.11 `write_waits`):
+    /// if `peer` is in the waiter line, wakes the first writer in line that can
+    /// write, if the window has room.
+    pub fn write_waits<B: ChunkBuffer, E: RuntimeEnv<B>>(&self, peer: PeerId, env: &mut E) {
+        if self.waiters.contains(&peer) {
+            self.wake_front(env);
+        }
+    }
+
     /// Attempts to acquire `need` bytes in the node-wide congestion window for
     /// `peer`'s writer (`protocol-v2.md` §4.11 `acquire_room(p, need)`).
     pub fn acquire_room<B: ChunkBuffer, E: RuntimeEnv<B>>(
@@ -248,16 +274,13 @@ impl SendQueues {
     ) -> bool {
         let w_bytes = self.config.window_bytes();
         let fits = self.in_flight.saturating_add(need) <= w_bytes || self.in_flight == 0;
-        if fits && (self.waiters.is_empty() || self.waiters.front() == Some(&peer)) {
-            if !self.waiters.is_empty() {
-                self.waiters.pop_front();
+        let first = self.front(env);
+        if fits && (first.is_none() || first == Some(peer)) {
+            if let Some(pos) = self.waiters.position(|&q| q == peer) {
+                self.waiters.remove(pos);
             }
             self.in_flight = self.in_flight.saturating_add(need);
-            if let Some(&next_peer) = self.waiters.front() {
-                if self.in_flight < w_bytes {
-                    env.wake_writer(next_peer);
-                }
-            }
+            self.wake_front(env);
             return true;
         }
         if !self.waiters.contains(&peer) {
@@ -270,12 +293,7 @@ impl SendQueues {
     pub fn leave_line<B: ChunkBuffer, E: RuntimeEnv<B>>(&mut self, peer: PeerId, env: &mut E) {
         if let Some(pos) = self.waiters.position(|&q| q == peer) {
             self.waiters.remove(pos);
-            let w_bytes = self.config.window_bytes();
-            if let Some(&next_peer) = self.waiters.front() {
-                if self.in_flight < w_bytes {
-                    env.wake_writer(next_peer);
-                }
-            }
+            self.wake_front(env);
         }
     }
 
@@ -339,12 +357,10 @@ impl SendQueues {
     }
 
     /// Returns `need` bytes to the congestion window and wakes the first
-    /// waiting writer (`free_room`).
+    /// waiting writer that can write (`free_room`).
     pub fn free_room<B: ChunkBuffer, E: RuntimeEnv<B>>(&mut self, need: usize, env: &mut E) {
         self.in_flight = self.in_flight.saturating_sub(need);
-        if let Some(&first) = self.waiters.front() {
-            env.wake_writer(first);
-        }
+        self.wake_front(env);
     }
 
     pub fn has_owed_offers(&self, peer: PeerId) -> bool {
@@ -372,6 +388,16 @@ fn owe_single(owed: &mut PreallocDeque<GroupId>, group: GroupId) {
 }
 
 impl<B: ChunkBuffer> SeacastNode<B> {
+    /// `peer`'s writer has started to wait on its transport (`protocol-v2.md`
+    /// §4.11 `write_waits`): if `peer` is in the window's waiter line, wakes
+    /// the first writer in line that can write, if room is free.
+    pub fn write_waits<E>(&self, peer: PeerId, env: &mut E)
+    where
+        E: RuntimeEnv<B>,
+    {
+        self.sends.write_waits(peer, env);
+    }
+
     /// Selects and filters the next queue entry to write to `peer`
     /// (`protocol-v2.md` §4.11 `next_to_send`).
     pub fn next_to_send<E, C>(

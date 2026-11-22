@@ -261,8 +261,14 @@ pub fn decode_chunk<B: ChunkBytes>(
     if frame.len() != len {
         return Err(Violation);
     }
-    let mut chunk =
-        ChunkMsg { group: head.group, index: head.index, cached_id: [0; 59], frame, memo: [0; 32] };
+    let mut chunk = ChunkMsg {
+        group: head.group,
+        index: head.index,
+        cached_id: [0; 59],
+        frame,
+        memo: [0; 32],
+        wire_len: compressed.len() as u32,
+    };
     layout.identify(&mut chunk);
     Ok(Some(chunk))
 }
@@ -373,10 +379,12 @@ pub fn encode_entry<B: ChunkBytes>(
     }
 }
 
-/// The bytes a chunk takes on the stream, its frame counted uncompressed
-/// (§1.7).
+/// The bytes a chunk takes on the stream (`protocol-v2-bindings.md` §1.5),
+/// using its compressed frame length when set on `chunk.wire_len` and falling
+/// back to `chunk.frame.len()` otherwise.
 pub fn chunk_wire_size<B: ChunkBuffer>(chunk: &ChunkMsg<B>) -> usize {
-    let len = 1 + ChunkHead::BYTES + chunk.frame.len();
+    let frame_len = if chunk.wire_len > 0 { chunk.wire_len as usize } else { chunk.frame.len() };
+    let len = 1 + ChunkHead::BYTES + frame_len;
     uvarint_len(len) + len
 }
 
@@ -520,8 +528,14 @@ mod tests {
     fn test_chunk_roundtrip() {
         let frame: Vec<u8> = (0..5000u32).map(|i| (i % 7) as u8).collect();
         let layout = ChunkLayout::Standalone { context_len: 0, max_data: frame.len() };
-        let mut chunk =
-            ChunkMsg { group: group(), index: 9, cached_id: [0; 59], frame, memo: [0; 32] };
+        let mut chunk = ChunkMsg {
+            group: group(),
+            index: 9,
+            cached_id: [0; 59],
+            frame,
+            memo: [0; 32],
+            wire_len: 0,
+        };
         layout.identify(&mut chunk);
         let mut out = Vec::new();
         let no_extension = |_: &ChunkMsg<Vec<u8>>, _: &mut Vec<u8>| panic!("not a first push");
@@ -530,6 +544,8 @@ mod tests {
         assert_eq!((kind, used), (KIND_CHUNK, out.len()));
         let decompress = |c: &[u8], len: usize| snappy::decompress(c, len);
         let back = decode_chunk(body, |_| Some(layout), decompress).unwrap().unwrap();
+        assert_eq!(chunk_wire_size(&back), out.len());
+        chunk.wire_len = back.wire_len;
         assert_eq!(back, chunk);
         assert_eq!(back.cached_id[..ChunkHead::BYTES], ChunkHead::of(&chunk).encode());
 

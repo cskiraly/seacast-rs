@@ -454,7 +454,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 let _ = wants.push(*w);
             }
         }
-        let answers = self.on_want(peer, &wants, env, catalog);
+        let answers = self.on_want(peer, &wants, env, catalog, rng);
         // A GRAFT's answer goes on its own, in the order of the link's relation
         // messages (§4.1).
         for gr in rpc.grafts {

@@ -63,7 +63,7 @@ Questions that need Silver's code read (tcache):
 - **Running the transform in the parity chunks themselves, with no work buffer, was tried and was slower.** Chunks a multiple of the page size apart land in the same cache sets.
 - **`fft::parity` allocates its work buffer on every call**, K strips.
 - **Recovery over GF(2^8) is still by matrix.** Its cost grows with the chunks lost; a transform-based erasure decode would bound it. Not tried there.
-- **A group of more than 256 chunks is coded over GF(2^16)** (`reed_solomon/gf16.rs`), with the code and the chunk layout of Leopard-RS: a chunk is a Leopard shard. A product by a constant is linear over GF(2), so it is four maps of a byte to a byte and the kernels are shared: each has a butterfly over two planes and builds its coefficient from such a map (`linear`). Open points:
+- **The `GF(2^16)` Leopard-RS implementation (`reed_solomon/gf16.rs`) is kept in `seacast-codec` (`#[allow(dead_code)]`)**, but `segment.rs` enforces the specification's `MAX_CHUNKS = 256` limit for coded groups (`version == 2`), sending larger bodies plain (`version == 1`). Open points on `gf16.rs` if it is ever enabled:
   - **A 10 MiB body is not coded.** K = 640 gives 1280 chunks and a bitmap names 1024 (`BITMAP_WORDS`). Twenty words would take it, and widen every bitmap, queue entry and pair record. The code's tables follow `MAX_BITMAP_BITS`.
   - **The format is not in the specification.** It is that of `leo_encode` of Leopard-RS with as many recovery shards as original ones, and the descriptor does not name it: the count alone says which field. A change needs a descriptor version.
   - **Compatibility is checked against parity from one build of the reference** (`github.com/catid/leopard` at `910ad0a`, the legacy `leo_encode`): six cases, by a hash and the first bytes, in `test_parity_is_leopards`. The reference's decoder has not been run on chunks made here, and no port of Leopard (`reed-solomon-simd`, `klauspost/reedsolomon`) has been checked.
@@ -80,6 +80,14 @@ Questions that need Silver's code read (tcache):
   - **No group of more than 256 chunks has gone through the core or the simulator.** The codec's tests cover it; the core already took plain groups of that length.
   - **`MAX_CODED_BODY` is four times what it was**, so a host that reserves it per group reserves that much more, and a coded group may decompress to that.
 - **`gfni::row` is `#[inline]`** because adding the FFT module stopped it being inlined into `combine`, which slowed recovery. The other kernels' `row` were already out of line and are unchanged.
+
+## The specification's v0.10.4 to v0.10.11 changes
+
+Applied 2026-11-22:
+
+- **`on_validated` and `forward` skip axes where the index is already `Received`** (`protocol-v2.md` §4.2, §4.4, v0.10.6), while still forwarding an index held only as `Rebuilt`. Covered by `a_second_id_for_a_received_index_is_not_forwarded` in `crates/seacast-core/tests/limits.rs`.
+- **The window's waiter line skips writers mid-write** (`RuntimeEnv::is_writing`, `SeacastNode::write_waits`, `protocol-v2.md` §4.11, v0.10.7 and v0.10.9). `RuntimeEnv::is_writing` defaults to `false`, and the simulator does not model mid-write backpressure. Covered by `the_window_line_skips_a_writer_mid_write` in `crates/seacast-core/tests/limits.rs`.
+- **The gossipsub, Waggle, partial-messages and draft native QUIC bindings are not implemented**, and cell header form (c) has no wire kind defined in the specification.
 
 ## The specification's v0.10.2 to v0.10.4 changes
 
@@ -114,7 +122,7 @@ Open on the floors, the sampler and the rest of §4.1:
 
 - **`link_deficits` is called by nothing here.** The simulator opens no links. It is covered by one test in `crates/seacast-core/tests/limits.rs`. Silver's host is to poll it and to subtract the links it has opened that are not joined yet.
 - **`reset_period` is called by nothing here.** The simulator runs one block. Silver's host is to call it at the slot boundary.
-- **`NodeConfig::order_key` defaults to zero.** The host must draw it. The hash under it is `fxhash`, which is not cryptographic: a peer that learned many of the node's choices could recover the key. Nothing on the wire carries them.
+- **`NodeConfig::order_key` defaults to zero.** The host must draw it. Ordering beyond an ask's offer list uses HMAC-SHA-256 (`crates/seacast-core/src/hmac.rs`). Nothing on the wire carries it.
 - **The keyed order of the announcers has no test.**
 - **The symmetric relation is covered by one test with scripted peers.** No simulator setting uses a symmetric type.
 - **The sampler's second phase, its peer of high custody and its limit in flight are covered by one test.** The simulator's sampling setting reaches the first phase and routed requests of one step; `ROUTE_HOPS` above one has not been run.

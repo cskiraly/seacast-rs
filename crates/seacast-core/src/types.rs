@@ -393,9 +393,10 @@ pub struct NodeConfig {
     pub window_timeout: f64,
     /// Heartbeat period in seconds (`HEARTBEAT = 0.700s`).
     pub heartbeat: f64,
-    /// Secret of this node's order of the announcers beyond an ask's list,
-    /// drawn by the host at start and never sent (`protocol.md` §6.1).
-    pub order_key: u64,
+    /// Secret of this node's HMAC-SHA-256 order of the announcers beyond an
+    /// ask's list, drawn by the host at start and never sent (`protocol.md`
+    /// §6.1).
+    pub order_key: Bytes32,
     /// Minimum non-related gossip peers (`D_LAZY = 6`).
     pub d_lazy: usize,
     /// Fraction of non-related eligible peers sampled for gossip
@@ -590,7 +591,7 @@ impl Default for NodeConfig {
             chunk_bytes: 12_000,
             window_timeout: 0.500,
             heartbeat: 0.700,
-            order_key: 0,
+            order_key: [0; 32],
             d_lazy: 6,
             gossip_factor: 0.25,
             gossip_retransmission: 3,
