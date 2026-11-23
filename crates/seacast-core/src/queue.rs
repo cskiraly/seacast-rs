@@ -425,6 +425,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             }
             if let Some(urgent_entry) = self.take_head(peer, true) {
                 if let Some(out) = self.with_owed(peer, urgent_entry) {
+                    self.note_offers_written(peer, &out);
                     return DispatchOutcome::Send(out);
                 }
                 continue;
@@ -434,6 +435,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             if normal_empty {
                 if self.sends.has_owed_offers(peer) {
                     if let Some(out) = self.with_owed(peer, QueueEntry::empty()) {
+                        self.note_offers_written(peer, &out);
                         return DispatchOutcome::Send(out);
                     }
                 }
@@ -482,8 +484,19 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                     }
                 }
                 if let Some(final_entry) = self.with_owed(peer, out_entry) {
+                    self.note_offers_written(peer, &final_entry);
                     return DispatchOutcome::Send(final_entry);
                 }
+            }
+        }
+    }
+
+    /// Records offers written to `peer` so answers to asks on them are exempt
+    /// from `SERVE_BUDGET` (`seacast.md` §4.5 `offers_in`).
+    fn note_offers_written(&mut self, peer: PeerId, entry: &QueueEntry<B>) {
+        for h in entry.haves.iter() {
+            if h.offer {
+                self.pairs.add_offered_to((peer, h.group), &h.bits);
             }
         }
     }

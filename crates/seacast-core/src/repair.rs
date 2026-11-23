@@ -47,8 +47,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
 
         // A group this node has not opened has no claim to act on and no holders to
         // count: both are taken from `peer_has` when it opens (`open_group`).
+        // A peer becomes a claimant only on a link that joined the type
+        // (`seacast.md` §4.3).
         let open = self.groups.get(&h.group).is_some_and(|r| r.t_of.is_some());
-        if h.claim_all && open {
+        if h.claim_all && open && self.is_linked(peer, h.group.type_id) {
             self.note_claim(peer, h.group, env, catalog, rng);
         }
         for i in newly.iter() {
@@ -773,7 +775,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let scope = catalog.sample_scope(&group);
         let missing = Bitmap::singleton(index);
         let in_flight = self.samples_in_flight.get(&scope).copied().unwrap_or(0);
-        if !first && in_flight >= prm.sample_outstanding.max(1) {
+        if !first && in_flight >= self.config.sample_outstanding.max(1) {
             // Asked when a second-phase ask ends.
             if !self.held_samples.push_back((scope, group, index)) {
                 env.unreachable(group, missing);
@@ -859,7 +861,6 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
         R: RngSource,
     {
-        let t = group.type_id;
         let scope = catalog.sample_scope(&group);
         if !first {
             if let Some(n) = self.samples_in_flight.get_mut(&scope) {
@@ -879,7 +880,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             }
             self.ask_sample(group, index, false, env, catalog, rng);
         }
-        let cap = catalog.params(t).sample_outstanding.max(1);
+        // Room left in flight goes to held samples of this scope, even when the
+        // timed-out group has expired (`seacast.md` §4.10).
+        let cap = self.config.sample_outstanding.max(1);
         while self.samples_in_flight.get(&scope).copied().unwrap_or(0) < cap {
             let Some(at) = self.held_samples.position(|h| h.0 == scope) else {
                 break;

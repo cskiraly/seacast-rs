@@ -179,13 +179,10 @@ pub enum PenaltyReason {
     /// (`protocol.md` §4.3, §8.2).
     InvalidHaveBitmap,
     /// Peer sent an ask for a chunk it already claimed in `peer_has`
-    /// (`protocol.md` §4.5).
+    /// (`seacast-lite.md` §4.5).
     AskedForClaimedChunk,
-    /// Peer asked for an index this node neither holds nor has in its interest:
-    /// one it was never offered (`protocol-v2.md` §4.5).
-    AskOutsideOfferOrInterest,
     /// Peer claimed `claim_all` on a group and failed to answer the
-    /// verification probe (`protocol-v2.md` §4.6 `R5`).
+    /// verification probe (`seacast.md` §4.6 `R5`).
     UnansweredClaimProbe,
 }
 

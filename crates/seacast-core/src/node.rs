@@ -76,6 +76,9 @@ pub struct SeacastNode<B> {
     pub serve_count: PreallocMap<(PeerId, ChunkId), usize>,
     pub unwanted: PreallocSet<(PeerId, ChunkId)>,
     pub standing: PeerSets<(GroupId, u32)>,
+    /// Peers whose standing request for a chunk was routed (`seacast.md` §4.5
+    /// `routed_standing`).
+    pub routed_standing: PeerSets<(GroupId, u32)>,
     /// The peers that claim each group whole (`claims`).
     pub claims: PeerSets<GroupId>,
 
@@ -114,10 +117,10 @@ pub struct SeacastNode<B> {
     /// Samples held back by `SAMPLE_OUTSTANDING`: scope, group, index
     /// (`held_samples`).
     pub held_samples: PreallocDeque<(GroupId, GroupId, u32)>,
-    /// Routed requests of a node passed on since `reset_period`
-    /// (`protocol-v2.md` §4.5 `forwarded`, X6). By node, so that connecting
-    /// again does not reset the count.
-    pub forwarded: PreallocMap<NodeId, usize>,
+    /// Routed requests of a node passed on per type since `reset_period`
+    /// (`seacast.md` §4.5 `forwarded`, X6). By node, so that connecting again
+    /// does not reset the count.
+    pub forwarded: PreallocMap<(NodeId, TypeId), usize>,
     /// As a source: the pushes planned at `publish` that were not made, and so
     /// are owed. With the pushes made, the plan (`protocol-v2.md` §4.7
     /// `planned`): whom a chunk is not offered at its acknowledgement.
@@ -142,10 +145,12 @@ pub struct SeacastNode<B> {
     /// `tied` by peer and group, over every root, and the number of ties of
     /// each peer: what the per-index and per-chunk checks read.
     pub(crate) tied_bits: PreallocMap<(PeerId, GroupId), Bitmap>,
-    /// Groups without a header that a peer has named, with the heartbeats each
-    /// has left, and their number per peer (`MAX_PENDING_GROUPS`,
-    /// `protocol.md` §8.2).
+    /// Groups without a header that a peer has named in HAVEs/offers, with the
+    /// heartbeats each has left (`MAX_PENDING_GROUPS`, `seacast-lite.md` §8.2).
     pub(crate) named: PreallocMap<(PeerId, GroupId), u32>,
+    /// Unknown groups a peer has named in WANTs, counted apart from `named`
+    /// (`seacast.md` §4.5 `admitted_group`).
+    pub(crate) wanted_groups: PreallocMap<(PeerId, GroupId), u32>,
 
     pub gossip_history: GossipHistory,
     pub pace_queue: PreallocDeque<PacedGossip>,
@@ -197,6 +202,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             serve_count: PreallocMap::with_capacity(cap.max_seen_ids),
             unwanted: PreallocSet::with_capacity(cap.max_seen_ids),
             standing: PeerSets::with_capacity(cap.max_asks, cap.max_peers),
+            routed_standing: PeerSets::with_capacity(cap.max_asks, cap.max_peers),
             claims: PeerSets::with_capacity(cap.max_groups, cap.max_peers),
             offers: PreallocMap::with_capacity(cap.max_asks),
             tried: AskPeers::with_capacity(
@@ -223,7 +229,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             sampled_from: PreallocMap::with_capacity(cap.max_asks),
             samples_in_flight: PreallocMap::with_capacity(cap.max_groups),
             held_samples: PreallocDeque::with_capacity(cap.max_asks),
-            forwarded: PreallocMap::with_capacity(cap.max_peers),
+            forwarded: PreallocMap::with_capacity(cap.max_peers * cap.max_types),
             plan_refused: PreallocSet::with_capacity(cap.max_stored_chunks),
             rsample_asked: PreallocSet::with_capacity(peer_asks),
             rsamples: PreallocMap::with_capacity(cap.max_repair_samples),
@@ -235,6 +241,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             tied: PreallocMap::with_capacity(cap.max_deferred_chunks),
             tied_bits: PreallocMap::with_capacity(cap.max_deferred_chunks),
             named: PreallocMap::with_capacity(cap.max_peers * config.max_pending_groups),
+            wanted_groups: PreallocMap::with_capacity(cap.max_peers * config.max_pending_groups),
             gossip_history: GossipHistory::with_capacity(6, 3, cap.max_groups),
             pace_queue: PreallocDeque::with_capacity(cap.max_peers * 4),
             pace_timer_active: false,
@@ -328,6 +335,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.unwanted.retain(|&(q, _)| q != peer);
 
         self.standing.remove_peer(peer);
+        self.routed_standing.remove_peer(peer);
 
         // Remove peer from ordered offer lists
         self.offers.retain(|_, list| {
@@ -354,6 +362,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.tied.retain(|&(q, _), _| q != peer);
         self.reindex_ties();
         self.named.retain(|&(q, _), _| q != peer);
+        self.wanted_groups.retain(|&(q, _), _| q != peer);
 
         // A claim is a connection's: a gone claimant is neither probed nor counted.
         // Our probe of it, not yet judged, gets no verdict, and our own repair is
@@ -419,10 +428,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         for j in rpc.joins {
             self.on_join(peer, j, env, catalog);
         }
-        // A message for an object type not joined on this link is ignored, without
-        // penalty (`protocol-v2.md` §2).
+        // Chunks and holdings are taken on any link for types this node runs;
+        // GRAFT, PRUNE, offers and WANTs require the link to have joined the
+        // type (`seacast.md` §2, §4.1).
         if let Some(f) = rpc.chunk {
-            if self.is_linked(peer, f.group.type_id) {
+            if catalog.joined_types().contains(&f.group.type_id) {
                 self.on_chunk(peer, f, env, catalog, rng, deferred_store);
             }
         }
@@ -464,7 +474,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             self.on_prune(peer, pr, env, catalog);
         }
         for h in rpc.haves {
-            if !h.offer && self.is_linked(peer, h.group.type_id) {
+            if !h.offer && catalog.joined_types().contains(&h.group.type_id) {
                 self.on_holding(peer, h, env, catalog, rng);
             }
         }
@@ -718,6 +728,61 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.named.insert((peer, *group), heartbeats);
         slot.named_count += 1;
         true
+    }
+
+    /// Whether `peer` may have WANT state kept for `group`: always for an open
+    /// group, else as one of the `MAX_PENDING_GROUPS` unknown groups it has
+    /// named in WANTs, counted apart from `named` (`seacast.md` §4.5
+    /// `admitted_group`).
+    pub fn admit_want_group(&mut self, peer: PeerId, group: &GroupId) -> bool {
+        if self.groups.get(group).is_some_and(|r| r.hdr.is_some()) {
+            return true;
+        }
+        let heartbeats = (self.config.group_ttl / self.config.heartbeat).ceil().max(1.0) as u32;
+        if let Some(left) = self.wanted_groups.get_mut(&(peer, *group)) {
+            *left = heartbeats;
+            return true;
+        }
+        let Some(slot) = self.slots.get_mut(peer) else {
+            return false;
+        };
+        if slot.wanted_count >= self.config.max_pending_groups || self.wanted_groups.is_full() {
+            return false;
+        }
+        self.wanted_groups.insert((peer, *group), heartbeats);
+        slot.wanted_count += 1;
+        true
+    }
+
+    /// Frees every peer's unknown-group WANT place for `group` once it opens.
+    pub(crate) fn release_wanted_group(&mut self, group: &GroupId) {
+        let slots = &mut self.slots;
+        self.wanted_groups.retain(|&(peer, ref of), _| {
+            if of == group {
+                if let Some(slot) = slots.get_mut(peer) {
+                    slot.wanted_count = slot.wanted_count.saturating_sub(1);
+                }
+                return false;
+            }
+            true
+        });
+    }
+
+    /// Removes `peer`'s standing requests, route marks and declared interest
+    /// for `group` when its unknown-group WANT place expires (`seacast.md`
+    /// §4.5).
+    pub(crate) fn clear_peer_wants(&mut self, peer: PeerId, group: &GroupId) {
+        self.pairs.clear_want_p(&(peer, *group));
+        let mut indices: InlineVec<u32, MAX_BITMAP_BITS> = InlineVec::new();
+        for &(of, idx) in self.standing.keys() {
+            if of == *group {
+                let _ = indices.push(idx);
+            }
+        }
+        for idx in indices {
+            self.standing.remove(&(*group, idx), peer);
+            self.routed_standing.remove(&(*group, idx), peer);
+        }
     }
 
     #[inline]

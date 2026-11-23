@@ -403,6 +403,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         rec.authentic = true;
         rec.deadline = deadline;
         rec.known_at.get_or_insert(now);
+        self.release_wanted_group(&group);
+        self.drop_wants_beyond(group, n);
         self.groups.put_bits(group, GroupBits::Interest, catalog.own_interest(&group));
 
         for f in shards {
@@ -413,6 +415,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.groups.put_bits(group, GroupBits::Mine, Bitmap::all_bits(n));
         self.groups.rec(group).state.replace(GroupState::Complete);
         self.groups.rec(group).stop_pull.replace(true);
+        // Standing WANTs that arrived ahead of publish are answered now (`seacast.md`
+        // §4.7).
+        for f in shards {
+            self.serve_standing(group, f.index, env, catalog);
+        }
         // A pull-only type's source pushes nothing, so no acknowledgement can come:
         // its holding names every chunk, and every chunk is offered now
         // (`offer_at_publish`).

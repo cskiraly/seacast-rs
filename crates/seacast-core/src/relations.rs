@@ -243,11 +243,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if c >= prm.m {
             return;
         }
-        // Families x colours one link may carry, per direction (`protocol-v2.md` §6.3,
-        // X6).
-        let limit = self.config.max_relations_per_link;
-        let (pushers, pushees) =
-            self.slots.get(peer).and_then(|s| s.relation_count.get(&t)).copied().unwrap_or((0, 0));
+        // Families x colours one link may carry, in any state (`seacast.md`
+        // §4.1 `relation_room`, `MAX_RELATIONS`). At the limit, a GRAFT for a
+        // new pair is ignored with no answer.
+        if !self.relation_room(peer, t, fam, c, catalog) {
+            return;
+        }
         let key = (peer, t, fam, c);
 
         if prm.symmetric {
@@ -257,9 +258,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             let (held_in, held_out) = (self.push_in.contains(&key), self.push_out.contains(&key));
             let held = held_in || held_out;
             let duty = self.join_sent(peer, t).is_some_and(|j| j.duty == Duty::Forward);
-            let room = pushers < limit &&
-                pushees < limit &&
-                self.count(self.in_pushers(t, fam, c)) < prm.f_hi &&
+            let room = self.count(self.in_pushers(t, fam, c)) < prm.f_hi &&
                 catalog.wants_family(t, fam) &&
                 duty;
             if !held && !room {
@@ -291,8 +290,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 if !asked && !gr.answer {
                     self.answer(peer, &gr, Direction::In, true, env);
                 }
-            } else if pushers < limit &&
-                self.count(self.in_pushers(t, fam, c)) < prm.f_hi &&
+            } else if self.count(self.in_pushers(t, fam, c)) < prm.f_hi &&
                 catalog.wants_family(t, fam)
             {
                 self.push_in.insert(key);
@@ -317,10 +315,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 if !asked && !gr.answer {
                     self.answer(peer, &gr, Direction::Out, true, env);
                 }
-            } else if pushees < limit &&
-                has_duty &&
-                self.count(self.out_pushees(t, fam, c)) < prm.d_out_max
-            {
+            } else if has_duty && self.count(self.out_pushees(t, fam, c)) < prm.d_out_max {
                 if !asked {
                     self.answer(peer, &gr, Direction::Out, true, env);
                 }
@@ -570,6 +565,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return false;
         }
         let key = (q, t, fam, colour);
+        if !self.relation_room(q, t, fam, colour, catalog) {
+            return false;
+        }
         let waits =
             |inbound| self.backoff.get(&(q, t, fam, colour, inbound)).is_some_and(|&t| t > now);
         let taken_in = d.includes_in() &&
@@ -577,6 +575,76 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let taken_out = d.includes_out() &&
             (self.push_out.contains(&key) || self.grafted_out.contains(&key) || waits(false));
         !taken_in && !taken_out
+    }
+
+    /// Whether `(fam, c)` already has relation state on `(peer, t)`, or the
+    /// link has room for another `(family, colour)` pair under
+    /// `TypeParams::max_relations` (`seacast.md` §4.1 `relation_room`).
+    pub(crate) fn relation_room<C>(
+        &self,
+        peer: PeerId,
+        t: TypeId,
+        fam: FamilyId,
+        c: Colour,
+        catalog: &C,
+    ) -> bool
+    where
+        C: ObjectCatalog<B>,
+    {
+        let key = (peer, t, fam, c);
+        if self.push_in.contains(&key) ||
+            self.push_out.contains(&key) ||
+            self.grafted_in.contains(&key) ||
+            self.grafted_out.contains(&key) ||
+            self.backoff.contains_key(&(peer, t, fam, c, true)) ||
+            self.backoff.contains_key(&(peer, t, fam, c, false))
+        {
+            return true;
+        }
+        let limit = catalog.params(t).max_relations.min(self.config.max_relations_per_link);
+        let mut count = 0usize;
+        for (p, ty, _, _) in self.push_in.iter() {
+            if p == peer && ty == t {
+                count += 1;
+            }
+        }
+        for (p, ty, f, col) in self.push_out.iter() {
+            if p == peer && ty == t && !self.push_in.contains(&(p, ty, f, col)) {
+                count += 1;
+            }
+        }
+        for &(p, ty, f, col) in self.grafted_in.iter() {
+            if p == peer &&
+                ty == t &&
+                !self.push_in.contains(&(p, ty, f, col)) &&
+                !self.push_out.contains(&(p, ty, f, col))
+            {
+                count += 1;
+            }
+        }
+        for &(p, ty, f, col) in self.grafted_out.iter() {
+            if p == peer &&
+                ty == t &&
+                !self.push_in.contains(&(p, ty, f, col)) &&
+                !self.push_out.contains(&(p, ty, f, col)) &&
+                !self.grafted_in.contains(&(p, ty, f, col))
+            {
+                count += 1;
+            }
+        }
+        for &(p, ty, f, col, inbound) in self.backoff.keys() {
+            if p == peer &&
+                ty == t &&
+                !self.push_in.contains(&(p, ty, f, col)) &&
+                !self.push_out.contains(&(p, ty, f, col)) &&
+                !self.grafted_in.contains(&(p, ty, f, col)) &&
+                !self.grafted_out.contains(&(p, ty, f, col)) &&
+                (inbound || !self.backoff.contains_key(&(p, ty, f, col, true)))
+            {
+                count += 1;
+            }
+        }
+        count < limit
     }
 
     /// GRAFTs the first `n` candidates of a relation, in peer id order.

@@ -280,15 +280,15 @@ pub struct TypeParams {
     /// Seconds a sampler waits on each later peer (`SAMPLE_RETRY2`, §4.10,
     /// `[D12]`).
     pub sample_retry2: f64,
-    /// A sampler's later asks in flight per scope (`SAMPLE_OUTSTANDING`,
-    /// §4.10, `[D12]`). At least 1.
-    pub sample_outstanding: usize,
     /// Forwarding steps a sampler's routed request may take (`ROUTE_HOPS`,
     /// §4.10, `[D12]`).
     pub route_hops: u8,
-    /// Routed requests passed on per asking peer between two calls of
+    /// Routed requests passed on per asking peer and type between two calls of
     /// `SeacastNode::reset_period` (`FORWARD_LIMIT`, §4.5, X6).
     pub forward_limit: usize,
+    /// Maximum `(family, colour)` relation pairs per link for this type, in
+    /// any state (`MAX_RELATIONS`, `seacast.md` §4.1, §6.3).
+    pub max_relations: usize,
     /// Seconds an offer's promise runs before a broken one parks the peer for
     /// the group (`PROMISE = 0.400s`, `[c5]`; per object type,
     /// `protocol-v2.md` §6.3).
@@ -333,9 +333,9 @@ impl Default for TypeParams {
             prune_backoff: 12.0,
             sample_retry: 2.0,
             sample_retry2: 0.5,
-            sample_outstanding: 4,
             route_hops: 1,
             forward_limit: 1,
+            max_relations: 256,
             promise: 0.400,
             repair_sample: None,
             sample_wait: 0.0,
@@ -411,9 +411,13 @@ pub struct NodeConfig {
     /// Maximum asks sent in immediate reply to a peer's offers per heartbeat
     /// (`MAX_IHAVE_LENGTH`).
     pub max_ihave_length: usize,
-    /// Chunks served to one peer's asks per heartbeat, over all groups: a
-    /// backstop where `SERVE_LIMIT` is unbounded. Not in the specification.
+    /// Chunks served to one peer's asks per heartbeat, over all groups,
+    /// excluding answers on our own written offers and claim probes
+    /// (`SERVE_BUDGET`, `seacast.md` §4.5, §6.3).
     pub max_served_per_heartbeat: usize,
+    /// A sampler's second-phase asks in flight per scope across all sampled
+    /// types (`SAMPLE_OUTSTANDING`, `seacast.md` §4.10, §6.3). At least 1.
+    pub sample_outstanding: usize,
     /// Holding entry lifetime in heartbeats (`HAVE_TTL = 3`).
     pub have_ttl: u32,
     /// Push entry lifetime in heartbeats (`PUSH_TTL = 6`).
@@ -598,6 +602,7 @@ impl Default for NodeConfig {
             max_ihave_messages: 128,
             max_ihave_length: 2 * crate::bitmap::MAX_BITMAP_BITS,
             max_served_per_heartbeat: 2 * crate::bitmap::MAX_BITMAP_BITS,
+            sample_outstanding: 4,
             have_ttl: 3,
             push_ttl: 6,
             group_ttl: 30.0,

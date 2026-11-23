@@ -187,9 +187,11 @@ pub struct Peer {
     pub ihave_frames: usize,
     pub ihave_asked: usize,
     pub(crate) served_now: usize,
-    /// Groups the peer has ties on, and groups it has named.
+    /// Groups the peer has ties on, groups it has named in HAVEs/offers, and
+    /// unknown groups it has named in WANTs (`admitted_group`).
     pub(crate) tie_count: usize,
     pub(crate) named_count: usize,
+    pub(crate) wanted_count: usize,
     /// The last pass over peers that took this one (`SeacastNode::mark`): a
     /// set of peers for one pass, without a list.
     pub(crate) mark: u64,
@@ -208,6 +210,7 @@ impl Peer {
             served_now: 0,
             tie_count: 0,
             named_count: 0,
+            wanted_count: 0,
             mark: 0,
         }
     }
@@ -223,6 +226,7 @@ impl Peer {
         self.served_now = 0;
         self.tie_count = 0;
         self.named_count = 0;
+        self.wanted_count = 0;
         self.mark = 0;
     }
 }
@@ -756,9 +760,10 @@ enum PairBits {
     SentTo = 2,
     Want = 3,
     Offered = 4,
+    OfferedTo = 5,
 }
 
-const PAIR_BITMAPS: usize = 5;
+const PAIR_BITMAPS: usize = 6;
 /// Words of a bitmap kept in the record itself. A group with more indices than
 /// these hold takes a block of full bitmaps from the pool.
 const NARROW_WORDS: usize = 2;
@@ -1031,6 +1036,64 @@ impl Pairs {
 
     pub fn offered(&self, key: &PairKey) -> Option<Bitmap> {
         self.bits(key, PairBits::Offered)
+    }
+
+    pub fn offered_to(&self, key: &PairKey) -> Option<Bitmap> {
+        self.bits(key, PairBits::OfferedTo)
+    }
+
+    pub fn add_offered_to(&mut self, key: PairKey, bits: &Bitmap) {
+        if bits.is_empty() {
+            return;
+        }
+        let existing = self.bits(&key, PairBits::OfferedTo).unwrap_or(Bitmap::EMPTY);
+        self.put(key, PairBits::OfferedTo, &(existing | bits));
+    }
+
+    /// Clears `want_p` for `(peer, group)`.
+    pub fn clear_want_p(&mut self, key: &PairKey) {
+        self.clear_field(key, PairBits::Want);
+    }
+
+    fn clear_field(&mut self, key: &PairKey, field: PairBits) {
+        let Some(pair) = self.recs.get_mut(key) else {
+            return;
+        };
+        pair.drop_bits(field);
+        if pair.is_empty() {
+            let wide = pair.wide;
+            self.recs.remove(key);
+            if wide != NO_WIDE {
+                self.free.push(wide);
+            }
+        }
+    }
+
+    /// Masks `want_p` for every peer that declared interest in `group`, keeping
+    /// only indices for which `keep(peer, index)` holds.
+    pub fn retain_want_p(&mut self, group: &GroupId, mut keep: impl FnMut(PeerId, u32) -> bool) {
+        let mut keys: InlineVec<PeerId, 64> = InlineVec::new();
+        for (&(peer, g), pair) in self.recs.iter() {
+            if g == *group && pair.has(PairBits::Want) {
+                let _ = keys.push(peer);
+            }
+        }
+        for peer in keys {
+            let key = (peer, *group);
+            if let Some(bits) = self.bits(&key, PairBits::Want) {
+                let mut next = Bitmap::new();
+                for i in bits.iter() {
+                    if keep(peer, i) {
+                        next.set(i);
+                    }
+                }
+                if next.is_empty() {
+                    self.clear_field(&key, PairBits::Want);
+                } else {
+                    self.put(key, PairBits::Want, &next);
+                }
+            }
+        }
     }
 
     pub fn set_offered(&mut self, key: PairKey, bits: Bitmap) {

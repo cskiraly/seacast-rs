@@ -198,6 +198,26 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             false
         });
 
+        // Unknown groups named in WANTs: when a peer's place expires, its
+        // standing requests, route marks and declared interest for that group
+        // go with it (`seacast.md` §4.5).
+        let mut expired_wanted: InlineVec<(PeerId, GroupId), MAX_CHUNKS> = InlineVec::new();
+        let slots = &mut self.slots;
+        self.wanted_groups.retain(|&(peer, group), left| {
+            if *left > 1 {
+                *left -= 1;
+                return true;
+            }
+            if let Some(slot) = slots.get_mut(peer) {
+                slot.wanted_count = slot.wanted_count.saturating_sub(1);
+            }
+            let _ = expired_wanted.push((peer, group));
+            false
+        });
+        for (peer, group) in expired_wanted {
+            self.clear_peer_wants(peer, &group);
+        }
+
         // `tried`, and `asked_parked` with it, live as long as an offer does; an ask's
         // time, its window; a park, `PARK_TTL` (`protocol.md` §8.1).
         let cutoff = now - self.config.offer_ttl;

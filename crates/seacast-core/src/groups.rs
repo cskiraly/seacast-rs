@@ -83,7 +83,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
     {
         if index as usize >= MAX_BITMAP_BITS ||
-            !self.is_linked(peer, group.type_id) ||
+            !catalog.joined_types().contains(&group.type_id) ||
             self.expired(group)
         {
             return false;
@@ -335,7 +335,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             rec.hdr = header;
         }
         if let Some(h) = &header {
+            self.release_wanted_group(&group);
             self.drop_beyond(group, h.n);
+            self.drop_wants_beyond(group, h.n);
         }
         let rec = self.groups.rec(group);
         rec.state = Some(GroupState::Collecting);
@@ -353,7 +355,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             for i in entry.bits.iter() {
                 self.holders.insert((group, i), p);
             }
-            if entry.claim_all {
+            if entry.claim_all && self.is_linked(p, group.type_id) {
                 self.claims.insert(group, p);
             }
         }
@@ -473,6 +475,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         self.release_ties(groups, env, catalog);
         for g in groups {
+            self.drop_outside(*g, catalog);
             let asks = self.ledger(g);
             for a in asks {
                 self.retry_offer(a, env, catalog);
@@ -520,7 +523,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                     self.asked_parked.remove(&(g, i), p);
                     let held =
                         self.groups.bits(&g, GroupBits::Mine).map(|b| b.has(i)).unwrap_or(false);
-                    if !held {
+                    if !held && self.is_linked(p, g.type_id) {
                         self.add_offer(Ask::new(g, i), p, now);
                     }
                 }
@@ -851,6 +854,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.kept_parks.retain(|(_, of), _| !gone(of));
         self.holders.retain_keys(|(of, _)| !gone(of));
         self.standing.retain_keys(|(of, _)| !gone(of));
+        self.routed_standing.retain_keys(|(of, _)| !gone(of));
         self.claims.retain_keys(|of| !gone(of));
 
         // The pull state: offers with their announcers' counts, then what hangs off an
@@ -881,6 +885,15 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             if gone(of) {
                 if let Some(slot) = slots.get_mut(peer) {
                     slot.named_count = slot.named_count.saturating_sub(1);
+                }
+            }
+            !gone(of)
+        });
+        let slots = &mut self.slots;
+        self.wanted_groups.retain(|&(peer, ref of), _| {
+            if gone(of) {
+                if let Some(slot) = slots.get_mut(peer) {
+                    slot.wanted_count = slot.wanted_count.saturating_sub(1);
                 }
             }
             !gone(of)

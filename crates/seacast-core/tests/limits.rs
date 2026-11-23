@@ -407,9 +407,9 @@ fn a_peer_cannot_overflow_the_tables() {
         distinct.dedup();
         distinct.len()
     };
-    assert!(named(world.node.pairs.keys().map(|&(_, g)| g).collect()) <= limit);
-    assert!(named(world.node.pairs.keys().map(|&(_, g)| g).collect()) <= limit);
-    assert!(named(world.node.pairs.keys().map(|&(_, g)| g).collect()) <= limit);
+    // Up to `limit` unknown groups from HAVEs/offers and `limit` from WANTs
+    // (`seacast.md` §4.5 `admitted_group`).
+    assert!(named(world.node.pairs.keys().map(|&(_, g)| g).collect()) <= 2 * limit);
     assert!(world.node.groups.len() <= 2 * limit);
     // Holders are counted for groups the node has open, and it has opened none.
     assert_eq!(world.node.holders.len(), 0);
@@ -653,8 +653,9 @@ fn a_sampler_completes_on_its_declared_indices() {
     assert_eq!(world.node.group_state(&g), Some(GroupState::Complete));
 }
 
-/// Nothing of a peer that has not joined the type on its link is handled: no
-/// state, no answer.
+/// On a link that has not joined a type this node runs, chunks and holdings
+/// are taken (with `claim_all` not making the peer a claimant), while offers
+/// and WANTs are ignored without state or answer (`seacast.md` §2, §4.3).
 #[test]
 fn messages_of_an_unjoined_type_are_ignored() {
     let mut world = World::new(Catalog::new(8, 8), 1, InterestKind::All);
@@ -665,12 +666,17 @@ fn messages_of_an_unjoined_type_are_ignored() {
 
     let mut rpc = chunk_rpc(chunk(g, 1, [0; 32]));
     let _ = rpc.haves.push(Have::offer(g, Bitmap::all_bits(8)));
-    let _ = rpc.haves.push(Have::holding(g, Bitmap::singleton(4), false, false));
+    let _ = rpc.haves.push(Have::holding(g, Bitmap::singleton(4), true, false));
     let _ = rpc.wants.push(Want::pull_ask(Ask { group: g, index: 0 }));
     world.rpc(2, rpc);
-    assert!(!world.node.chunks.contains_key(&(g, 1)));
-    assert!(world.node.pairs.is_empty());
-    assert!(world.drain(2).is_empty());
+    // Chunk and holding accepted; claim_all recorded in peer_has but peer 2 is
+    // not a claimant; offer and WANT ignored (no chunk 0 answer sent).
+    assert!(world.node.chunks.contains_key(&(g, 1)));
+    assert!(world.node.pairs.peer_has(&(2, g)).is_some_and(|e| e.has(4) && e.claim_all));
+    assert!(!world.node.claims.contains(&g, 2));
+    assert!(world.node.pairs.offered(&(2, g)).is_none());
+    let sent = world.drain(2);
+    assert!(sent.iter().all(|e| e.chunk.is_none()));
 }
 
 /// A chunk whose proof is checked off the chunk path is held by the host until
@@ -958,13 +964,12 @@ fn a_projected_index_past_the_bitmap_is_dropped() {
     assert!(!world.node.chunks.contains_key(&(g, 5000)));
 }
 
-/// An ask for an index this node neither holds nor has in its interest counts
-/// against the asker and leaves no standing request; one inside its interest is
-/// in order.
+/// Once a group's gate is open, an ask outside what this node serves is
+/// ignored without penalty and leaves no standing request (`seacast.md` §4.5).
 #[test]
 fn an_ask_outside_offer_and_interest_is_refused() {
     let mut catalog = Catalog::new(8, 8);
-    catalog.declared = true;
+    catalog.derived = true;
     catalog.interest = Bitmap::all_bits(4);
     let mut world = World::new(catalog, 1, InterestKind::Declared);
     let g = group(1);
@@ -977,7 +982,7 @@ fn an_ask_outside_offer_and_interest_is_refused() {
     assert_eq!(world.env.penalties, 0);
     assert!(world.node.standing.contains_key(&(g, 2)));
     ask(&mut world, 6);
-    assert_eq!(world.env.penalties, 1);
+    assert_eq!(world.env.penalties, 0);
     assert!(!world.node.standing.contains_key(&(g, 6)));
 }
 
@@ -1369,8 +1374,8 @@ fn a_sampler_asks_one_peer_for_each_sample() {
     let mut catalog = Catalog::new(8, 8);
     catalog.interest = Bitmap::new();
     catalog.declared = true;
-    catalog.params.sample_outstanding = 1;
-    let mut world = World::new(catalog, 4, InterestKind::Derived);
+    let config = NodeConfig { sample_outstanding: 1, ..Default::default() };
+    let mut world = World::with_config(config, catalog, 4, InterestKind::Derived);
     // Peer 3 has no interest of its own and forwards; peer 4 is of high custody.
     for (peer, interest) in [(3, InterestKind::Declared), (4, InterestKind::All)] {
         let mut rpc = Rpc::default();
@@ -1454,10 +1459,13 @@ fn a_routed_request_is_passed_on_within_the_limit() {
     let passed = ask(&mut world, 3, 1);
     assert!(passed.len() == 1 && passed[0].standing && passed[0].hops == 0);
     assert!(passed[0].bits == Bitmap::singleton(3));
-    assert_eq!(world.node.forwarded.get(&world.catalog.node_id(1)), Some(&1));
-    // At the limit: kept standing, not passed on, not penalised.
+    assert_eq!(world.node.forwarded.get(&(world.catalog.node_id(1), TYPE)), Some(&1));
+    // A routed ask outside our interest adds no bit to the DECLARED peer's want_p.
+    assert!(world.node.pairs.want_p(&(1, g)).is_none());
+    // At the limit: not passed on, not kept standing outside our interest, no
+    // penalty.
     assert!(ask(&mut world, 4, 1).is_empty());
-    assert!(world.node.standing.contains_key(&(g, 4)));
+    assert!(!world.node.standing.contains_key(&(g, 4)));
     assert_eq!(world.env.penalties, 0);
     world.node.reset_period();
     assert_eq!(ask(&mut world, 5, 1).len(), 1);
@@ -1468,12 +1476,12 @@ fn a_routed_request_is_passed_on_within_the_limit() {
         world.drain(1).iter().filter_map(|e| e.chunk.as_ref()).map(|c| c.index).collect();
     assert_eq!(answers, vec![3]);
 
-    // Without `hops`, an index this node neither holds nor wants was never invited.
+    // Without `hops`, an index outside our interest is ignored without penalty.
     assert!(ask(&mut world, 6, 0).is_empty());
-    assert_eq!(world.env.penalties, 1);
+    assert_eq!(world.env.penalties, 0);
     // The count outlives the connection: connecting again does not reset it.
     world.node.disconnect_peer(1, &mut world.env, &mut world.store);
-    assert_eq!(world.node.forwarded.get(&world.catalog.node_id(1)), Some(&1));
+    assert_eq!(world.node.forwarded.get(&(world.catalog.node_id(1), TYPE)), Some(&1));
     // The node's next connection, under another peer id, is still at the limit.
     let again = 1 + NODES;
     world.node.connect_peer(again, true, &mut world.env, &world.catalog);
@@ -2184,4 +2192,64 @@ fn the_window_line_skips_a_writer_mid_write() {
     world.env.woken.clear();
     world.node.write_waits(2, &mut world.env);
     assert_eq!(world.env.woken, vec![3]);
+}
+
+/// Source `publish` answers standing requests waiting for its chunks
+/// (`seacast.md` §4.7).
+#[test]
+fn publish_answers_standing_requests() {
+    let mut world = World::new(Catalog::new(2, 2), 2, InterestKind::Declared);
+    let g = group(1);
+    let mut rpc = Rpc::default();
+    let _ = rpc.wants.push(Want::standing(g, Bitmap::singleton(1)));
+    world.rpc(1, rpc);
+    assert!(world.node.standing.contains_key(&(g, 1)));
+
+    let shards = [chunk(g, 0, [0; 32]), chunk(g, 1, [0; 32])];
+    let (env, catalog, rng) = (&mut world.env, &world.catalog, &mut world.rng);
+    world.node.publish(g, Shape { n: 2, k: 2 }, &shards, env, catalog, rng);
+    let answered: Vec<u32> = world
+        .drain(1)
+        .iter()
+        .filter(|e| e.solicited)
+        .filter_map(|e| e.chunk.as_ref())
+        .map(|c| c.index)
+        .collect();
+    assert_eq!(answered, vec![1]);
+}
+
+/// Answers to asks on our own written offers do not count against
+/// `SERVE_BUDGET`, and an index asked twice in one frame is counted once
+/// (`seacast.md` §4.5).
+#[test]
+fn offers_exempt_from_serve_budget_and_duplicate_asks_counted_once() {
+    let config = NodeConfig { max_served_per_heartbeat: 1, ..Default::default() };
+    let mut world = World::with_config(config, Catalog::new(8, 8), 2, InterestKind::All);
+    let g = group(1);
+    for i in 0..3 {
+        world.rpc(1, chunk_rpc(chunk(g, i, [0; 32])));
+    }
+    world.drain(2);
+    // Offer chunk 0 to peer 2 and write it out so `offered_to` records it.
+    let (env, catalog) = (&mut world.env, &world.catalog);
+    world.node.announce(2, g, Bitmap::singleton(0), env, catalog);
+    let written = world.drain(2);
+    assert!(written.iter().any(|e| e.haves.iter().any(|h| h.offer && h.bits.has(0))));
+
+    // Ask for offered chunk 0 (exempt) and unoffered chunk 1 twice in one frame:
+    // both 0 and 1 are answered, and chunk 1 uses 1 budget unit (not 2).
+    let mut rpc = Rpc::default();
+    let _ = rpc.wants.push(Want::direct(g, Bitmap::from_indices([0, 1])));
+    let _ = rpc.wants.push(Want::direct(g, Bitmap::singleton(1)));
+    world.rpc(2, rpc);
+    let sent: Vec<u32> =
+        world.drain(2).iter().filter_map(|e| e.chunk.as_ref()).map(|c| c.index).collect();
+    assert_eq!(sent, vec![0, 1]);
+    assert_eq!(world.node.pairs.served(&(2, g)), 2);
+
+    // Budget (1) is now spent: unoffered chunk 2 is refused.
+    let mut rpc = Rpc::default();
+    let _ = rpc.wants.push(Want::direct(g, Bitmap::singleton(2)));
+    world.rpc(2, rpc);
+    assert!(world.drain(2).iter().all(|e| e.chunk.is_none()));
 }

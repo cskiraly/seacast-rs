@@ -81,6 +81,19 @@ Questions that need Silver's code read (tcache):
   - **`MAX_CODED_BODY` is four times what it was**, so a host that reserves it per group reserves that much more, and a coded group may decompress to that.
 - **`gfni::row` is `#[inline]`** because adding the FFT module stopped it being inlined into `combine`, which slowed recovery. The other kernels' `row` were already out of line and are unchanged.
 
+## The specification's v0.10.11 to v0.12.0 changes
+
+Applied 2026-11-23:
+
+- **Asks outside what the node serves (`seacast.md` §4.5 `outside`, `drop_outside`):** ignored without penalty once `authenticable(g)` is true; asks arriving before the gate are swept in `on_groups_authenticated`. `PenaltyReason::AskOutsideOfferOrInterest` was removed.
+- **Routed requests and `FORWARD_LIMIT` (`seacast.md` §4.5):** routed asks outside our interest add no `want_p` bit and are kept in `standing` only when `route_want` passes them on; `forwarded` is keyed by `(NodeId, TypeId)` and increments only when `enqueue` succeeds.
+- **WANT bounds and deduplication (`seacast.md` §4.5):** indices bounded by `max_chunks` before open and swept by `drop_wants_beyond`; unknown groups in WANTs tracked in `wanted_groups` separately from `named`; duplicate asks/chunk IDs in one frame charged once; answers on our own written offers (`offered_to`, recorded in `next_to_send`) and claim probes are exempt from `max_served_per_heartbeat`.
+- **Chunks and holdings on unjoined links (`seacast.md` §2, §4.2, §4.3):** accepted for any type the node runs; `claim_all` on an unjoined link does not enter `claims` and ties on an unjoined link do not become offers.
+- **Per-type `MAX_RELATIONS` (`TypeParams::max_relations`, `relation_room`):** counts `(family, colour)` pairs across `push_in`, `push_out`, `grafted_in`, `grafted_out` and `backoff`; GRAFTs for new pairs at the limit are ignored without answer.
+- **Source `publish` answers standing requests (`seacast.md` §4.7).**
+- **`SAMPLE_OUTSTANDING` moved from `TypeParams` to `NodeConfig` (`seacast.md` §4.10, v0.11.1).**
+- **Spec filenames updated to `seacast.md`, `seacast-lite.md` and `seacast-bindings.md` (v0.12.0).**
+
 ## The specification's v0.10.4 to v0.10.11 changes
 
 Applied 2026-11-22:
