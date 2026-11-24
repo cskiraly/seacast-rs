@@ -52,7 +52,7 @@ pub trait Compressor {
 }
 
 /// Standard Snappy block format compressor/decompressor ([`snappy`]). It
-/// decompresses at most [`MAX_CODED_BODY`] bytes.
+/// decompresses at most [`MAX_PLAIN_BODY`] bytes.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SnappyBlockCompressor;
 
@@ -62,7 +62,7 @@ impl Compressor for SnappyBlockCompressor {
     }
 
     fn decompress(&self, compressed: &[u8]) -> Option<Vec<u8>> {
-        snappy::decompress(compressed, MAX_CODED_BODY)
+        snappy::decompress(compressed, MAX_PLAIN_BODY)
     }
 }
 
@@ -70,12 +70,12 @@ impl Compressor for SnappyBlockCompressor {
 /// commits (`protocol.md` §1 `[c1]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct SegmentDescriptor {
-    /// `2` = coded (compress first, then Reed–Solomon); `1` = plain.
+    /// `2` = coded (Reed–Solomon parity after the data); `1` = plain.
     pub version: u8,
     /// `0` = SHA-256.
     pub hash_id: u8,
-    /// `1` = snappy block compression applied before coding (`[c6]`); `0` =
-    /// plain.
+    /// `1` = snappy block compression applied before segmenting (`[c6]`);
+    /// `0` = none. Either goes with either version.
     pub encoding: u8,
     /// `N`: total chunks in the group (data + parity).
     pub count: u32,
@@ -180,10 +180,9 @@ impl SegmentDescriptor {
             return false;
         }
         match self.version {
-            2 => {
-                self.encoding == 1 && self.count <= MAX_CHUNKS && self.count as u64 == 2 * k as u64
-            }
-            1 => self.encoding == 0 && self.count == k && (self.count as usize) <= MAX_PLAIN_CHUNKS,
+            _ if self.encoding > 1 => false,
+            2 => self.count <= MAX_CHUNKS && self.count as u64 == 2 * k as u64,
+            1 => self.count == k && (self.count as usize) <= MAX_PLAIN_CHUNKS,
             _ => false,
         }
     }
@@ -319,8 +318,13 @@ pub struct Shard<B> {
     pub data: B,
 }
 
-/// Segments, optionally compresses and Reed–Solomon-encodes `body`, and builds
-/// the Merkle tree (`build_group(body)` in `protocol.md` §1 `[c1, c6]`).
+/// Compresses and segments `body`, Reed–Solomon-encodes it where a coded
+/// group holds it, and builds the Merkle tree (`build_group(body)` in
+/// `protocol.md` §1 `[c1, c6]`).
+///
+/// A body past the coded size is compressed too and cut at `UNIT`, as Prysm's
+/// publisher cuts it. Only where its compression has more segments than a
+/// group holds does it go as it is.
 ///
 /// Panics if `body` is empty or longer than [`MAX_PLAIN_BODY`]: the caller
 /// checks its length.
@@ -340,10 +344,11 @@ where
     let coded = 2 * k <= MAX_CHUNKS as usize;
     // Coded, the compressed bytes are padded in place to `k` whole segments: the
     // Reed–Solomon input as it stands, with no copy per segment.
-    let mut compressed = if coded { compressor.compress(body) } else { Vec::new() };
-    let total = if coded { compressed.len() } else { body.len() };
-    assert!(total > 0, "the compressor returned nothing");
-    let size = total.div_ceil(k);
+    let mut compressed = compressor.compress(body);
+    assert!(!compressed.is_empty(), "the compressor returned nothing");
+    let raw = !coded && compressed.len().div_ceil(UNIT) > MAX_PLAIN_CHUNKS;
+    let total = if raw { body.len() } else { compressed.len() };
+    let (k, size) = if coded { (k, total.div_ceil(k)) } else { (total.div_ceil(UNIT), UNIT) };
     let mut parity = Vec::new();
     if coded {
         compressed.resize(k * size, 0);
@@ -353,7 +358,7 @@ where
         let mut dsts: Vec<&mut [u8]> = parity.chunks_exact_mut(size).collect();
         rs_parity_rows(&srcs, 2 * k, &rows, &mut dsts);
     }
-    let data = if coded { &compressed[..total] } else { body };
+    let data = if raw { body } else { &compressed[..total] };
 
     let mut leaves: Vec<&[u8]> =
         (0..k).map(|i| &data[(i * size).min(total)..((i + 1) * size).min(total)]).collect();
@@ -366,7 +371,7 @@ where
     let descriptor = SegmentDescriptor {
         version: if coded { 2 } else { 1 },
         hash_id: 0,
-        encoding: if coded { 1 } else { 0 },
+        encoding: u8::from(!raw),
         count: leaves.len() as u32,
         segment_size: size as u32,
         total_length: total as u64,
@@ -508,12 +513,12 @@ pub fn complete_in_place(
 }
 
 /// The length of the body a complete group's data segments hold: what
-/// [`body_into`] writes. A caller reserves that much; a coded group's is at
-/// most [`MAX_CODED_BODY`].
+/// [`body_into`] writes. A caller reserves that much; it is at most
+/// [`MAX_PLAIN_BODY`].
 pub fn body_len(descriptor: &SegmentDescriptor, data: &[u8]) -> Option<usize> {
     let segmented = data.get(..usize::try_from(descriptor.total_length).ok()?)?;
     match descriptor.encoding {
-        1 => snappy::decompressed_len(segmented).filter(|&len| len <= MAX_CODED_BODY),
+        1 => snappy::decompressed_len(segmented).filter(|&len| len <= MAX_PLAIN_BODY),
         _ => Some(segmented.len()),
     }
 }
@@ -526,7 +531,7 @@ pub fn body_into(descriptor: &SegmentDescriptor, data: &[u8], out: &mut [u8]) ->
     let segmented = data.get(..usize::try_from(descriptor.total_length).ok()?)?;
     match descriptor.encoding {
         1 => {
-            snappy::decompressed_len(segmented).filter(|&len| len <= MAX_CODED_BODY)?;
+            snappy::decompressed_len(segmented).filter(|&len| len <= MAX_PLAIN_BODY)?;
             snappy::decompress_into(segmented, out)
         }
         _ => {
@@ -538,7 +543,10 @@ pub fn body_into(descriptor: &SegmentDescriptor, data: &[u8], out: &mut [u8]) ->
 
 /// The data of a chunk whose frame has `skip` bytes before it.
 fn data_at<B: ChunkBytes>(chunk: &ChunkMsg<B>, skip: usize) -> &[u8] {
-    chunk.frame.as_bytes().get(skip..).unwrap_or(&[])
+    match chunk.frame.tail() {
+        [] => chunk.frame.as_bytes().get(skip..).unwrap_or(&[]),
+        tail => tail,
+    }
 }
 
 /// Level 2 decoding: reconstructs all `N` chunks from any `K` verified chunks
@@ -1082,32 +1090,52 @@ mod tests {
         assert_eq!(GroupId::of_chunk_id(&chunk.cached_id), chunk.group);
     }
 
-    /// A body of 10 MiB is a plain group of 640 chunks: more
-    /// than half the indices a bitmap names, and within them.
+    /// Bytes that do not compress.
+    fn noise(len: usize) -> Vec<u8> {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// A body of 10 MiB that does not compress is a plain group of a little
+    /// over 640 chunks: more than half the indices a bitmap names, and within
+    /// them.
     #[test]
     fn test_largest_gossip_body_fits_a_group() {
         let mut pool = VecBufferPool;
         let comp = SnappyBlockCompressor;
-        let body: Vec<u8> = (0..10 << 20).map(|i| (i % 241) as u8).collect();
+        let body = noise(10 << 20);
         let (desc, shards) = build_group::<Vec<u8>, _, _>(&body, &mut pool, &comp);
-        assert!(desc.is_valid() && desc.version == 1 && desc.count == 640);
-        let available = chunks_of(&desc, &shards, 0..640);
+        assert!(desc.is_valid() && (desc.version, desc.encoding) == (1, 1));
+        assert!((640..MAX_PLAIN_CHUNKS as u32).contains(&desc.count));
+        assert_eq!(desc.segment_size as usize, UNIT);
+        let available = chunks_of(&desc, &shards, 0..desc.count as usize);
         assert!(available.iter().all(valid));
-        let mut rebuilt = PreallocVec::with_capacity(640);
+        let mut rebuilt = PreallocVec::with_capacity(desc.count as usize);
         let decoded =
             decode_and_reencode(&available, CONTEXT.len(), &mut pool, &comp, &mut rebuilt);
         assert!(decoded.as_ref() == Some(&body));
     }
 
-    /// A body past the coded limit goes uncoded and uncompressed.
+    /// A body past the coded limit goes uncoded: its compression cut at
+    /// `UNIT`.
     #[test]
     fn test_plain_group_round_trip() {
         let mut pool = VecBufferPool;
         let comp = SnappyBlockCompressor;
-        let count = MAX_CODED_CHUNKS as usize / 2 + 2;
-        let body: Vec<u8> = (0..(count - 1) * UNIT + 5).map(|i| (i % 253) as u8).collect();
+        let body: Vec<u8> =
+            (0..(MAX_CODED_CHUNKS as usize / 2 + 1) * UNIT + 5).map(|i| (i % 253) as u8).collect();
         let (desc, shards) = build_group::<Vec<u8>, _, _>(&body, &mut pool, &comp);
-        assert!(desc.is_valid() && desc.version == 1 && desc.count as usize == count);
+        assert!(desc.is_valid() && (desc.version, desc.encoding) == (1, 1));
+        let count = desc.count as usize;
+        assert_eq!(count, comp.compress(&body).len().div_ceil(UNIT));
+        assert!(count > 1 && desc.segment_size as usize == UNIT);
         let available = chunks_of(&desc, &shards, (0..count).rev());
         let mut rebuilt = PreallocVec::with_capacity(count);
         assert_eq!(
@@ -1130,5 +1158,23 @@ mod tests {
             root: [0; 32],
         };
         assert!(!wide_coded.is_valid());
+    }
+
+    /// A body whose compression has more segments than a group holds goes as
+    /// it is.
+    #[test]
+    fn test_plain_group_of_a_body_that_grows() {
+        let mut pool = VecBufferPool;
+        let comp = SnappyBlockCompressor;
+        let body = noise(MAX_PLAIN_BODY);
+        assert!(comp.compress(&body).len() > MAX_PLAIN_BODY);
+        let (desc, shards) = build_group::<Vec<u8>, _, _>(&body, &mut pool, &comp);
+        assert!(desc.is_valid() && (desc.version, desc.encoding) == (1, 0));
+        assert_eq!(desc.count as usize, MAX_PLAIN_CHUNKS);
+        let available = chunks_of(&desc, &shards, 0..MAX_PLAIN_CHUNKS);
+        let mut rebuilt = PreallocVec::with_capacity(MAX_PLAIN_CHUNKS);
+        let decoded =
+            decode_and_reencode(&available, CONTEXT.len(), &mut pool, &comp, &mut rebuilt);
+        assert!(decoded.as_ref() == Some(&body));
     }
 }

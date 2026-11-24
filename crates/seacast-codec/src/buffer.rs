@@ -13,6 +13,15 @@ use seacast_core::ChunkBuffer;
 /// A handle that can show its bytes without anything else in hand.
 pub trait ChunkBytes: ChunkBuffer {
     fn as_bytes(&self) -> &[u8];
+
+    /// The rest of a frame whose data a host keeps apart from what precedes
+    /// it: the frame is `as_bytes() || tail()`, cut at its data. Empty for a
+    /// frame kept whole. Read by level 2 here and by a codec that says so; the
+    /// frame-level functions of this crate take a whole frame.
+    #[inline]
+    fn tail(&self) -> &[u8] {
+        &[]
+    }
 }
 
 impl ChunkBytes for Vec<u8> {

@@ -4,45 +4,28 @@
 //! [`Policy`] is one type, joined on every link, whose relations the host
 //! keeps.
 
-use seacast_codec::{BufferPool, ChunkBytes, Sha256};
+use seacast_codec::Sha256;
 use seacast_core::{
-    Bytes32, ChunkId, ChunkMsg, Domain, Duty, ForkDigest, GroupId, InlineVec, InterestKind, Join,
-    MAX_JOINED_TYPES, NodeId, PeerId, Policy, PreallocVec, Shape, Timestamp, TypeCodec, TypeId,
-    TypeParams, ValidationResult,
+    Bytes32, ChunkBuffer, ChunkId, ChunkMsg, Domain, Duty, ForkDigest, GroupId, InlineVec,
+    InterestKind, Join, MAX_JOINED_TYPES, NodeId, PeerId, Policy, PreallocVec, Shape, Timestamp,
+    TypeCodec, TypeId, TypeParams, ValidationResult,
 };
 
-use crate::payload::{PAYLOAD, PayloadCodec};
+use crate::payload::PAYLOAD;
 
-/// What the payload asks of the domain. A `context` is `slot |
-/// beacon_block_root` ([`CONTEXT_BYTES`](crate::CONTEXT_BYTES)).
+/// What the payload asks of the domain. A chunk names its group alone, so
+/// the domain is given no context.
 pub trait PayloadHost {
-    /// Whether the block `context` names commits the descriptor whose group id
-    /// is `header_id` (`Domain::authenticate`): `Defer` until that block is
-    /// validated and applied locally, then whether its slot is the context's
-    /// and its bid's group id is `header_id`.
-    fn authenticate(
-        &mut self,
-        group: &GroupId,
-        header_id: &Bytes32,
-        context: &[u8],
-    ) -> ValidationResult;
+    /// Whether the descriptor whose group id is `header_id` is committed
+    /// (`Domain::authenticate`): `Defer` while the host cannot tell.
+    fn authenticate(&mut self, group: &GroupId, header_id: &Bytes32) -> ValidationResult;
 
-    /// Whether an installed block commits `group` (`Domain::authenticable`).
+    /// Whether `group` is one the host has accepted (`Domain::authenticable`).
     fn authenticable(&self, group: &GroupId) -> bool;
 
-    /// When `context`'s slot leaves the live window (`Domain::deadline`).
-    fn deadline(&self, _group: &GroupId, _context: &[u8]) -> Option<Timestamp> {
+    /// When `group` leaves the live window (`Domain::deadline`).
+    fn deadline(&self, _group: &GroupId) -> Option<Timestamp> {
         None
-    }
-
-    /// Whether a chunk of `group` may name the block of `context`. Asked of
-    /// every chunk, where `authenticate` is asked once a group and a group's
-    /// chunks may name two blocks of its slot (`seacast-lite.md` §1). `false`
-    /// rejects the chunk and penalises its sender: only for a block that is
-    /// installed and whose bid does not commit the group. A block not
-    /// installed is no ground to refuse.
-    fn names_block(&self, _group: &GroupId, _context: &[u8]) -> bool {
-        true
     }
 
     fn node_id(&self, peer: PeerId) -> NodeId;
@@ -67,36 +50,38 @@ pub const fn payload_join(fork_digest: ForkDigest) -> Join {
     }
 }
 
-pub struct PayloadCatalog<Host, Pool, B> {
+/// `C` is the payload's codec: [`PayloadCodec`], or a host's own over it where
+/// the host keeps a group's chunks in place and runs level 2 there.
+pub struct PayloadCatalog<Host, C> {
     pub host: Host,
-    pub codec: PayloadCodec<Pool, B>,
+    pub codec: C,
     pub params: TypeParams,
     pub join: Join,
 }
 
-impl<Host: PayloadHost, Pool, B> PayloadCatalog<Host, Pool, B> {
+impl<Host: PayloadHost, C> PayloadCatalog<Host, C> {
     /// The catalog with [`payload_params`] and [`payload_join`].
-    pub fn new(host: Host, codec: PayloadCodec<Pool, B>, fork_digest: ForkDigest) -> Self {
+    pub fn new(host: Host, codec: C, fork_digest: ForkDigest) -> Self {
         Self { host, codec, params: payload_params(), join: payload_join(fork_digest) }
     }
 }
 
-impl<Host, Pool, B> TypeCodec<B> for PayloadCatalog<Host, Pool, B>
+impl<Host, C, B> TypeCodec<B> for PayloadCatalog<Host, C>
 where
     Host: PayloadHost,
-    Pool: BufferPool<B>,
-    B: ChunkBytes,
+    C: TypeCodec<B>,
+    B: ChunkBuffer,
 {
     fn shape(&self, chunk: &ChunkMsg<B>) -> Option<Shape> {
         self.codec.shape(chunk)
     }
 
     fn check(&self, chunk: &ChunkMsg<B>) -> bool {
-        self.codec.check(chunk) && self.host.names_block(&chunk.group, self.codec.context(chunk))
+        self.codec.check(chunk)
     }
 
     fn check_proof(&mut self, chunk: &ChunkMsg<B>) -> ValidationResult {
-        TypeCodec::check_proof(&mut self.codec, chunk)
+        self.codec.check_proof(chunk)
     }
 
     fn header_id(&self, chunk: &ChunkMsg<B>) -> Bytes32 {
@@ -122,26 +107,26 @@ where
     }
 }
 
-impl<Host: PayloadHost, Pool, B> Domain for PayloadCatalog<Host, Pool, B> {
+impl<Host: PayloadHost, C> Domain for PayloadCatalog<Host, C> {
     fn authenticate(
         &mut self,
         group: &GroupId,
         header_id: &Bytes32,
-        context: &[u8],
+        _context: &[u8],
     ) -> ValidationResult {
-        self.host.authenticate(group, header_id, context)
+        self.host.authenticate(group, header_id)
     }
 
     fn authenticable(&self, group: &GroupId) -> bool {
         self.host.authenticable(group)
     }
 
-    fn deadline(&self, group: &GroupId, context: &[u8]) -> Option<Timestamp> {
-        self.host.deadline(group, context)
+    fn deadline(&self, group: &GroupId, _context: &[u8]) -> Option<Timestamp> {
+        self.host.deadline(group)
     }
 }
 
-impl<Host: PayloadHost, Pool, B> Policy for PayloadCatalog<Host, Pool, B> {
+impl<Host: PayloadHost, C> Policy for PayloadCatalog<Host, C> {
     fn params(&self, _t: TypeId) -> &TypeParams {
         &self.params
     }
