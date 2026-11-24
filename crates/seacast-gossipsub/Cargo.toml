@@ -1,0 +1,10 @@
+[package]
+name = "seacast-gossipsub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The gossipsub binding of SEACAST v2: control strings, the payload's chunk and id, frames in parts"
+
+[dependencies]
+seacast-core = { path = "../seacast-core" }
+seacast-codec = { path = "../seacast-codec" }

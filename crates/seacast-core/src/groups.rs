@@ -46,6 +46,16 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 self.send_have(peer, chunk.group, env, catalog);
             } else if self.pending_ids.contains(&mid) {
                 self.tie(peer, &chunk, catalog);
+            } else if self.verifying.contains(&mid) {
+                // The copy of a claimant we probed, while another's is being
+                // verified: it answers the probe at the verdict (§4.6, R5).
+                let probed = catalog.project(&chunk).iter().any(|&(g, i)| {
+                    let a = Ask::new(g, i);
+                    self.probe_asks.contains(&a) && self.promises.contains(a, peer)
+                });
+                if probed {
+                    self.verifying_claimant.insert(mid, self.slots.stamp(peer));
+                }
             }
             return;
         }
@@ -90,7 +100,13 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         let ask = Ask::new(*group, index);
         if self.accepted(group, index) {
-            if self.probe_asks.contains(&ask) {
+            // Our probe's answer may be named by the chunk's other group (R4).
+            if self.probe_asks.contains(&ask) ||
+                catalog
+                    .cross(group, index)
+                    .iter()
+                    .any(|&(g, i)| self.probe_asks.contains(&Ask::new(g, i)))
+            {
                 return true;
             }
             self.send_have(peer, *group, env, catalog);
@@ -185,6 +201,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         D: DeferredStore<B>,
     {
         self.verifying.remove(&chunk.cached_id);
+        let claimant = self.verifying_claimant.remove(&chunk.cached_id);
         // Its connection closed meanwhile: the chunk is dropped unseen, as one that
         // never came. Another connection may have the peer id.
         let Some(peer) = self.slots.resolve(peer) else {
@@ -201,11 +218,17 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if result == ValidationResult::Pending || result == ValidationResult::Ignore {
             return;
         }
-        self.seen_ids.insert(chunk.cached_id);
         if result == ValidationResult::Reject {
+            // An id leaves `seen_ids` with its group's record. Of a group with
+            // none it would stay for good, so it is not kept: a repeat is
+            // checked, and counted against its sender, again.
+            if self.groups.get(&chunk.group).is_some() {
+                self.seen_ids.insert(chunk.cached_id);
+            }
             env.penalise(peer, PenaltyReason::InvalidChunkLevel1);
             return;
         }
+        self.seen_ids.insert(chunk.cached_id);
         let projected = Self::projections(catalog, &chunk);
         // A second id for an index already received on an axis is only
         // acknowledged there (`fill`), not forwarded; one held only as rebuilt
@@ -218,6 +241,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         for &(g, i) in &projected {
             self.fill(g, i, &chunk, Some(peer), env, catalog);
+        }
+        if let Some(q) = claimant.and_then(|q| self.slots.resolve(q)) {
+            for &(g, i) in &projected {
+                self.probe_answer(g, i, q);
+            }
         }
         // A dropped or expired axis is not acted on (`protocol-v2.md` §4.6).
         let mut acting: InlineVec<(GroupId, u32), MAX_PROJECTED> = InlineVec::new();
@@ -277,7 +305,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             }
             return;
         }
-        self.store_chunk(group, index, chunk.clone(), env.now());
+        if !self.store_chunk(group, index, chunk.clone(), env.now()) {
+            return;
+        }
         if sender.is_some() {
             self.groups.edit_bits(group, GroupBits::Received, |bits| bits.set(index));
         } else {
@@ -335,6 +365,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             rec.hdr = header;
         }
         if let Some(h) = &header {
+            // A place that ran out goes before its group opens (§4.5).
+            self.release_wanted_groups(now);
             self.release_wanted_group(&group);
             self.drop_beyond(group, h.n);
             self.drop_wants_beyond(group, h.n);
@@ -367,10 +399,19 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         index: u32,
         chunk: ChunkMsg<B>,
         now: Timestamp,
-    ) {
-        self.known_id.insert((group, index), chunk.cached_id);
-        self.chunks.insert((group, index), chunk);
+    ) -> bool {
+        // Admitted before any state changes: a chunk a full table refuses is
+        // neither counted nor claimed.
+        let key = (group, index);
+        if self.chunks.is_full() && !self.chunks.contains_key(&key) ||
+            self.known_id.is_full() && !self.known_id.contains_key(&key)
+        {
+            return false;
+        }
+        self.known_id.insert(key, chunk.cached_id);
+        self.chunks.insert(key, chunk);
         self.groups.rec(group).last_activity.replace(now);
+        true
     }
 
     /// Defers a chunk whose group the domain cannot tell of yet (`protocol.md`
@@ -725,8 +766,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         // chunk of two groups keeps the index of its first (`R4`).
         for (ch, i) in rebuilt.iter().zip(0..h.n) {
             if !recv.has(i) {
+                if !self.store_chunk(group, i, ch.clone(), now) {
+                    continue;
+                }
                 let _ = new_indices.push(i);
-                self.store_chunk(group, i, ch.clone(), now);
                 self.groups.edit_bits(group, GroupBits::Rebuilt, |bits| bits.set(i));
                 // Standing WANTs and a kept probe that waited for it, as `fill` answers
                 // them (§4.5, §4.6).
@@ -847,6 +890,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         // A chunk id carries its group after its type.
         self.seen_ids.retain(|id| !gone_id(id));
         self.verifying.retain(|id| !gone_id(id));
+        self.verifying_claimant.retain(|id, _| !gone_id(id));
         self.serve_count.retain(|(_, id), _| !gone_id(id));
         self.unwanted.retain(|(_, id)| !gone_id(id));
 

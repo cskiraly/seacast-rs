@@ -76,6 +76,9 @@ pub struct SeacastNode<B> {
     pub serve_count: PreallocMap<(PeerId, ChunkId), usize>,
     pub unwanted: PreallocSet<(PeerId, ChunkId)>,
     pub standing: PeerSets<(GroupId, u32)>,
+    /// The ids answered in the frame `on_want` handles, with each answer's
+    /// position: an id is answered once a frame (§4.5).
+    pub(crate) frame_ids: PreallocMap<ChunkId, usize>,
     /// Peers whose standing request for a chunk was routed (`seacast.md` §4.5
     /// `routed_standing`).
     pub routed_standing: PeerSets<(GroupId, u32)>,
@@ -141,6 +144,9 @@ pub struct SeacastNode<B> {
     /// again.
     pub(crate) unverified: PreallocDeque<(GenerationPeerId, ChunkMsg<B>)>,
     pub verifying: PreallocSet<ChunkId>,
+    /// A probed claimant whose copy came while another's was being verified:
+    /// it answers the probe at the verdict.
+    pub(crate) verifying_claimant: PreallocMap<ChunkId, GenerationPeerId>,
     pub tied: PreallocMap<(PeerId, GroupId), Bitmap>,
     /// `tied` by peer and group, over every root, and the number of ties of
     /// each peer: what the per-index and per-chunk checks read.
@@ -148,9 +154,9 @@ pub struct SeacastNode<B> {
     /// Groups without a header that a peer has named in HAVEs/offers, with the
     /// heartbeats each has left (`MAX_PENDING_GROUPS`, `seacast-lite.md` §8.2).
     pub(crate) named: PreallocMap<(PeerId, GroupId), u32>,
-    /// Unknown groups a peer has named in WANTs, counted apart from `named`
-    /// (`seacast.md` §4.5 `admitted_group`).
-    pub(crate) wanted_groups: PreallocMap<(PeerId, GroupId), u32>,
+    /// Unknown groups a peer has named in WANTs, counted apart from `named`,
+    /// with the time each place ends (`seacast.md` §4.5 `admitted_group`).
+    pub(crate) wanted_groups: PreallocMap<(PeerId, GroupId), u64>,
 
     pub gossip_history: GossipHistory,
     pub pace_queue: PreallocDeque<PacedGossip>,
@@ -182,12 +188,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             peers: PreallocVec::with_capacity(cap.max_peers),
             slots: PeerSlab::with_capacity(cap.max_peers, || Peer::with_capacity(cap.max_types)),
             kept_parks: PreallocMap::with_capacity(cap.max_kept_parks),
-            push_out: Relations::with_capacity(cap.max_relations, cap.max_peers),
-            push_in: Relations::with_capacity(cap.max_relations, cap.max_peers),
+            push_out: Relations::with_capacity(cap.max_relation_keys, cap.max_peers),
+            push_in: Relations::with_capacity(cap.max_relation_keys, cap.max_peers),
             linked: PeerSets::with_capacity(cap.max_types, cap.max_peers),
-            grafted_in: PreallocSet::with_capacity(cap.max_relations),
-            grafted_out: PreallocSet::with_capacity(cap.max_relations),
-            backoff: PreallocMap::with_capacity(cap.max_relations),
+            grafted_in: PreallocSet::with_capacity(cap.max_relation_keys),
+            grafted_out: PreallocSet::with_capacity(cap.max_relation_keys),
+            backoff: PreallocMap::with_capacity(cap.max_relation_keys),
             groups: Groups::with_capacity(cap.max_groups, cap.max_wide_groups),
             chunks: PreallocMap::with_capacity(cap.max_stored_chunks),
             known_id: PreallocMap::with_capacity(cap.max_stored_chunks),
@@ -202,6 +208,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             serve_count: PreallocMap::with_capacity(cap.max_seen_ids),
             unwanted: PreallocSet::with_capacity(cap.max_seen_ids),
             standing: PeerSets::with_capacity(cap.max_asks, cap.max_peers),
+            frame_ids: PreallocMap::with_capacity(MAX_BITMAP_BITS),
             routed_standing: PeerSets::with_capacity(cap.max_asks, cap.max_peers),
             claims: PeerSets::with_capacity(cap.max_groups, cap.max_peers),
             offers: PreallocMap::with_capacity(cap.max_asks),
@@ -238,6 +245,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             pending_ids: PreallocSet::with_capacity(cap.max_deferred_chunks),
             unverified: PreallocDeque::with_capacity(cap.max_deferred_chunks),
             verifying: PreallocSet::with_capacity(cap.max_deferred_chunks),
+            verifying_claimant: PreallocMap::with_capacity(cap.max_deferred_chunks),
             tied: PreallocMap::with_capacity(cap.max_deferred_chunks),
             tied_bits: PreallocMap::with_capacity(cap.max_deferred_chunks),
             named: PreallocMap::with_capacity(cap.max_peers * config.max_pending_groups),
@@ -425,6 +433,31 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         R: RngSource,
         D: DeferredStore<B>,
     {
+        self.on_frame_part(peer, rpc, false, env, catalog, rng, deferred_store);
+    }
+
+    /// [`on_frame`](Self::on_frame) for a binding whose frame holds more than
+    /// an `Rpc` does, as a gossipsub RPC: the host hands the frame over in
+    /// parts, its holdings in the last ones. `offered`: an earlier part of
+    /// the frame bore an offer, so the frame is counted already (§4.3).
+    /// Returns `offered` for the next part.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_frame_part<E, C, R, D>(
+        &mut self,
+        peer: PeerId,
+        rpc: Rpc<B>,
+        mut offered: bool,
+        env: &mut E,
+        catalog: &mut C,
+        rng: &mut R,
+        deferred_store: &mut D,
+    ) -> bool
+    where
+        E: RuntimeEnv<B>,
+        C: ObjectCatalog<B>,
+        R: RngSource,
+        D: DeferredStore<B>,
+    {
         for j in rpc.joins {
             self.on_join(peer, j, env, catalog);
         }
@@ -439,10 +472,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         // One WANT per group: an offer's asks are bits of one bitmap, so none is left
         // behind.
         let mut asks: InlineVec<Want, MAX_ENTRY_CONTROL> = InlineVec::new();
-        let mut offered = false;
         for h in &rpc.haves {
             if h.offer && self.is_linked(peer, h.group.type_id) {
-                if !offered && !h.bits.is_empty() {
+                // An offer-bearing frame, for §4.3's limits.
+                if !offered {
                     offered = true;
                     if let Some(slot) = self.slots.get_mut(peer) {
                         slot.ihave_frames += 1;
@@ -479,6 +512,28 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             }
         }
         self.respond(peer, &asks, &answers, env);
+        offered
+    }
+
+    /// Records that `peer` does not want the chunk `id`: an ask of it by id
+    /// is then not answered (§4.5 `unwanted`). For a binding that carries
+    /// such ids, as gossipsub's IDONTWANT. Taken only for a group this node
+    /// has a record of, and goes with it; at most
+    /// `NodeConfig::max_unwanted_ids` per peer and heartbeat. Returns whether
+    /// it was kept.
+    pub fn note_unwanted(&mut self, peer: PeerId, id: ChunkId) -> bool {
+        let limit = self.config.max_unwanted_ids;
+        if self.groups.get(&GroupId::of_chunk_id(&id)).is_none() {
+            return false;
+        }
+        let Some(slot) = self.slots.get_mut(peer) else {
+            return false;
+        };
+        if slot.unwanted_ids >= limit {
+            return false;
+        }
+        slot.unwanted_ids += 1;
+        self.unwanted.insert((peer, id))
     }
 
     /// Sends one combined response per RPC handled (`protocol.md` §4.1
@@ -640,24 +695,6 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         projected
     }
 
-    /// Takes one relation of `peer`'s link off its count; `out` for `push_out`.
-    /// A relation the host wrote into the sets directly was never counted,
-    /// so the count saturates.
-    pub(crate) fn uncount_relation(&mut self, peer: PeerId, t: TypeId, out: bool) {
-        if let Some(count) = self.slots.get_mut(peer).and_then(|s| s.relation_count.get_mut(&t)) {
-            let side = if out { &mut count.1 } else { &mut count.0 };
-            *side = side.saturating_sub(1);
-        }
-    }
-
-    /// Adds one relation of `peer`'s link to its count; `out` for `push_out`.
-    pub(crate) fn count_relation(&mut self, peer: PeerId, t: TypeId, out: bool) {
-        if let Some(slot) = self.slots.get_mut(peer) {
-            let count = slot.relation_count.entry_or_default(t);
-            *(if out { &mut count.1 } else { &mut count.0 }) += 1;
-        }
-    }
-
     /// Counts `peer` as linked for `t` once both JOINs are recorded and ours is
     /// queued, not owed (§4.1 `links`). A host that writes a link's JOINs into
     /// its record calls it after.
@@ -668,6 +705,29 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         {
             self.linked.insert(t, peer);
         }
+    }
+
+    /// Takes back `peer`'s JOIN for `t`: on gossipsub's wires, its
+    /// unsubscription from the type's last topic (`seacast-bindings.md` §0).
+    /// The link no longer counts for the type and its relations of the type
+    /// end, so nothing more is pushed or offered to the peer, and its offers,
+    /// WANTs, GRAFTs and PRUNEs of the type are ignored. Our JOIN stands: a
+    /// later JOIN of the peer's links the type again.
+    ///
+    /// What the peer has told of the type's groups stays until they end, as
+    /// holdings and chunks are taken on any link: its standing WANTs are
+    /// still answered, and its offers may still be asked against.
+    pub fn on_leave(&mut self, peer: PeerId, t: TypeId) {
+        let Some(slot) = self.slots.get_mut(peer) else {
+            return;
+        };
+        slot.join_recv.remove(&t);
+        self.linked.remove(&t, peer);
+        self.push_in.remove_peer_type(peer, t);
+        self.push_out.remove_peer_type(peer, t);
+        self.grafted_in.retain(|&(q, ty, _, _)| (q, ty) != (peer, t));
+        self.grafted_out.retain(|&(q, ty, _, _)| (q, ty) != (peer, t));
+        self.backoff.retain(|&(q, ty, _, _, _), _| (q, ty) != (peer, t));
     }
 
     /// The JOIN `peer` sent for `t`, and ours to it.
@@ -732,15 +792,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
 
     /// Whether `peer` may have WANT state kept for `group`: always for an open
     /// group, else as one of the `MAX_PENDING_GROUPS` unknown groups it has
-    /// named in WANTs, counted apart from `named` (`seacast.md` §4.5
-    /// `admitted_group`).
-    pub fn admit_want_group(&mut self, peer: PeerId, group: &GroupId) -> bool {
-        if self.groups.get(group).is_some_and(|r| r.hdr.is_some()) {
-            return true;
-        }
-        let heartbeats = (self.config.group_ttl / self.config.heartbeat).ceil().max(1.0) as u32;
-        if let Some(left) = self.wanted_groups.get_mut(&(peer, *group)) {
-            *left = heartbeats;
+    /// named in WANTs, counted apart from `named`. A place lasts `GROUP_TTL`
+    /// from the group's first naming (`seacast.md` §4.5 `admitted_group`).
+    pub fn admit_want_group(&mut self, peer: PeerId, group: &GroupId, now: Timestamp) -> bool {
+        if self.groups.get(group).is_some_and(|r| r.hdr.is_some()) ||
+            self.wanted_groups.contains_key(&(peer, *group))
+        {
             return true;
         }
         let Some(slot) = self.slots.get_mut(peer) else {
@@ -749,12 +806,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         if slot.wanted_count >= self.config.max_pending_groups || self.wanted_groups.is_full() {
             return false;
         }
-        self.wanted_groups.insert((peer, *group), heartbeats);
+        self.wanted_groups.insert((peer, *group), (now + self.config.group_ttl).to_bits());
         slot.wanted_count += 1;
         true
     }
 
-    /// Frees every peer's unknown-group WANT place for `group` once it opens.
+    /// Frees every peer's WANT place for `group`, which has opened.
     pub(crate) fn release_wanted_group(&mut self, group: &GroupId) {
         let slots = &mut self.slots;
         self.wanted_groups.retain(|&(peer, ref of), _| {
@@ -768,21 +825,24 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         });
     }
 
-    /// Removes `peer`'s standing requests, route marks and declared interest
-    /// for `group` when its unknown-group WANT place expires (`seacast.md`
-    /// §4.5).
-    pub(crate) fn clear_peer_wants(&mut self, peer: PeerId, group: &GroupId) {
-        self.pairs.clear_want_p(&(peer, *group));
-        let mut indices: InlineVec<u32, MAX_BITMAP_BITS> = InlineVec::new();
-        for &(of, idx) in self.standing.keys() {
-            if of == *group {
-                let _ = indices.push(idx);
+    /// Frees the WANT places whose lifetime has passed, with the asker's
+    /// standing requests, route marks and interest bits for the group
+    /// (`seacast.md` §4.5 `release_wanted_groups`).
+    pub(crate) fn release_wanted_groups(&mut self, now: Timestamp) {
+        let (slots, pairs) = (&mut self.slots, &mut self.pairs);
+        let (standing, routed) = (&mut self.standing, &mut self.routed_standing);
+        self.wanted_groups.retain(|&(peer, group), &mut until| {
+            if f64::from_bits(until) > now {
+                return true;
             }
-        }
-        for idx in indices {
-            self.standing.remove(&(*group, idx), peer);
-            self.routed_standing.remove(&(*group, idx), peer);
-        }
+            if let Some(slot) = slots.get_mut(peer) {
+                slot.wanted_count = slot.wanted_count.saturating_sub(1);
+            }
+            pairs.clear_want_p(&(peer, group));
+            standing.remove_peer_if(peer, |&(of, _)| of == group);
+            routed.remove_peer_if(peer, |&(of, _)| of == group);
+            false
+        });
     }
 
     #[inline]

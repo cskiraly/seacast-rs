@@ -11,7 +11,6 @@ use crate::{
     reed_solomon::{rs_complete_in_place, rs_parity_rows, rs_reconstruct_into},
     sha256::{Sha256, sha256_prefixed_many},
     snappy,
-    wire::ChunkHead,
 };
 
 /// Target uncompressed segment size (`UNIT = 16 KiB` in `protocol.md` §1
@@ -29,6 +28,9 @@ pub const MAX_CODED_CHUNKS: u32 = MAX_CHUNKS;
 /// Maximum plain (uncoded) chunks supported by a group (`MAX_BITMAP_BITS =
 /// 512`).
 pub const MAX_PLAIN_CHUNKS: usize = MAX_BITMAP_BITS;
+
+/// Longest body [`build_group`] takes: `MAX_PLAIN_CHUNKS` segments of `UNIT`.
+pub const MAX_PLAIN_BODY: usize = MAX_PLAIN_CHUNKS * UNIT;
 
 /// Maximum segment byte size (`MAX_SEGMENT_SIZE = 2 * UNIT = 32 KiB` in
 /// `protocol.md` §1 `[c1]`).
@@ -262,17 +264,26 @@ pub fn build_frame(
     frame
 }
 
-/// The 59-byte id of a chunk (`protocol-v2-bindings.md` §1.3): its object
-/// header ([`ChunkHead`]), then the first 20 bytes of `content`, a digest that
+/// The 59-byte id of a chunk (`seacast-bindings.md` §1.2): its group (type,
+/// key, index), its index, then the first 20 bytes of `content`, a digest that
 /// binds every byte of its frame level 1 reads ([`frame_content`],
 /// [`standalone_group`](crate::standalone_group)). Two copies that differ
 /// anywhere have two ids, so a forged copy, rejected, does not mark an honest
 /// one seen.
 pub fn chunk_id(group: &GroupId, index: u32, content: &Bytes32) -> ChunkId {
     let mut out = [0u8; 59];
-    out[..ChunkHead::BYTES].copy_from_slice(&ChunkHead { group: *group, index }.encode());
-    out[ChunkHead::BYTES..].copy_from_slice(&content[..20]);
+    out[0] = group.type_id.0;
+    out[1..33].copy_from_slice(&group.key);
+    out[33..35].copy_from_slice(&group.index.to_le_bytes());
+    out[35..39].copy_from_slice(&index.to_le_bytes());
+    out[39..].copy_from_slice(&content[..20]);
     out
+}
+
+/// The bytes a chunk counts for in the window: its compressed length where the
+/// host has set it (`ChunkMsg::wire_len`), else its frame's.
+pub fn chunk_wire_size<B: ChunkBuffer>(chunk: &ChunkMsg<B>) -> usize {
+    if chunk.wire_len > 0 { chunk.wire_len as usize } else { chunk.frame.len() }
 }
 
 /// The content of a segmented chunk's id: `sha256(leaf || head)`, where `leaf`
@@ -310,6 +321,9 @@ pub struct Shard<B> {
 
 /// Segments, optionally compresses and Reed–Solomon-encodes `body`, and builds
 /// the Merkle tree (`build_group(body)` in `protocol.md` §1 `[c1, c6]`).
+///
+/// Panics if `body` is empty or longer than [`MAX_PLAIN_BODY`]: the caller
+/// checks its length.
 pub fn build_group<B, Pool, Comp>(
     body: &[u8],
     pool: &mut Pool,
@@ -321,6 +335,7 @@ where
     Comp: Compressor,
 {
     assert!(!body.is_empty(), "body must not be empty");
+    assert!(body.len() <= MAX_PLAIN_BODY, "body exceeds MAX_PLAIN_BODY");
     let k = body.len().div_ceil(UNIT);
     let coded = 2 * k <= MAX_CHUNKS as usize;
     // Coded, the compressed bytes are padded in place to `k` whole segments: the
@@ -545,7 +560,51 @@ where
     let first_chunk = available_chunks.first()?;
     let head = split_frame(first_chunk.frame.as_bytes(), context_len)?;
     let (descriptor, context) = (&head.descriptor, head.context);
-    if !descriptor.is_valid() {
+    let group = first_chunk.group;
+    // Every chunk of the group has the same header, context and proof length before
+    // its data.
+    let skip = DESCRIPTOR_BYTES + context_len + 32 * descriptor.proof_len();
+    decode_and_reencode_with(
+        available_chunks,
+        descriptor,
+        skip,
+        pool,
+        compressor,
+        out_rebuilt,
+        |index, proof, data, leaf, pool| {
+            let frame = build_frame(descriptor, context, proof, data);
+            let content = frame_content(leaf, &frame[..frame.len() - data.len()]);
+            ChunkMsg {
+                group,
+                index,
+                cached_id: chunk_id(&group, index, &content),
+                frame: pool.alloc_from_slice(&frame),
+                memo: *leaf,
+                wire_len: 0,
+            }
+        },
+    )
+}
+
+/// [`decode_and_reencode`] for any frame layout whose data is the frame's
+/// tail: `descriptor` is the group's, `skip` the bytes of every frame before
+/// its data, and `rebuild` makes the chunk of an index that was not given,
+/// from its proof, data and leaf digest.
+pub fn decode_and_reencode_with<B, Pool, Comp>(
+    available_chunks: &[ChunkMsg<B>],
+    descriptor: &SegmentDescriptor,
+    skip: usize,
+    pool: &mut Pool,
+    compressor: &Comp,
+    out_rebuilt: &mut PreallocVec<ChunkMsg<B>>,
+    mut rebuild: impl FnMut(u32, &MerkleProof, &[u8], &Bytes32, &mut Pool) -> ChunkMsg<B>,
+) -> Option<B>
+where
+    B: ChunkBytes,
+    Pool: BufferPool<B>,
+    Comp: Compressor,
+{
+    if !descriptor.is_valid() || descriptor.count as usize > MAX_PLAIN_CHUNKS {
         return None;
     }
     let k = descriptor.k() as usize;
@@ -554,10 +613,6 @@ where
     if available_chunks.len() < k {
         return None;
     }
-    let group = first_chunk.group;
-    // Every chunk of the group has the same header, context and proof length before
-    // its data.
-    let skip = DESCRIPTOR_BYTES + context_len + 32 * descriptor.proof_len();
 
     // The first chunk given of each index.
     let mut given: [Option<&ChunkMsg<B>>; MAX_PLAIN_CHUNKS] = [None; MAX_PLAIN_CHUNKS];
@@ -598,6 +653,13 @@ where
             .collect();
         data.resize(k * seg_size, 0);
         rs_reconstruct_into(k, n, &indices, &chunks, &mut data)?;
+        // The pad of a short last chunk is zero, whichever chunks were decoded
+        // from: one recovered is checked, so the verdict is the same at every
+        // node (`seacast-lite.md` §3, level 2).
+        let total = usize::try_from(descriptor.total_length).ok()?;
+        if data.get(total..)?.iter().any(|&b| b != 0) {
+            return None;
+        }
 
         leaves.extend((0..k).map(|i| &data[i * seg_size..][..descriptor.segment_length(i as u32)]));
 
@@ -660,17 +722,7 @@ where
             let _ = out_rebuilt.push(existing.clone());
         } else {
             let proof = merkle_proof_from_layers(&tree, i);
-            let frame = build_frame(descriptor, context, &proof, leaf);
-            let content = frame_content(&tree.leaf(i), &frame[..frame.len() - leaf.len()]);
-            let msg = ChunkMsg {
-                group,
-                index: idx,
-                cached_id: chunk_id(&group, idx, &content),
-                frame: pool.alloc_from_slice(&frame),
-                memo: tree.leaf(i),
-                wire_len: 0,
-            };
-            let _ = out_rebuilt.push(msg);
+            let _ = out_rebuilt.push(rebuild(idx, &proof, leaf, &tree.leaf(i), pool));
         }
     }
     Some(body_buf)
@@ -741,6 +793,67 @@ mod tests {
         assert!(
             decode_and_reencode(&subset, CONTEXT.len(), &mut pool, &comp, &mut rebuilt).is_none()
         );
+    }
+
+    /// A builder that pads the short last data chunk with other than zeros
+    /// before coding fails level 2 whichever chunks a node decodes from.
+    #[test]
+    fn test_nonzero_pad_fails_at_every_basis() {
+        let mut pool = VecBufferPool;
+        let comp = SnappyBlockCompressor;
+        let body: Vec<u8> = (0..(UNIT * 4 + 1234)).map(|i| (i % 251) as u8).collect();
+        let k = body.len().div_ceil(UNIT);
+        let mut data = comp.compress(&body);
+        let total = data.len();
+        let size = total.div_ceil(k);
+        assert!(total < k * size, "the last data chunk is short");
+        data.resize(k * size, 0xAB);
+        let mut parity = vec![0u8; k * size];
+        let srcs: Vec<&[u8]> = data.chunks_exact(size).collect();
+        let rows: Vec<usize> = (k..2 * k).collect();
+        let mut dsts: Vec<&mut [u8]> = parity.chunks_exact_mut(size).collect();
+        rs_parity_rows(&srcs, 2 * k, &rows, &mut dsts);
+        let mut leaves: Vec<&[u8]> =
+            (0..k).map(|i| &data[i * size..((i + 1) * size).min(total)]).collect();
+        leaves.extend(parity.chunks_exact(size));
+        let tree = build_merkle_layers(&leaves);
+        let desc = SegmentDescriptor {
+            version: 2,
+            hash_id: 0,
+            encoding: 1,
+            count: leaves.len() as u32,
+            segment_size: size as u32,
+            total_length: total as u64,
+            root: tree.root(),
+        };
+        let shards: Vec<Shard<Vec<u8>>> = leaves
+            .iter()
+            .enumerate()
+            .map(|(i, leaf)| Shard {
+                index: i as u32,
+                proof: merkle_proof_from_layers(&tree, i),
+                data: leaf.to_vec(),
+            })
+            .collect();
+        let bases: [Vec<usize>; 4] = [
+            (0..k).collect(),
+            (k - 1..2 * k - 1).collect(),
+            (0..k - 1).chain([k]).collect(),
+            (k..2 * k).collect(),
+        ];
+        for basis in bases {
+            let mut subset = chunks_of(&desc, &shards, basis.iter().copied());
+            for ch in &mut subset {
+                assert!(valid(ch));
+                ch.memo = frame_leaf_hash(ch.index, &ch.frame, CONTEXT.len()).expect("valid");
+            }
+            let mut rebuilt = PreallocVec::with_capacity(16);
+            assert!(
+                decode_and_reencode(&subset, CONTEXT.len(), &mut pool, &comp, &mut rebuilt)
+                    .is_none(),
+                "decoded from {basis:?}"
+            );
+        }
     }
 
     fn chunks_of(
@@ -952,13 +1065,14 @@ mod tests {
         let leaf = leaf_hash(frame.data);
         assert_eq!(frame_leaf_hash(1, &chunk.frame, CONTEXT.len()), Some(leaf));
         assert_eq!(chunk.memo, leaf);
-        let head = ChunkHead { group: chunk.group, index: 1 }.encode();
         let rest = &chunk.frame[..chunk.frame.len() - frame.data.len()];
         let mut h = Sha256::new();
         h.update(&leaf);
         h.update(rest);
-        assert_eq!(chunk.cached_id[..ChunkHead::BYTES], head);
-        assert_eq!(chunk.cached_id[ChunkHead::BYTES..], h.finalize()[..20]);
+        assert_eq!(chunk.cached_id[0], 1);
+        assert_eq!(chunk.cached_id[1..33], chunk.group.key);
+        assert_eq!(chunk.cached_id[33..39], [0, 0, 1, 0, 0, 0]);
+        assert_eq!(chunk.cached_id[39..], h.finalize()[..20]);
         assert_eq!(
             frame_identity(&chunk.frame, CONTEXT.len()),
             (frame_content(&leaf, rest), Some(leaf))

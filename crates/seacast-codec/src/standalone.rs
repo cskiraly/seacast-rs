@@ -7,7 +7,7 @@ use seacast_core::{
     Bytes32, ChunkMsg, GroupId, PreallocVec, Shape, TypeCodec, TypeId, ValidationResult,
 };
 
-use crate::{buffer::ChunkBytes, sha256::Sha256, wire::chunk_wire_size};
+use crate::{buffer::ChunkBytes, segment::chunk_wire_size, sha256::Sha256};
 
 /// The group of a standalone chunk: index 0 under the key `sha256(0x04 || type
 /// || frame)`.

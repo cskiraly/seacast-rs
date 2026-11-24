@@ -91,11 +91,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         R: RngSource,
     {
         // A node without duty for the type holds no relations (`protocol-v2.md` §1.2).
-        if catalog.our_join(t).duty != Duty::Forward {
+        if catalog.our_join(t).duty != Duty::Forward || catalog.params(t).host_relations {
             return;
         }
         let now = env.now();
-        self.backoff.retain(|_, until| *until > now);
         let prm = catalog.params(t);
         let (m, f_lo, f_hi) = (prm.m, prm.f_lo, prm.f_hi);
         let target = match self.config.uplink_class() {
@@ -178,7 +177,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             self.grafted_out.insert((q, t, fam, c));
         }
         let graft = Graft { object_type: t, family: fam, colour: c, direction: d, answer: false };
-        self.sends.send_relation(q, Control::Graft(graft), env);
+        // A GRAFT that could not be owed was not sent: nothing waits for its
+        // answer, and upkeep makes it again.
+        if !self.sends.send_relation(q, Control::Graft(graft), env) {
+            self.grafted_in.remove(&(q, t, fam, c));
+            self.grafted_out.remove(&(q, t, fam, c));
+        }
     }
 
     /// Our PRUNE: the relation ends at our end at once (`prune`).
@@ -194,15 +198,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         E: RuntimeEnv<B>,
     {
         if d.includes_in() {
-            if self.push_in.remove(&(q, t, fam, c)) {
-                self.uncount_relation(q, t, false);
-            }
+            self.push_in.remove(&(q, t, fam, c));
             self.grafted_in.remove(&(q, t, fam, c));
         }
         if d.includes_out() {
-            if self.push_out.remove(&(q, t, fam, c)) {
-                self.uncount_relation(q, t, true);
-            }
+            self.push_out.remove(&(q, t, fam, c));
             self.grafted_out.remove(&(q, t, fam, c));
         }
         let prune = Prune { object_type: t, family: fam, colour: c, direction: d };
@@ -234,10 +234,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         C: ObjectCatalog<B>,
     {
         let t = gr.object_type;
-        if !self.is_linked(peer, t) {
+        let prm = catalog.params(t);
+        if !self.is_linked(peer, t) || prm.host_relations {
             return;
         }
-        let prm = catalog.params(t);
         let (fam, c) = (gr.family, gr.colour);
         // No such colour: not a relation of this type.
         if c >= prm.m {
@@ -246,7 +246,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         // Families x colours one link may carry, in any state (`seacast.md`
         // §4.1 `relation_room`, `MAX_RELATIONS`). At the limit, a GRAFT for a
         // new pair is ignored with no answer.
-        if !self.relation_room(peer, t, fam, c, catalog) {
+        if !self.relation_room(peer, t, fam, c, env.now(), catalog) {
             return;
         }
         let key = (peer, t, fam, c);
@@ -261,21 +261,24 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             let room = self.count(self.in_pushers(t, fam, c)) < prm.f_hi &&
                 catalog.wants_family(t, fam) &&
                 duty;
-            if !held && !room {
+            // A relation the tables cannot keep is refused, and one held one way
+            // that cannot be made whole ends.
+            let fits = self.push_in.has_room(&key) && self.push_out.has_room(&key);
+            if !held && !room || !fits {
+                self.push_in.remove(&key);
+                self.push_out.remove(&key);
                 self.answer(peer, &gr, Direction::Both, false, env);
                 return;
             }
             // Held either way: made whole again.
             if !held_in {
                 self.push_in.insert(key);
-                self.count_relation(peer, t, false);
             }
             if !asked && !(held && gr.answer) {
                 self.answer(peer, &gr, Direction::Both, true, env);
             }
             if !held_out {
                 self.push_out.insert(key);
-                self.count_relation(peer, t, true);
                 self.on_relation_join(peer, t, fam, c, env, catalog);
             }
             return;
@@ -291,10 +294,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                     self.answer(peer, &gr, Direction::In, true, env);
                 }
             } else if self.count(self.in_pushers(t, fam, c)) < prm.f_hi &&
-                catalog.wants_family(t, fam)
+                catalog.wants_family(t, fam) &&
+                self.push_in.has_room(&key)
             {
                 self.push_in.insert(key);
-                self.count_relation(peer, t, false);
                 if !asked {
                     self.answer(peer, &gr, Direction::In, true, env);
                 }
@@ -315,13 +318,15 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 if !asked && !gr.answer {
                     self.answer(peer, &gr, Direction::Out, true, env);
                 }
-            } else if has_duty && self.count(self.out_pushees(t, fam, c)) < prm.d_out_max {
+            } else if has_duty &&
+                self.count(self.out_pushees(t, fam, c)) < prm.d_out_max &&
+                self.push_out.has_room(&key)
+            {
                 if !asked {
                     self.answer(peer, &gr, Direction::Out, true, env);
                 }
                 // In the relation at our end: what we hold is announced (`join_push`).
                 self.push_out.insert(key);
-                self.count_relation(peer, t, true);
                 self.on_relation_join(peer, t, fam, c, env, catalog);
             } else {
                 // "I will not push you".
@@ -348,15 +353,15 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         }
         let key = (peer, t, pr.family, pr.colour);
         let prm = catalog.params(t);
+        if prm.host_relations {
+            return;
+        }
         let until = env.now() + prm.prune_backoff;
         // A symmetric relation ends both ways.
         let d = if prm.symmetric { Direction::Both } else { pr.direction };
         // "I stop pushing you", "I will not push you": our "push me" waits.
         if d.includes_out() {
             let held = self.push_in.remove(&key);
-            if held {
-                self.uncount_relation(peer, t, false);
-            }
             if self.grafted_in.remove(&key) || held {
                 self.backoff.insert((peer, t, pr.family, pr.colour, true), until);
             }
@@ -364,13 +369,52 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         // "Stop pushing me": our "I will push you" waits.
         if d.includes_in() {
             let held = self.push_out.remove(&key);
-            if held {
-                self.uncount_relation(peer, t, true);
-            }
             if self.grafted_out.remove(&key) || held {
                 self.backoff.insert((peer, t, pr.family, pr.colour, false), until);
             }
         }
+    }
+
+    /// The host's word that `peer` is in the relation of `(t, fam, c)`, both
+    /// ways: on gossipsub's wires, that it is in the topic's mesh, by a GRAFT
+    /// sent or one accepted (`seacast.md` §4.1, §7). What we hold is announced
+    /// to it (`join_push`). `false`: the peer has not joined the type on the
+    /// link, or the tables cannot keep the relation; the host then leaves it
+    /// out of its mesh.
+    pub fn relation_added<E, C>(
+        &mut self,
+        peer: PeerId,
+        t: TypeId,
+        fam: FamilyId,
+        c: Colour,
+        env: &mut E,
+        catalog: &C,
+    ) -> bool
+    where
+        E: RuntimeEnv<B>,
+        C: ObjectCatalog<B>,
+    {
+        let key = (peer, t, fam, c);
+        if !self.is_linked(peer, t) ||
+            !(self.push_in.has_room(&key) && self.push_out.has_room(&key))
+        {
+            return false;
+        }
+        self.push_in.insert(key);
+        if !self.push_out.contains(&key) {
+            self.push_out.insert(key);
+            self.on_relation_join(peer, t, fam, c, env, catalog);
+        }
+        true
+    }
+
+    /// The host's word that the relation of `(t, fam, c)` with `peer` has
+    /// ended: a PRUNE sent or received. A closed connection needs none
+    /// (`disconnect_peer`).
+    pub fn relation_removed(&mut self, peer: PeerId, t: TypeId, fam: FamilyId, c: Colour) {
+        let key = (peer, t, fam, c);
+        self.push_in.remove(&key);
+        self.push_out.remove(&key);
     }
 
     /// Announces stored chunks when a peer joins our out-relation
@@ -387,10 +431,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         E: RuntimeEnv<B>,
         C: ObjectCatalog<B>,
     {
-        // Every open group, in the order of their ids.
+        // Every open group of the type and family, in the order of their ids.
         let mut groups: InlineVec<GroupId, 512> = InlineVec::new();
         for (g, rec) in self.groups.iter() {
-            if rec.t_of.is_some() {
+            if rec.t_of.is_some() && g.type_id == t && catalog.family(g) == fam {
                 let _ = groups.push(*g);
             }
         }
@@ -565,7 +609,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return false;
         }
         let key = (q, t, fam, colour);
-        if !self.relation_room(q, t, fam, colour, catalog) {
+        if !self.relation_room(q, t, fam, colour, now, catalog) {
             return false;
         }
         let waits =
@@ -578,73 +622,88 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     }
 
     /// Whether `(fam, c)` already has relation state on `(peer, t)`, or the
-    /// link has room for another `(family, colour)` pair under
-    /// `TypeParams::max_relations` (`seacast.md` §4.1 `relation_room`).
+    /// link has fewer `(family, colour)` pairs of `t` than `MAX_RELATIONS`:
+    /// relations, our GRAFTs not yet answered, backoffs not run out, and our
+    /// GRAFTs and PRUNEs still owed (`seacast.md` §4.1 `relation_room`, §6.3).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn relation_room<C>(
         &self,
         peer: PeerId,
         t: TypeId,
         fam: FamilyId,
         c: Colour,
+        now: Timestamp,
         catalog: &C,
     ) -> bool
     where
         C: ObjectCatalog<B>,
     {
-        let key = (peer, t, fam, c);
-        if self.push_in.contains(&key) ||
-            self.push_out.contains(&key) ||
-            self.grafted_in.contains(&key) ||
-            self.grafted_out.contains(&key) ||
-            self.backoff.contains_key(&(peer, t, fam, c, true)) ||
-            self.backoff.contains_key(&(peer, t, fam, c, false))
+        let live = |f, k, inbound| {
+            self.backoff.get(&(peer, t, f, k, inbound)).is_some_and(|&until| until > now)
+        };
+        let related = |f, k| {
+            self.push_in.contains(&(peer, t, f, k)) || self.push_out.contains(&(peer, t, f, k))
+        };
+        let grafted = |f, k| {
+            self.grafted_in.contains(&(peer, t, f, k)) ||
+                self.grafted_out.contains(&(peer, t, f, k))
+        };
+        let backed_off = |f, k| live(f, k, true) || live(f, k, false);
+        if related(fam, c) ||
+            grafted(fam, c) ||
+            backed_off(fam, c) ||
+            self.sends.owed_pairs(peer, t).any(|fc| fc == (fam, c))
         {
             return true;
         }
-        let limit = catalog.params(t).max_relations.min(self.config.max_relations_per_link);
-        let mut count = 0usize;
-        for (p, ty, _, _) in self.push_in.iter() {
-            if p == peer && ty == t {
-                count += 1;
-            }
+        let limit = catalog.params(t).max_relations;
+        // Every source counted whole bounds the distinct pairs from above.
+        let bound = self.push_in.pairs_of(peer, t).count() +
+            self.push_out.pairs_of(peer, t).count() +
+            self.grafted_in.len() +
+            self.grafted_out.len() +
+            self.backoff.len() +
+            self.sends.owed_pairs(peer, t).count();
+        if bound < limit {
+            return true;
         }
-        for (p, ty, f, col) in self.push_out.iter() {
-            if p == peer && ty == t && !self.push_in.contains(&(p, ty, f, col)) {
-                count += 1;
-            }
-        }
-        for &(p, ty, f, col) in self.grafted_in.iter() {
-            if p == peer &&
-                ty == t &&
-                !self.push_in.contains(&(p, ty, f, col)) &&
-                !self.push_out.contains(&(p, ty, f, col))
-            {
-                count += 1;
-            }
-        }
-        for &(p, ty, f, col) in self.grafted_out.iter() {
-            if p == peer &&
-                ty == t &&
-                !self.push_in.contains(&(p, ty, f, col)) &&
-                !self.push_out.contains(&(p, ty, f, col)) &&
-                !self.grafted_in.contains(&(p, ty, f, col))
-            {
-                count += 1;
-            }
-        }
-        for &(p, ty, f, col, inbound) in self.backoff.keys() {
-            if p == peer &&
-                ty == t &&
-                !self.push_in.contains(&(p, ty, f, col)) &&
-                !self.push_out.contains(&(p, ty, f, col)) &&
-                !self.grafted_in.contains(&(p, ty, f, col)) &&
-                !self.grafted_out.contains(&(p, ty, f, col)) &&
-                (inbound || !self.backoff.contains_key(&(p, ty, f, col, true)))
-            {
-                count += 1;
-            }
-        }
-        count < limit
+        // Each pair counted at its first source.
+        let mut n = self.push_in.pairs_of(peer, t).count();
+        n += self
+            .push_out
+            .pairs_of(peer, t)
+            .filter(|&(f, k)| !self.push_in.contains(&(peer, t, f, k)))
+            .count();
+        n += self
+            .grafted_in
+            .iter()
+            .filter(|&&(q, ty, f, k)| q == peer && ty == t && !related(f, k))
+            .count();
+        n += self
+            .grafted_out
+            .iter()
+            .filter(|&&(q, ty, f, k)| {
+                q == peer && ty == t && !related(f, k) && !self.grafted_in.contains(&(q, ty, f, k))
+            })
+            .count();
+        n += self
+            .backoff
+            .iter()
+            .filter(|&(&(q, ty, f, k, inbound), &until)| {
+                q == peer &&
+                    ty == t &&
+                    until > now &&
+                    !related(f, k) &&
+                    !grafted(f, k) &&
+                    (inbound || !live(f, k, true))
+            })
+            .count();
+        n += self
+            .sends
+            .owed_pairs(peer, t)
+            .filter(|&(f, k)| !related(f, k) && !grafted(f, k) && !backed_off(f, k))
+            .count();
+        n < limit
     }
 
     /// GRAFTs the first `n` candidates of a relation, in peer id order.

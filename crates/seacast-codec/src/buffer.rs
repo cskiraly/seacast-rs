@@ -6,8 +6,7 @@
 //! whole chunks need more: the bytes behind a handle ([`ChunkBytes`]), and a
 //! handle for bytes they produced ([`BufferPool`]). A host whose chunks sit
 //! in a store it writes in place uses the slice-level functions instead
-//! (`segment::decode_in_place`, `wire::encode_rpc_framing`,
-//! `wire::decode_rpc_with`), and needs neither.
+//! (`segment::complete_in_place`, `segment::body_into`), and needs neither.
 
 use seacast_core::ChunkBuffer;
 

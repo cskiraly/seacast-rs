@@ -1,11 +1,11 @@
 use crate::{
     bitmap::{Bitmap, MAX_BITMAP_BITS},
-    collections::{InlineVec, PreallocVec},
+    collections::{InlineVec, MAX_ENTRY_CONTROL, PreallocVec},
     message::{Have, Queued, Want},
     node::SeacastNode,
     state::{GroupBits, PeerSet},
     traits::{ChunkBuffer, ObjectCatalog, PenaltyReason, RngSource, RuntimeEnv, TimerEvent},
-    types::{Ask, ChunkId, Duty, GroupId, InterestKind, PeerId, Timestamp, TypeId},
+    types::{Ask, Duty, GroupId, InterestKind, PeerId, Timestamp, TypeId},
 };
 
 impl<B: ChunkBuffer> SeacastNode<B> {
@@ -159,11 +159,17 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         R: RngSource,
     {
         let mut answers: InlineVec<(GroupId, u32), MAX_BITMAP_BITS> = InlineVec::new();
-        let mut taken: InlineVec<(GroupId, u32), MAX_BITMAP_BITS> = InlineVec::new();
-        let mut seen_mids: InlineVec<(ChunkId, usize), MAX_BITMAP_BITS> = InlineVec::new();
+        // The indices answered in this frame, by group; past the table's room,
+        // read from the answers.
+        let mut taken: InlineVec<(GroupId, Bitmap), MAX_ENTRY_CONTROL> = InlineVec::new();
+        let any_probe = wants.iter().any(|w| w.probe);
 
         for w in wants {
             let g = w.group;
+            let at = match taken.iter().position(|(of, _)| *of == g) {
+                Some(at) => Some(at),
+                None => taken.push((g, Bitmap::new())).then(|| taken.len() - 1),
+            };
             if self.expired(&g) {
                 continue;
             }
@@ -172,7 +178,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 self.join_recv(peer, t).is_some_and(|j| j.interest == InterestKind::Declared);
             let serve_limit = catalog.params(t).serve_limit;
             let count = self.groups.get(&g).and_then(|r| r.hdr.as_ref()).map(|h| h.n);
-            let max_idx = count.unwrap_or(catalog.params(t).max_chunks);
+            let max_idx = count.unwrap_or(catalog.params(t).max_indices);
             let budget = self.config.max_served_per_heartbeat;
             // Routed only through a node whose duty towards `peer` is FORWARD (§4.5).
             let hops = if self.join_sent(peer, t).is_some_and(|j| j.duty == Duty::Forward) {
@@ -183,7 +189,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             let our_interest = self.our_interest_for(peer, &g, catalog);
 
             for idx in w.bits.iter() {
-                if taken.contains(&(g, idx)) {
+                let answered = match at {
+                    Some(at) => taken[at].1.has(idx),
+                    None => answers.contains(&(g, idx)),
+                };
+                if answered {
                     continue;
                 }
                 if idx >= max_idx {
@@ -196,7 +206,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 if self.outside(peer, &g, idx, hops > 0, catalog) && !peer_claimed {
                     continue;
                 }
-                if !self.admit_want_group(peer, &g) {
+                if !self.admit_want_group(peer, &g, env.now()) {
                     continue;
                 }
                 let in_our_interest = our_interest.has(idx);
@@ -212,8 +222,9 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 // of an index the same frame also probes takes that probe if valid.
                 let claimed = self.groups.bits(&g, GroupBits::Mine);
                 let waiting = self.probe_waiting_of.get(&(peer, g)).copied();
-                let probed_in_frame =
-                    w.probe || wants.iter().any(|o| o.probe && o.group == g && o.bits.has(idx));
+                let probed_in_frame = w.probe ||
+                    any_probe &&
+                        wants.iter().any(|o| o.probe && o.group == g && o.bits.has(idx));
                 let flagged = probed_in_frame &&
                     claimed.is_some_and(|mine| mine.has(idx)) &&
                     !self.pairs.probe_served(&(peer, g)) &&
@@ -258,7 +269,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 // An id asked twice in one frame is answered and counted once; a
                 // probe of the cell through its other type takes its exemption on
                 // the answer already chosen (§4.5).
-                if let Some(&(_, ans_idx)) = seen_mids.iter().find(|&&(id, _)| id == mid) {
+                if let Some(&ans_idx) = self.frame_ids.get(&mid) {
                     if flagged {
                         self.pairs.set_probe_served((peer, g));
                         let (ag, aidx) = answers[ans_idx];
@@ -275,6 +286,13 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 }
                 if self.serve_count.get(&(peer, mid)).copied().unwrap_or(0) >=
                     self.config.gossip_retransmission
+                {
+                    continue;
+                }
+                // An answer whose counts cannot be kept is not given: the limits
+                // would not hold.
+                if self.serve_count.is_full() && !self.serve_count.contains_key(&(peer, mid)) ||
+                    !self.pairs.has_room(&(peer, g))
                 {
                     continue;
                 }
@@ -299,12 +317,14 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                         self.probe_answers.insert(of);
                     }
                 }
-                let ans_idx = answers.len();
-                let _ = taken.push((g, idx));
+                if let Some(at) = at {
+                    taken[at].1.set(idx);
+                }
+                self.frame_ids.insert(mid, answers.len());
                 let _ = answers.push((g, idx));
-                let _ = seen_mids.push((mid, ans_idx));
             }
         }
+        self.frame_ids.clear();
         answers
     }
 
@@ -356,44 +376,45 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     where
         C: ObjectCatalog<B>,
     {
-        let mut to_remove: InlineVec<(u32, PeerId), MAX_BITMAP_BITS> = InlineVec::new();
+        // One index at a time, so that no list of every (index, peer) is needed.
+        let mut indices = Bitmap::new();
         for &(g, i) in self.standing.keys() {
-            if g != group {
+            if g == group {
+                indices.set(i);
+            }
+        }
+        let mut out = std::mem::replace(&mut self.peer_scratch, PreallocVec::with_capacity(0));
+        for i in indices.iter() {
+            out.clear();
+            for q in self.standing.iter(&(group, i)) {
+                let routed = self.routed_standing.contains(&(group, i), q);
+                if self.outside(q, &group, i, routed, catalog) {
+                    let _ = out.push(q);
+                }
+            }
+            for &q in out.iter() {
+                self.standing.remove(&(group, i), q);
+                self.routed_standing.remove(&(group, i), q);
+            }
+        }
+        self.peer_scratch = out;
+        // Pairs exist only for connected peers.
+        for k in 0..self.peers.len() {
+            let q = self.peers[k];
+            let Some(bits) = self.pairs.want_p(&(q, group)) else {
                 continue;
-            }
-            for q in self.peers_of(PeerSet::Standing(g, i)) {
-                let routed = self.routed_standing.contains(&(g, i), q);
-                if self.outside(q, &g, i, routed, catalog) {
-                    let _ = to_remove.push((i, q));
+            };
+            let mut kept = bits;
+            for i in bits.iter() {
+                let routed = self.routed_standing.contains(&(group, i), q);
+                if self.outside(q, &group, i, routed, catalog) {
+                    kept.clear(i);
                 }
             }
-        }
-        for (i, q) in to_remove {
-            self.standing.remove(&(group, i), q);
-            self.routed_standing.remove(&(group, i), q);
-        }
-        let mut drop_want: InlineVec<(PeerId, u32), MAX_BITMAP_BITS> = InlineVec::new();
-        for &(q, g) in self.pairs.keys() {
-            if g != group {
-                continue;
-            }
-            if let Some(bits) = self.pairs.want_p(&(q, g)) {
-                for i in bits.iter() {
-                    let routed = self.routed_standing.contains(&(g, i), q);
-                    if self.outside(q, &g, i, routed, catalog) {
-                        let _ = drop_want.push((q, i));
-                    }
-                }
-            }
-        }
-        for (q, i) in drop_want {
-            if let Some(mut bits) = self.pairs.want_p(&(q, group)) {
-                bits.clear(i);
-                if bits.is_empty() {
-                    self.pairs.clear_want_p(&(q, group));
-                } else {
-                    self.pairs.set_want_p((q, group), bits);
-                }
+            if kept.is_empty() {
+                self.pairs.clear_want_p(&(q, group));
+            } else if kept != bits {
+                self.pairs.set_want_p((q, group), kept);
             }
         }
     }
@@ -404,7 +425,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
     pub(crate) fn drop_wants_beyond(&mut self, group: GroupId, n: u32) {
         self.standing.retain_keys(|&(g, i)| g != group || i < n);
         self.routed_standing.retain_keys(|&(g, i)| g != group || i < n);
-        self.pairs.retain_want_p(&group, |_, i| i < n);
+        self.pairs.retain_want_p(&group, &self.peers, |i| i < n);
     }
 
     /// Passes a routed sample request this node cannot answer one step on: to
@@ -495,7 +516,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
                 node.slots
                     .get(q)
                     .is_none_or(|s| s.served_now >= node.config.max_served_per_heartbeat);
-            if peer_already_has || served_so_far >= serve_limit || over {
+            if peer_already_has ||
+                served_so_far >= serve_limit ||
+                over ||
+                !node.pairs.has_room(&(q, group))
+            {
                 return;
             }
             if counted {
@@ -662,6 +687,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let Some(slot) = self.slots.get_mut(peer) else {
             return;
         };
+        // With no room for the ask's list the peer is not listed: a count taken
+        // for a list that is not kept would never be given back.
+        if self.offers.is_full() && !self.offers.contains_key(&ask) {
+            return;
+        }
         let list = self.offers.entry_or_default(ask);
         if !list.contains(&peer) && list.len() < max_offers && slot.listed_count < max_listed {
             if list.push(peer) {
@@ -887,11 +917,24 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         self.pairs.clear_offered(&group, index);
     }
 
-    /// `group`'s count is known now: the offers, asks, tries and promises of
-    /// an index it has not go (`drop_beyond`, `protocol.md` §4.2, §8.2). Every
+    /// `group`'s count is known now: the holdings, offers, asks, tries and
+    /// promises of an index it has not go (`drop_beyond`, `protocol.md` §4.2,
+    /// §8.2). Every
     /// ask is of an offered index, so the offers name them all. A tie past the
     /// count went at its release, before the group could open.
     pub(crate) fn drop_beyond(&mut self, group: GroupId, n: u32) {
+        // A holding saved before the count was known keeps no index past it:
+        // it would count toward the group being whole elsewhere.
+        let within = Bitmap::all_bits(n);
+        for k in 0..self.peers.len() {
+            let key = (self.peers[k], group);
+            if let Some(mut e) = self.pairs.peer_has(&key) {
+                if !e.bits.and_not(&within).is_empty() {
+                    e.bits = e.bits & within;
+                    self.pairs.set_peer_has(key, e);
+                }
+            }
+        }
         let mut beyond = Bitmap::new();
         for q in self.pairs.offering(&group) {
             if let Some(bits) = self.pairs.offered(&(q, group)) {

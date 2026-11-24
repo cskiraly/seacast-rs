@@ -252,6 +252,11 @@ pub struct TypeParams {
     /// One relation both ways per family and colour, grafted and pruned with
     /// `BOTH` (`SYMMETRIC`, §4.1).
     pub symmetric: bool,
+    /// The host keeps the type's relations, as a gossipsub client its topic's
+    /// mesh (`seacast.md` §7), and tells the node of each change
+    /// (`SeacastNode::relation_added`, `relation_removed`). The node then
+    /// sends no GRAFT or PRUNE and ignores one received.
+    pub host_relations: bool,
     /// Families a peer of high custody counts for in a floor that asks for
     /// diversity (`COVER_HIGH`, §1.3, `[D12]`).
     pub cover_high: usize,
@@ -304,9 +309,10 @@ pub struct TypeParams {
     pub repair_reask: bool,
     /// Optional fraud-proof evidence object type (`EVIDENCE`, `[D6]`).
     pub evidence: Option<TypeId>,
-    /// Most chunks a group of this type has. Not in the specification: read
-    /// by [`CapacityConfig::size_for`] only.
-    pub max_chunks: u32,
+    /// Most indices a group of this type has, before its count is known: a
+    /// WANT's index bound (`MAX_INDICES`, `seacast.md` §4.5) and
+    /// [`CapacityConfig::size_for`]'s.
+    pub max_indices: u32,
     /// Most groups of this type the domain takes in one of its slots. Not in
     /// the specification: read by [`CapacityConfig::size_for`] only.
     pub max_groups_per_slot: u32,
@@ -323,6 +329,7 @@ impl Default for TypeParams {
             d_out_fast: 8,
             d_out_max: 12,
             symmetric: false,
+            host_relations: false,
             cover_high: 1,
             announce_extra: AnnounceWidth::Sample,
             eager: true,
@@ -341,7 +348,7 @@ impl Default for TypeParams {
             sample_wait: 0.0,
             repair_reask: false,
             evidence: None,
-            max_chunks: crate::bitmap::MAX_BITMAP_BITS as u32,
+            max_indices: crate::bitmap::MAX_BITMAP_BITS as u32,
             max_groups_per_slot: 4,
         }
     }
@@ -411,6 +418,9 @@ pub struct NodeConfig {
     /// Maximum asks sent in immediate reply to a peer's offers per heartbeat
     /// (`MAX_IHAVE_LENGTH`).
     pub max_ihave_length: usize,
+    /// Maximum chunk ids taken per peer per heartbeat as not wanted
+    /// ([`SeacastNode::note_unwanted`](crate::SeacastNode::note_unwanted)).
+    pub max_unwanted_ids: usize,
     /// Chunks served to one peer's asks per heartbeat, over all groups,
     /// excluding answers on our own written offers and claim probes
     /// (`SERVE_BUDGET`, `seacast.md` §4.5, §6.3).
@@ -428,9 +438,6 @@ pub struct NodeConfig {
     /// Seconds an expired group's tombstone is kept: what the group's id is
     /// refused for.
     pub tombstone_ttl: f64,
-    /// Families x colours one link may carry, per direction (`protocol-v2.md`
-    /// §6.3 "relations per link", X6).
-    pub max_relations_per_link: usize,
     /// Maximum pending (unauthenticated) groups tracked per peer
     /// (`MAX_PENDING_GROUPS`, §8.2).
     pub max_pending_groups: usize,
@@ -496,8 +503,9 @@ pub struct CapacityConfig {
     pub max_wide_pairs: usize,
     /// Maximum stored chunks across all active groups (`4096`).
     pub max_stored_chunks: usize,
-    /// Maximum push relation entries (`(peer, type, family, colour)` = `4096`).
-    pub max_relations: usize,
+    /// Keys of the relation tables (`(type, family, colour)` with a relation,
+    /// GRAFTs unanswered, backoffs) = `4096`.
+    pub max_relation_keys: usize,
     /// Maximum `(group, index)` asks / offers tracked concurrently (`4096`).
     pub max_asks: usize,
     /// Maximum seen/deferred chunk IDs (`8192`).
@@ -533,7 +541,7 @@ impl Default for CapacityConfig {
             max_pairs: 64 * 256,
             max_wide_pairs: 64 * 16,
             max_stored_chunks: 4096,
-            max_relations: 4096,
+            max_relation_keys: 4096,
             max_asks: 4096,
             max_seen_ids: 8192,
             max_deferred_chunks: 1024,
@@ -562,8 +570,8 @@ impl CapacityConfig {
             let of_type = count * params.max_groups_per_slot as usize * slots;
             joined += count;
             groups += of_type;
-            chunks += of_type * params.max_chunks as usize;
-            if params.max_chunks > 64 {
+            chunks += of_type * params.max_indices as usize;
+            if params.max_indices > 64 {
                 wide += of_type;
             }
         }
@@ -601,13 +609,13 @@ impl Default for NodeConfig {
             gossip_retransmission: 3,
             max_ihave_messages: 128,
             max_ihave_length: 2 * crate::bitmap::MAX_BITMAP_BITS,
+            max_unwanted_ids: 2 * crate::bitmap::MAX_BITMAP_BITS,
             max_served_per_heartbeat: 2 * crate::bitmap::MAX_BITMAP_BITS,
             sample_outstanding: 4,
             have_ttl: 3,
             push_ttl: 6,
             group_ttl: 30.0,
             tombstone_ttl: 30.0,
-            max_relations_per_link: 256,
             max_pending_groups: 64,
             max_asks_per_peer: crate::bitmap::MAX_BITMAP_BITS,
             max_offers_per_ask: 16,

@@ -403,16 +403,24 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         rec.authentic = true;
         rec.deadline = deadline;
         rec.known_at.get_or_insert(now);
+        // A place that ran out goes before its group opens (§4.5).
+        self.release_wanted_groups(now);
         self.release_wanted_group(&group);
+        self.drop_beyond(group, n);
         self.drop_wants_beyond(group, n);
         self.groups.put_bits(group, GroupBits::Interest, catalog.own_interest(&group));
 
+        // A chunk a full table refuses is not claimed.
+        let mut stored = Bitmap::new();
         for f in shards {
+            if !self.store_chunk(group, f.index, f.clone(), now) {
+                continue;
+            }
+            stored.set(f.index);
             self.seen_ids.insert(f.cached_id);
             self.put_gossip(f, catalog);
-            self.store_chunk(group, f.index, f.clone(), now);
         }
-        self.groups.put_bits(group, GroupBits::Mine, Bitmap::all_bits(n));
+        self.groups.put_bits(group, GroupBits::Mine, stored);
         self.groups.rec(group).state.replace(GroupState::Complete);
         self.groups.rec(group).stop_pull.replace(true);
         // Standing WANTs that arrived ahead of publish are answered now (`seacast.md`

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/seacast-core",
     "crates/seacast-codec",
+    "crates/seacast-gossipsub",
     "crates/seacast-sim",
 ]
 

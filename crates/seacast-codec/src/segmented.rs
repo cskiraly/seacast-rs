@@ -12,10 +12,9 @@ use crate::{
     buffer::{BufferPool, ChunkBytes},
     layout::ChunkLayout,
     segment::{
-        DESCRIPTOR_BYTES, SnappyBlockCompressor, check_frame, check_frame_leaf,
+        DESCRIPTOR_BYTES, SnappyBlockCompressor, check_frame, check_frame_leaf, chunk_wire_size,
         decode_and_reencode, frame_leaf_hash, group_id, split_frame,
     },
-    wire::chunk_wire_size,
 };
 
 type Chunk<B> = ChunkMsg<B>;

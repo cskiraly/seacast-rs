@@ -10,7 +10,7 @@ use crate::{
     node::SeacastNode,
     state::{DispatchOutcome, GroupBits, Owed, PeerQueue},
     traits::{ChunkBuffer, ObjectCatalog, RuntimeEnv, TimerEvent},
-    types::{Ask, GroupId, NodeConfig, PeerId, SourceOffers, TypeId},
+    types::{Ask, Colour, FamilyId, GroupId, NodeConfig, PeerId, SourceOffers, TypeId},
 };
 
 #[derive(Debug, Clone)]
@@ -39,6 +39,7 @@ impl SendQueues {
                 PeerQueue::with_capacity(
                     cap.max_queue_entries_per_peer,
                     cap.max_owed_single_per_peer,
+                    cap.max_types,
                 )
             }),
             in_flight: 0,
@@ -102,22 +103,40 @@ impl SendQueues {
     }
 
     /// Queues a JOIN, GRAFT or PRUNE, or owes it: one a full queue refuses, and
-    /// every later one, waits in order (`protocol-v2.md` §4.1 `send_relation`).
-    /// With no room left to owe, the newest is dropped.
+    /// every later one, waits in order (`seacast.md` §4.1 `send_relation`).
+    /// A JOIN is always owed: the room for a link's JOINs is kept apart. A
+    /// GRAFT or PRUNE that repeats the last one owed for its family and colour
+    /// is not owed twice. With no room left to owe, a GRAFT or PRUNE is
+    /// dropped, and `false` returned.
     pub fn send_relation<B: ChunkBuffer, E: RuntimeEnv<B>>(
         &mut self,
         peer: PeerId,
         message: Control,
         env: &mut E,
-    ) {
+    ) -> bool {
         let urgent = matches!(message, Control::Join(_));
         let waiting = self.queue.get(peer).is_some_and(|q| !q.owed_relations.is_empty());
-        if waiting || !self.send(peer, Queued::Control(message), urgent, env) {
-            if let Some(q) = self.queue.get_mut(peer) {
-                let _ = q.owed_relations.push_back(message);
-            }
-            env.wake_writer(peer);
+        if !waiting && self.send(peer, Queued::Control(message), urgent, env) {
+            return true;
         }
+        let Some(q) = self.queue.get_mut(peer) else {
+            return false;
+        };
+        let pair = |m: &Control| match m {
+            Control::Graft(g) => Some((g.object_type, g.family, g.colour)),
+            Control::Prune(p) => Some((p.object_type, p.family, p.colour)),
+            _ => None,
+        };
+        let owed = if urgent {
+            q.owed_relations.push_back(message)
+        } else {
+            let of = pair(&message);
+            let last = q.owed_relations.iter().filter(|m| pair(m) == of).last();
+            last == Some(&message) ||
+                q.owed_relations.len() < q.max_entries && q.owed_relations.push_back(message)
+        };
+        env.wake_writer(peer);
+        owed
     }
 
     /// What is owed of the relation's messages, queued in order while there is
@@ -139,6 +158,27 @@ impl SendQueues {
             self.send(peer, Queued::Control(message), urgent, env);
         }
         joined
+    }
+
+    /// The family and colour of each GRAFT and PRUNE of type `t` owed to
+    /// `peer`, the first of each pair only.
+    pub fn owed_pairs(
+        &self,
+        peer: PeerId,
+        t: TypeId,
+    ) -> impl Iterator<Item = (FamilyId, Colour)> + '_ {
+        let owed = self.queue.get(peer).map(|q| &q.owed_relations);
+        let pair = move |m: &Control| match m {
+            Control::Graft(g) if g.object_type == t => Some((g.family, g.colour)),
+            Control::Prune(p) if p.object_type == t => Some((p.family, p.colour)),
+            _ => None,
+        };
+        owed.into_iter().flat_map(move |q| {
+            q.iter().enumerate().filter_map(move |(i, m)| {
+                let fc = pair(m)?;
+                (!q.iter().take(i).any(|e| pair(e) == Some(fc))).then_some(fc)
+            })
+        })
     }
 
     /// Our JOIN for `t` to `peer` is owed, not queued.
@@ -659,13 +699,19 @@ impl<B: ChunkBuffer> SeacastNode<B> {
 
     fn pop_owed_answer(&mut self, peer: PeerId) -> Option<(GroupId, u32)> {
         // The lowest group id, then its lowest index; then the groups of one chunk.
-        let (g, idx) = match self.sends.owed_answers.lowest(peer) {
-            Some((g, idx)) => {
-                self.sends.owed_answers.take_index(peer, &g, idx);
-                (g, idx)
+        // An answer whose chunk has gone is passed over: those behind it are
+        // live.
+        loop {
+            let (g, idx) = match self.sends.owed_answers.lowest(peer) {
+                Some((g, idx)) => {
+                    self.sends.owed_answers.take_index(peer, &g, idx);
+                    (g, idx)
+                }
+                None => (self.sends.queue.get_mut(peer)?.owed_single_answers.pop_front()?, 0),
+            };
+            if self.chunks.contains_key(&(g, idx)) {
+                return Some((g, idx));
             }
-            None => (self.sends.queue.get_mut(peer)?.owed_single_answers.pop_front()?, 0),
-        };
-        self.chunks.contains_key(&(g, idx)).then_some((g, idx))
+        }
     }
 }

@@ -46,8 +46,8 @@ pub struct PeerQueue {
 }
 
 /// Indices of groups of more than one chunk owed to peers, by peer and group:
-/// one table for all peers. Full, what is owed of a pair not yet in it is
-/// dropped.
+/// one table for all peers, an equal share of it a peer. What is owed of a
+/// pair beyond its peer's share is dropped.
 #[derive(Debug, Clone)]
 pub struct Owed {
     bits: PreallocMap<(PeerId, GroupId), Bitmap>,
@@ -70,9 +70,12 @@ impl Owed {
             return;
         }
         let key = (peer, group);
+        // A peer has its share of the table and no more: what is owed to one
+        // peer cannot take the room of what is owed to another.
+        let share = self.bits.capacity() / self.per_peer.len().max(1);
         if let Some(owed) = self.bits.get_mut(&key) {
             *owed |= bits;
-        } else if !self.bits.is_full() {
+        } else if (self.per_peer[peer as usize] as usize) < share {
             self.bits.insert(key, *bits);
             self.per_peer[peer as usize] += 1;
         }
@@ -127,16 +130,18 @@ impl Owed {
 }
 
 impl PeerQueue {
-    /// Preallocates both lanes with fixed capacity `max_entries`, and what is
-    /// owed for `max_single` groups of one chunk.
-    pub fn with_capacity(max_entries: usize, max_single: usize) -> Self {
+    /// Preallocates both lanes with fixed capacity `max_entries`, what is
+    /// owed for `max_single` groups of one chunk, and `max_entries` owed
+    /// GRAFTs and PRUNEs with a JOIN for each of `max_types`.
+    pub fn with_capacity(max_entries: usize, max_single: usize, max_types: usize) -> Self {
         Self {
             urgent: PreallocDeque::with_capacity(max_entries),
             normal: PreallocVec::with_capacity(max_entries),
             max_entries,
             owed_single: PreallocDeque::with_capacity(max_single),
             owed_single_answers: PreallocDeque::with_capacity(max_single),
-            owed_relations: PreallocDeque::with_capacity(max_entries),
+            // A JOIN a type besides: a link's JOINs are never dropped.
+            owed_relations: PreallocDeque::with_capacity(max_entries + max_types),
         }
     }
 
@@ -178,14 +183,12 @@ pub struct Peer {
     pub node_id: NodeId,
     pub join_recv: PreallocMap<TypeId, Join>,
     pub join_sent: PreallocMap<TypeId, Join>,
-    /// The link's relations in `push_in` and in `push_out`, for the per-link
-    /// limit.
-    pub(crate) relation_count: PreallocMap<TypeId, (usize, usize)>,
     /// Chunks the peer is listed for across `offers`.
     pub listed_count: usize,
     // This heartbeat: offers taken, asks made of them, chunks served.
     pub ihave_frames: usize,
     pub ihave_asked: usize,
+    pub(crate) unwanted_ids: usize,
     pub(crate) served_now: usize,
     /// Groups the peer has ties on, groups it has named in HAVEs/offers, and
     /// unknown groups it has named in WANTs (`admitted_group`).
@@ -203,10 +206,10 @@ impl Peer {
             node_id: [0; 32],
             join_recv: PreallocMap::with_capacity(max_types),
             join_sent: PreallocMap::with_capacity(max_types),
-            relation_count: PreallocMap::with_capacity(max_types),
             listed_count: 0,
             ihave_frames: 0,
             ihave_asked: 0,
+            unwanted_ids: 0,
             served_now: 0,
             tie_count: 0,
             named_count: 0,
@@ -219,10 +222,10 @@ impl Peer {
         self.node_id = [0; 32];
         self.join_recv.clear();
         self.join_sent.clear();
-        self.relation_count.clear();
         self.listed_count = 0;
         self.ihave_frames = 0;
         self.ihave_asked = 0;
+        self.unwanted_ids = 0;
         self.served_now = 0;
         self.tie_count = 0;
         self.named_count = 0;
@@ -300,6 +303,12 @@ impl Relations {
         self.sets.contains(&(t, fam, c), peer)
     }
 
+    /// Whether `insert` would keep the relation: admission, before a yes.
+    #[inline]
+    pub fn has_room(&self, &(_, t, fam, c): &RelationKey) -> bool {
+        self.sets.has_room(&(t, fam, c))
+    }
+
     /// Returns whether the relation was added.
     pub fn insert(&mut self, (peer, t, fam, c): RelationKey) -> bool {
         let added = !self.sets.contains(&(t, fam, c), peer) && self.sets.insert((t, fam, c), peer);
@@ -317,6 +326,12 @@ impl Relations {
     pub fn remove_peer(&mut self, peer: PeerId) {
         self.len -= self.sets.keys().filter(|key| self.sets.contains(key, peer)).count();
         self.sets.remove_peer(peer);
+    }
+
+    /// Drops `peer`'s relations of type `t`.
+    pub fn remove_peer_type(&mut self, peer: PeerId, t: TypeId) {
+        self.len -= self.pairs_of(peer, t).count();
+        self.sets.remove_peer_if(peer, |&(ty, _, _)| ty == t);
     }
 
     /// Word `w` of the peers of a type, family and colour.
@@ -343,6 +358,19 @@ impl Relations {
     /// Whether `peer` is in any relation.
     pub fn related(&self, peer: PeerId) -> bool {
         self.sets.keys().any(|key| self.sets.contains(key, peer))
+    }
+
+    /// The families and colours of type `t` that `peer` is in, by a walk over
+    /// the keys, not the peers.
+    pub fn pairs_of(
+        &self,
+        peer: PeerId,
+        t: TypeId,
+    ) -> impl Iterator<Item = (FamilyId, Colour)> + '_ {
+        self.sets
+            .keys()
+            .filter(move |&&(ty, fam, c)| ty == t && self.sets.contains(&(ty, fam, c), peer))
+            .map(|&(_, fam, c)| (fam, c))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = RelationKey> + '_ {
@@ -1069,29 +1097,29 @@ impl Pairs {
         }
     }
 
-    /// Masks `want_p` for every peer that declared interest in `group`, keeping
-    /// only indices for which `keep(peer, index)` holds.
-    pub fn retain_want_p(&mut self, group: &GroupId, mut keep: impl FnMut(PeerId, u32) -> bool) {
-        let mut keys: InlineVec<PeerId, 64> = InlineVec::new();
-        for (&(peer, g), pair) in self.recs.iter() {
-            if g == *group && pair.has(PairBits::Want) {
-                let _ = keys.push(peer);
-            }
-        }
-        for peer in keys {
+    /// Masks `want_p` of `group` for each of `peers`, keeping only indices for
+    /// which `keep(index)` holds.
+    pub fn retain_want_p(
+        &mut self,
+        group: &GroupId,
+        peers: &[PeerId],
+        mut keep: impl FnMut(u32) -> bool,
+    ) {
+        for &peer in peers {
             let key = (peer, *group);
-            if let Some(bits) = self.bits(&key, PairBits::Want) {
-                let mut next = Bitmap::new();
-                for i in bits.iter() {
-                    if keep(peer, i) {
-                        next.set(i);
-                    }
+            let Some(bits) = self.bits(&key, PairBits::Want) else {
+                continue;
+            };
+            let mut next = Bitmap::new();
+            for i in bits.iter() {
+                if keep(i) {
+                    next.set(i);
                 }
-                if next.is_empty() {
-                    self.clear_field(&key, PairBits::Want);
-                } else {
-                    self.put(key, PairBits::Want, &next);
-                }
+            }
+            if next.is_empty() {
+                self.clear_field(&key, PairBits::Want);
+            } else if next != bits {
+                self.put(key, PairBits::Want, &next);
             }
         }
     }
@@ -1114,6 +1142,13 @@ impl Pairs {
 
     pub fn served(&self, key: &PairKey) -> usize {
         self.recs.get(key).map_or(0, |pair| pair.served as usize)
+    }
+
+    /// Whether the pair has a record or the table has room for one: what a
+    /// count of the pair needs.
+    #[inline]
+    pub fn has_room(&self, key: &PairKey) -> bool {
+        self.recs.contains_key(key) || !self.recs.is_full()
     }
 
     pub fn add_served(&mut self, key: PairKey) {

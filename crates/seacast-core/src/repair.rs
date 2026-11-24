@@ -44,6 +44,10 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         e.claim_all = e.claim_all || h.claim_all;
         e.complete = e.complete || h.complete;
         self.pairs.set_peer_has((peer, h.group), e);
+        // The holders follow the holding as it is kept: an index the pair's
+        // record has no room for names no holder, since none would be removed
+        // for it.
+        let kept = self.pairs.peer_has(&(peer, h.group)).map(|e| e.bits).unwrap_or(Bitmap::EMPTY);
 
         // A group this node has not opened has no claim to act on and no holders to
         // count: both are taken from `peer_has` when it opens (`open_group`).
@@ -54,7 +58,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             self.note_claim(peer, h.group, env, catalog, rng);
         }
         for i in newly.iter() {
-            if open {
+            if open && kept.has(i) {
                 self.holders.insert((h.group, i), peer);
             }
             self.sends.window_release(peer, h.group, i, env);
@@ -62,6 +66,11 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             if self.groups.has_bits(&h.group, GroupBits::Origin) {
                 self.origin_acked(h.group, i, env, catalog);
             }
+        }
+        // A bit held already: a copy written since (a probe's answer, or any
+        // without cancel) frees its room (§4.3, card 14).
+        for i in h.bits.and_not(&newly).iter() {
+            self.sends.window_release(peer, h.group, i, env);
         }
     }
 
@@ -482,10 +491,6 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             return;
         };
         let a = Ask::new(group, probe_idx);
-        // No probe without its promise: the decode is not deferred.
-        if !self.promises.has_room(a, q) {
-            return;
-        }
         let now = env.now();
         let defer_win = catalog.params(t).defer_window;
         let duty_at = self
@@ -494,6 +499,17 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             .and_then(|r| r.reconsider_at)
             .map(f64::from_bits)
             .unwrap_or(now);
+        // No probe without its promise. A probe that cannot be sent has no
+        // verdict, and our own repair is reconsidered at the duty's own time
+        // (§4.6).
+        if !self.promises.has_room(a, q) {
+            let rec = self.groups.rec(group);
+            rec.deferred.replace(true);
+            rec.duty_at = Some(duty_at);
+            self.settle_probe(group, None);
+            self.arm(group, now.max(duty_at), env);
+            return;
+        }
         let rec = self.groups.rec(group);
         rec.deferred.replace(true);
         rec.probe.replace(probe_idx);
@@ -716,8 +732,12 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let fam = catalog.family(group);
         let m = catalog.params(t).m.max(1);
         for &q in self.peers.iter() {
+            // A peer that takes every index is repaired through the relation
+            // only (§6.2, tier 4); one with an interest of its own, a
+            // custodian, wherever it is (§6.3 `REPAIR_TO`).
             let in_rel = self.push_out.any_colour(q, t, fam, m);
-            if in_rel || !self.interest_of_peer(q, group, catalog).is_empty() {
+            let takes_all = self.join_recv(q, t).is_some_and(|j| j.interest == InterestKind::All);
+            if in_rel || !takes_all && !self.interest_of_peer(q, group, catalog).is_empty() {
                 let _ = out.push(q);
             }
         }

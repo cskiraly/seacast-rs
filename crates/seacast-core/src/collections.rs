@@ -887,6 +887,13 @@ impl<K: Eq + Hash + Copy> PeerSets<K> {
         self.rows.contains_key(key)
     }
 
+    /// Whether `insert` would take a peer under `key`: it has a row, or one
+    /// is free.
+    #[inline]
+    pub fn has_room(&self, key: &K) -> bool {
+        self.rows.contains_key(key) || !self.free.is_empty()
+    }
+
     /// Drops the set of `key`.
     pub fn remove_key(&mut self, key: &K) {
         if let Some(row) = self.rows.remove(key) {
@@ -957,8 +964,16 @@ impl<K: Eq + Hash + Copy> PeerSets<K> {
 
     /// Takes `peer` out of every set.
     pub fn remove_peer(&mut self, peer: PeerId) {
+        self.remove_peer_if(peer, |_| true);
+    }
+
+    /// Takes `peer` out of the sets of the keys `of` accepts.
+    pub fn remove_peer_if(&mut self, peer: PeerId, mut of: impl FnMut(&K) -> bool) {
         let (words, free, width) = (&mut self.words, &mut self.free, self.width);
-        self.rows.retain(|_, &mut row| {
+        self.rows.retain(|key, &mut row| {
+            if !of(key) {
+                return true;
+            }
             let at = row as usize * width;
             words[at + peer as usize / 64] &= !(1 << (peer % 64));
             let kept = words[at..at + width].iter().any(|&w| w != 0);

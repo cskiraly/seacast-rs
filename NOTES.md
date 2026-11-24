@@ -30,16 +30,16 @@ Questions that need Silver's code read (tcache):
 - **A chunk's context is in every chunk.** A type whose context is long (a column's commitments) pays it N times. `protocol-v2.md` sends a header once a group and link; not done here.
 - **A cancelled push leaves an offer owed** through `SendQueues::owe`. Whether the node should send that offer itself was left open.
 - **`on_chunk_head` trusts the host's proof check.** It drops a copy of a chunk held, or of one that waits, on its head alone. A host that leaves the proof to `TypeCodec::check_proof` must not call it. A copy of a chunk that waits is told only by its id, which no chunk's head gives, since the id hashes the frame: such a copy from another peer is read. The entry has one test, with scripted peers.
-- **Capacities follow the types joined** (`CapacityConfig::size_for`, from `TypeParams::max_chunks` and `max_groups_per_slot`). Open points:
+- **Capacities follow the types joined** (`CapacityConfig::size_for`, from `TypeParams::max_indices` and `max_groups_per_slot`). Open points:
   - **Only `max_types`, `max_groups` and `max_stored_chunks` are derived.** `max_owed_pairs`, `max_pairs`, `max_asks`, `max_seen_ids`, `max_deferred_chunks` and `max_ask_peers` also grow with the groups and are still the host's to set.
-  - **A group's bitmaps are kept in its record only while they name no index past 63** (`GroupBits`, read and written through `Groups::bits`, `put_bits`, `edit_bits`). One that names a higher index is kept in a row of `max_wide_groups` rows, a row a group. With no row left the write is dropped and the bitmap stays as it was: the node then holds a chunk it does not count as held. Nothing counts or logs it. `CapacityConfig::size_for` takes a type as wide if its `max_chunks` is above 64.
+  - **A group's bitmaps are kept in its record only while they name no index past 63** (`GroupBits`, read and written through `Groups::bits`, `put_bits`, `edit_bits`). One that names a higher index is kept in a row of `max_wide_groups` rows, a row a group. With no row left the write is dropped and the bitmap stays as it was: the node then holds a chunk it does not count as held. Nothing counts or logs it. `CapacityConfig::size_for` takes a type as wide if its `max_indices` is above 64.
   - **A read of a bitmap copies it**, 136 bytes, where it was a reference into the record. Not measured.
   - **The table of records has room for twice `max_groups` rounded up to a power of two.**
   - **A group's repair sample is kept beside its record** (`rsamples`, `max_repair_samples` groups). Full, a group asks for no sample and its verdict is `Repaired`, as when no custodian could be asked. `CapacityConfig::size_for` does not set it.
   - **`cancel_group` walks every peer's queue** at each group's end, so its cost is peers times the queue length a group. With thousands of groups a slot this is not measured.
   - **What is owed of a group of one chunk is dropped at a full ring** (`max_owed_single_per_peer`), offers and answers each in a ring of their own. A dropped offer reaches the peer by the heartbeat's gossip; a dropped answer breaks the promise the peer runs on its ask. A group that ended stays in the ring until it is taken, and takes a place meanwhile.
-  - **What is owed of the other groups is one table for all peers**, by peer and group (`Owed`, `max_owed_pairs`), offers and answers each in one. Full, what is owed of a pair not in it is dropped, with the same effect as at a full ring; nothing counts or logs it. One peer can fill the table. The lowest group owed to a peer is found by a pass over the whole table, a pass for each group an entry takes: only for a peer that is owed something. Not measured.
-  - **A group counts as of one chunk by its header** (`Shape::n == 1`), not by its type's `max_chunks`: what is owed of a group not open goes to the map.
+  - **What is owed of the other groups is one table for all peers**, by peer and group (`Owed`, `max_owed_pairs`), offers and answers each in one. A peer has an equal share of it (`max_owed_pairs / max_peers` pairs): what is owed of a pair beyond its peer's share is dropped, with the same effect as at a full ring; nothing counts or logs it. The lowest group owed to a peer is found by a pass over the whole table, a pass for each group an entry takes: only for a peer that is owed something. Not measured.
+  - **A group counts as of one chunk by its header** (`Shape::n == 1`), not by its type's `max_indices`: what is owed of a group not open goes to the map.
 - **A popped chunk must get a verdict.** A host that takes a chunk from `pop_unverified` and never calls `on_validated` leaves its id in `verifying` until the group ends, and other copies are refused meanwhile. There is no timeout.
 - **A deadline is fixed when first asked**, and a group known only from offers has none until its first chunk.
 - **Memory.** The per (peer, group) table is the largest. Ideas not tried: peer lists held inline, a dense index for pairs. `cargo run --release -p seacast-core --example node_size` prints the heap a node holds after `new`. Most of it is the send queues: three lanes of `max_queue_entries_per_peer` entries and two maps of `max_groups` bitmaps for every peer id, allocated whether the peer is connected or not. An entry is as wide as a control message with its bitmap, also when it stands for a chunk.
@@ -81,15 +81,43 @@ Questions that need Silver's code read (tcache):
   - **`MAX_CODED_BODY` is four times what it was**, so a host that reserves it per group reserves that much more, and a coded group may decompress to that.
 - **`gfni::row` is `#[inline]`** because adding the FFT module stopped it being inlined into `combine`, which slowed recovery. The other kernels' `row` were already out of line and are unchanged.
 
+## Findings of the 2026-11-23 study
+
+A study of commit `1e486ee` against the specification listed defects by number (F1 to F20, R2 to R4). Addressed 2026-11-23:
+
+- **F13: the pad of a short last data chunk is checked to be zero after the decode** (`decode_and_reencode`), so level 2 gives the same verdict whichever chunks a node decodes from.
+- **F12: `build_group` refuses a body past `MAX_PLAIN_BODY`** with a panic of its own, documented, where `MerkleTree::build` panicked.
+- **F11: `PROTOCOL_ID` was `/seacast-rs/2.0.0`.** Gone with the local wire format (below).
+- **F2, F6, F7, F9: admission before any change of state.** A chunk the chunk table refuses is neither counted nor claimed (`store_chunk`); a GRAFT the relation tables cannot keep is answered no; an answer whose counts cannot be kept (`serve_count`, the pair's record) is not given; the default deferred store reserves nothing for a peer it cannot count, and a count of zero gives its place back. At `publish` a chunk not stored is not claimed, and the group is still marked complete.
+- **F4: a peer has a share of the owed table** (above).
+- **F16: an owed answer whose chunk has gone is passed over** (`pop_owed_answer`).
+- **F3: a probe's answer named by the chunk's other group is read** (`on_chunk_head`, through `cross`).
+- **F18: a probed claimant's copy that comes while another's is being verified answers the probe at the verdict** (`verifying_claimant`, one claimant an id).
+- **F17: a probe with no room for its promise has no verdict, and the repair duty is armed again at its own time.**
+- **F14: the default repair candidates** (README). The simulator's tier 4 row moved with it: fewer repair pushes, more answers, a later p99.
+- **F8: the id of a rejected chunk of a group with no record is not kept in `seen_ids`.** A repeat is checked and counted against its sender again.
+- **F19: a holding saved before the count was known is cut at it** (`drop_beyond`, also called from `publish`).
+- **R2, R3: a JOIN is never dropped, and a repeated GRAFT or PRUNE is owed once** (README). A GRAFT or PRUNE refused by a full ring is still dropped; for a PRUNE or an answer the two ends then disagree until upkeep or a later message sets it right.
+- **R4: `on_relation_join` lists the groups of the type and family only**, still 512 at most.
+- **F10, F20 in part:** a peer is not counted as listed for an ask whose list the offers table has no room for; the holders follow a holding as the pair's record keeps it.
+
+Left as they are:
+
+- **F1: `complete_in_place` does not compute again the chunks that are there** (see "Level 2 hashing").
+- **F10: the window tracks at most `max_peers * 64` chunks**, a full tombstone table lets an expired group back, and `pending` has one cap for all peers.
+- **F20: with the pool of wide bitmaps empty, a pair's indices past 127 are not kept**, and with no wide row left a group's bitmap is not written.
+- **`probe_answers` full:** a probe's answer then loses its exemption at the write.
+
 ## The specification's v0.10.11 to v0.12.0 changes
 
 Applied 2026-11-23:
 
 - **Asks outside what the node serves (`seacast.md` §4.5 `outside`, `drop_outside`):** ignored without penalty once `authenticable(g)` is true; asks arriving before the gate are swept in `on_groups_authenticated`. `PenaltyReason::AskOutsideOfferOrInterest` was removed.
 - **Routed requests and `FORWARD_LIMIT` (`seacast.md` §4.5):** routed asks outside our interest add no `want_p` bit and are kept in `standing` only when `route_want` passes them on; `forwarded` is keyed by `(NodeId, TypeId)` and increments only when `enqueue` succeeds.
-- **WANT bounds and deduplication (`seacast.md` §4.5):** indices bounded by `max_chunks` before open and swept by `drop_wants_beyond`; unknown groups in WANTs tracked in `wanted_groups` separately from `named`; duplicate asks/chunk IDs in one frame charged once; answers on our own written offers (`offered_to`, recorded in `next_to_send`) and claim probes are exempt from `max_served_per_heartbeat`.
+- **WANT bounds and deduplication (`seacast.md` §4.5):** indices bounded by `TypeParams::max_indices` (`MAX_INDICES`) before open and swept by `drop_wants_beyond`; unknown groups in WANTs tracked in `wanted_groups` separately from `named`, a place lasting `GROUP_TTL` from the group's first naming and freed with the asker's standing requests, route marks and interest bits (`release_wanted_groups`, at each heartbeat and before a group opens); duplicate asks/chunk IDs in one frame charged once; answers on our own written offers (`offered_to`, recorded in `next_to_send`) and claim probes are exempt from `max_served_per_heartbeat`.
 - **Chunks and holdings on unjoined links (`seacast.md` §2, §4.2, §4.3):** accepted for any type the node runs; `claim_all` on an unjoined link does not enter `claims` and ties on an unjoined link do not become offers.
-- **Per-type `MAX_RELATIONS` (`TypeParams::max_relations`, `relation_room`):** counts `(family, colour)` pairs across `push_in`, `push_out`, `grafted_in`, `grafted_out` and `backoff`; GRAFTs for new pairs at the limit are ignored without answer.
+- **Per-type `MAX_RELATIONS` (`TypeParams::max_relations`, `relation_room`):** counts `(family, colour)` pairs across `push_in`, `push_out`, `grafted_in`, `grafted_out`, backoffs not run out and our GRAFTs and PRUNEs still owed; GRAFTs for new pairs at the limit are ignored without answer. `NodeConfig::max_relations_per_link` is removed. `relation_room` walks the relation keys of the type, not their peers; past a bound taken from the tables' lengths it also walks `grafted_in`, `grafted_out` and `backoff`, which hold every link's entries. It runs at each GRAFT received and for each candidate of our own GRAFTs, not on the chunk path.
+- **A holding that repeats a bit frees the room of a copy written since** (`seacast.md` §4.3, v0.10.12).
 - **Source `publish` answers standing requests (`seacast.md` §4.7).**
 - **`SAMPLE_OUTSTANDING` moved from `TypeParams` to `NodeConfig` (`seacast.md` §4.10, v0.11.1).**
 - **Spec filenames updated to `seacast.md`, `seacast-lite.md` and `seacast-bindings.md` (v0.12.0).**
@@ -100,13 +128,13 @@ Applied 2026-11-22:
 
 - **`on_validated` and `forward` skip axes where the index is already `Received`** (`protocol-v2.md` §4.2, §4.4, v0.10.6), while still forwarding an index held only as `Rebuilt`. Covered by `a_second_id_for_a_received_index_is_not_forwarded` in `crates/seacast-core/tests/limits.rs`.
 - **The window's waiter line skips writers mid-write** (`RuntimeEnv::is_writing`, `SeacastNode::write_waits`, `protocol-v2.md` §4.11, v0.10.7 and v0.10.9). `RuntimeEnv::is_writing` defaults to `false`, and the simulator does not model mid-write backpressure. Covered by `the_window_line_skips_a_writer_mid_write` in `crates/seacast-core/tests/limits.rs`.
-- **The gossipsub, Waggle, partial-messages and draft native QUIC bindings are not implemented**, and cell header form (c) has no wire kind defined in the specification.
+- **The Waggle, libp2p stream, partial-messages and draft native QUIC bindings are not implemented**, and cell header form (c) has no wire kind defined in the specification.
 
 ## The specification's v0.10.2 to v0.10.4 changes
 
 Applied 2026-11-18, the README's first departure lists them. Open:
 
-- **The standalone binding is implemented but for its chunk kinds** (2026-11-18). Kind `0x06` is any type's chunk, with a clear object header and the type's frame compressed (decided: a kind per chunk layout puts the domain's layouts in the binding). A cell's header with the first unsolicited push of its group on a link is left to the type: the node marks the write (`QueueEntry::first_of_group`) and tells `wire_size`, and `encode_entry` lets the type append it. Not done: a cell type (its layout, the header stripped and checked on receive, the id over cell and proof), and the fork's open points (§1.3). The simulator's columns and rows have no cells, and send no header bytes.
+- **The standalone binding's encoding (`seacast-codec::wire`) was removed 2026-11-23** for the gossipsub binding (below). The node still marks the first unsolicited push of a group on a link (`QueueEntry::first_of_group`) and tells `wire_size`; no type sends anything with it.
 - **The chunk id's content is built on the data's leaf** (decided, after the binding's hash of the body cost each chunk a second pass over its data). `sha256(leaf || the frame before the data)` binds every byte level 1 reads, so ids stay unforgeable; a hash of the data alone would let a copy with the right data and a wrong proof, rejected and marked seen, shut out the honest one. The codec benchmark's `decode_and_reencode` is back near its former time.
 - **`SegmentedCodec::check_proof` trusts a nonzero `memo` as the data's leaf.** `identify` computes it from the bytes; a host that sets `memo` otherwise must set the leaf.
 - **The group carries its type** (`GroupId::type_id`), as the binding's does. `Policy::type_of_group`, the separate types of `Have`, `Want` and `ChunkMsg`, and the type a peer named a group with went; the trait methods that take a group, and `DecodeJob`, no longer take a type beside it.
@@ -151,7 +179,7 @@ Open on the floors, the sampler and the rest of §4.1:
 - **A claimant to probe is drawn in peer id order**, not in the order the claims came. The simulator's summary did not move.
 - **Peer lists are now in peer id order**, not the order of connection. The simulator connects in id order, so its summary did not move; a host that connects in another order draws its targets from lists in another order.
 - **Walks over the peers that remain**, none on the chunk path: `maintain_relations` (the relations held one way), `repair_candidates`, the heartbeat's choice of gossip targets, `disconnect_peer` (a pass over each table) and group expiry.
-- **`max_relations` now bounds the keys (type, family, colour) with a relation, a direction, not the relations.** Each key holds a bitmask of `max_peers` bits. The relations of one link are still bounded by `max_relations_per_link`.
+- **`CapacityConfig::max_relation_keys` bounds the keys (type, family, colour) with a relation, a direction, not the relations.** Each key holds a bitmask of `max_peers` bits. The relations of one link are bounded by `MAX_RELATIONS` (`TypeParams::max_relations`).
 - **A group's offers and holdings need a row in the pair table's index**, sized `max_groups + max_peers * max_pending_groups` rows and at most `max_pairs`. Past that an offer or a holding of a new group is not kept, as with a full pair table.
 - **The writer still scans its own queue**: `choose_normal_index` reads the normal lane up to three times a write, with a `holders` lookup a chunk.
 - **`family_word` reads a row a colour**: a type of many colours costs that many lookups a word of the bitmask, a chunk. Not measured.
@@ -197,3 +225,15 @@ Open on the floors, the sampler and the rest of §4.1:
 - The departures listed in the README have not been written into `informed-diffusion-spec`. The spec repository is unchanged.
 - That list was built from the changes made here, each checked by searching the spec for the rule in question. A full audit of the core against both protocol files has not been done, so older departures may be missing.
 - "Serving" in that list: the ask-legitimacy check was compared with the `on_want` pseudocode only. The spec's prose may already state the condition, in which case it is an enforcement and not a departure.
+
+## The gossipsub binding
+
+Added 2026-11-23: `crates/seacast-gossipsub` (`seacast-bindings.md` §4), for integration into Silver and rust-libp2p. Open:
+
+- **No client adapter.** `crates/seacast-gossipsub/tests/nodes.rs` runs `PayloadCatalog` under `SeacastNode` over a plain struct in place of gossipsub's `RPC`: two nodes on a link, and a node between two that forwards into its mesh only. It fires no timer, so nothing that waits for one runs (heartbeat gossip, a promise's end, repair), and it has no loss, no third copy and no chunk that fails level 1.
+- **No test vectors from another implementation.** The layouts follow the specification's text. The specification notes that its research harness writes a WANT's index big-endian; here it is little-endian, as the text states.
+- **The content id costs a second pass over a chunk's bytes**, beside the data's leaf digest, on receive and at publish. Not measured: the codec benchmark has no case for it.
+- **The mesh is the host's** (`TypeParams::host_relations`, `relation_added`, `relation_removed`), decided 2026-11-23. The host must tell the node of every change, a PRUNE it sends or receives included; nothing checks the two agree. `link_deficits` still reports floors for such a type.
+- **Unsubscribing** is `SeacastNode::on_leave` (2026-11-23). It ends the link and the relations of the type; what the peer told of the type's groups (holdings, offers, standing WANTs) stays until the groups end.
+- **The sampler's rules** (`seacast-bindings.md` §6) and **cell groups** are not implemented on this binding.
+- **`ChunkLayout`** (the two-step level 1 of a stream reader) has no user left but its tests.

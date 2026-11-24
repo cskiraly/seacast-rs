@@ -20,7 +20,7 @@ Assume a very high bar for engineering quality.
 ## Design principles
 
 - **The core is domain-agnostic.** `seacast-core` knows a chunk's type, group, index and an opaque frame. It knows nothing of blocks, slots, bids, payloads or any concrete object type, and it has no clock but the host's. Do not add domain names, constants or rules to it.
-- **The codec is networking mechanics only.** `seacast-codec` holds segmentation, the segment descriptor, Reed-Solomon, Merkle, SHA-256, Snappy and the wire encoding. `SegmentedCodec` is the `TypeCodec` of a segmented type. No domain logic.
+- **The codec is networking mechanics only.** `seacast-codec` holds segmentation, the segment descriptor, Reed-Solomon, Merkle, SHA-256, Snappy. `SegmentedCodec` is the `TypeCodec` of a segmented type. No domain logic.
 - **Everything domain-specific lives in `seacast-sim`:** the type ids, the payload catalog and its host, the simulator.
 - **Three traits, three concerns.** `TypeCodec` (frame layout and the checks that need only the chunk), `Domain` (whether a group is authentic, and its deadline), `Policy` (types, interest, duty, parameters). Keep a new rule in the trait whose concern it is.
 - **Sans-io and single-threaded.** `SeacastNode` never blocks, spawns nothing and holds no lock. All I/O, timers, randomness and buffers come through `RuntimeEnv` and the other host traits.
@@ -38,7 +38,8 @@ Assume a very high bar for engineering quality.
 | crate | role |
 | --- | --- |
 | `crates/seacast-core` | the state machine with its send queues, the host's traits. Only dependency: `fxhash`. |
-| `crates/seacast-codec` | the codec of segmented and standalone types, and the wire encoding |
+| `crates/seacast-codec` | the codec of segmented and standalone types |
+| `crates/seacast-gossipsub` | the gossipsub binding: control strings, the payload's codec, a received `RPC` in parts |
 | `crates/seacast-sim` | the domain: type ids, the payload catalog, the discrete-event simulator |
 
 The README's last section lists the modules of `seacast-core`.

@@ -24,6 +24,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         for slot in self.slots.iter_mut() {
             slot.ihave_frames = 0;
             slot.ihave_asked = 0;
+            slot.unwanted_ids = 0;
             slot.served_now = 0;
         }
         // Every ask held back is retried, a batch at a time. A retry that is held back
@@ -62,6 +63,8 @@ impl<B: ChunkBuffer> SeacastNode<B> {
         let group_bits = self.gossip_history.gossip_group_bits();
         self.gossip_history.shift();
 
+        // A backoff lives until it runs out, whatever the type's duty (§3).
+        self.backoff.retain(|_, until| *until > now);
         for t in catalog.joined_types() {
             self.maintain_relations(t, env, catalog, rng);
         }
@@ -198,25 +201,7 @@ impl<B: ChunkBuffer> SeacastNode<B> {
             false
         });
 
-        // Unknown groups named in WANTs: when a peer's place expires, its
-        // standing requests, route marks and declared interest for that group
-        // go with it (`seacast.md` §4.5).
-        let mut expired_wanted: InlineVec<(PeerId, GroupId), MAX_CHUNKS> = InlineVec::new();
-        let slots = &mut self.slots;
-        self.wanted_groups.retain(|&(peer, group), left| {
-            if *left > 1 {
-                *left -= 1;
-                return true;
-            }
-            if let Some(slot) = slots.get_mut(peer) {
-                slot.wanted_count = slot.wanted_count.saturating_sub(1);
-            }
-            let _ = expired_wanted.push((peer, group));
-            false
-        });
-        for (peer, group) in expired_wanted {
-            self.clear_peer_wants(peer, &group);
-        }
+        self.release_wanted_groups(now);
 
         // `tried`, and `asked_parked` with it, live as long as an offer does; an ask's
         // time, its window; a park, `PARK_TTL` (`protocol.md` §8.1).

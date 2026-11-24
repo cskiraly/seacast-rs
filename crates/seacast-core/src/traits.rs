@@ -223,6 +223,11 @@ impl<B> DeferredStore<B> for BoundedDeferredStore {
         if self.total >= self.max_total {
             return false;
         }
+        // A peer whose count cannot be kept reserves nothing: its cap could not
+        // be held, nor its reservations released.
+        if self.per_peer.is_full() && !self.per_peer.contains_key(&peer) {
+            return false;
+        }
         let count = self.per_peer.entry_or_default(peer);
         if *count >= self.max_per_peer {
             return false;
@@ -233,11 +238,16 @@ impl<B> DeferredStore<B> for BoundedDeferredStore {
     }
 
     fn release(&mut self, peer: PeerId, _chunk: &ChunkMsg<B>) {
-        if let Some(count) = self.per_peer.get_mut(&peer) {
-            if *count > 0 {
-                *count -= 1;
-                self.total = self.total.saturating_sub(1);
-            }
+        let Some(count) = self.per_peer.get_mut(&peer) else {
+            return;
+        };
+        if *count > 0 {
+            *count -= 1;
+            self.total = self.total.saturating_sub(1);
+        }
+        // A count of zero gives its place back.
+        if *count == 0 {
+            self.per_peer.remove(&peer);
         }
     }
 }
@@ -486,8 +496,8 @@ pub trait Policy {
 
     /// Repair rule: candidate peers to whom rebuilt chunks of `group` may be
     /// pushed/offered (`T.params.REPAIR_TO(g)`). If `None` is returned,
-    /// defaults to peers in the push/announce relation or peers with interest
-    /// in `group`.
+    /// defaults to the peers in the push relation, and the peers outside it
+    /// whose interest in `group` is not `ALL`.
     fn repair_to(&self, _group: &GroupId) -> Option<InlineVec<PeerId, MAX_INLINE_PEERS>> {
         None
     }
